@@ -16,4 +16,4 @@ pi install npm:pi-dispatch
 
 ## 许可证
 
-Apache-2.0，见 [LICENSE](./LICENSE)。
+MIT，见 [LICENSE](./LICENSE)。
