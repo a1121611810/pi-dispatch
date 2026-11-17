@@ -1,0 +1,15 @@
+# pnpm 12 project config.
+#
+# `minimumReleaseAge` — pnpm 12 defaults to a delay that rejects packages
+# published within the last ~24 h. For this project that delay adds friction
+# (CI on `main` and a clean checkout on a developer box can be skewed by
+# hours) without buying anything — the registry's existing metadata is the
+# trust boundary we rely on. Pin to 0 so the lockfile resolves the same on
+# every machine.
+minimumReleaseAge: 0
+
+# pi 的传递依赖带 install/postinstall 脚本（@google/genai、protobufjs）。它们对本扩展
+# 无用；pnpm 12 用 `allowBuilds` 显式声明「审阅过、不跑」（`onlyBuiltDependencies` 已移除）。
+allowBuilds:
+  "@google/genai": false
+  protobufjs: false

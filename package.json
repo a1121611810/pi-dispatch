@@ -1,0 +1,61 @@
+{
+  "name": "pi-dispatch",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Programmable subagent dispatch for pi: queue, spawn, watch, stop, and account for child agents",
+  "keywords": [
+    "dispatch",
+    "pi",
+    "pi-package",
+    "subagents"
+  ],
+  "homepage": "https://github.com/a1121611810/pi-dispatch",
+  "bugs": "https://github.com/a1121611810/pi-dispatch/issues",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/a1121611810/pi-dispatch.git"
+  },
+  "files": [
+    "dist/**/*.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "rolldown -c",
+    "check": "tsrs -p tsconfig.json",
+    "lint": "oxlint",
+    "fmt": "oxfmt",
+    "fmt:check": "oxfmt --check"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@types/node": "^26.6.6",
+    "oxfmt": "^0.78.0",
+    "oxlint": "^1.93.0",
+    "rolldown": "^1.3.2",
+    "tsrs": "0.25.0-ts7.1.0-beta"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "pnpm@12.15.0",
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  }
+}

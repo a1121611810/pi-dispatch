@@ -6,6 +6,12 @@ yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
 
+# macOS
+.DS_Store
+
+# 运行时状态（派发记录 / 孩子产出）：真机跑起来会写，不许入库
+.pi/
+
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
