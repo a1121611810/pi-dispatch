@@ -1,0 +1,711 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>留痕 · 图解</title>
+    <style>
+      :root {
+        --ink: #16181d;
+        --ink2: #4a5058;
+        --ink3: #838a94;
+        --line: #dfe3e8;
+        --soft: #f8fafb;
+        --green: #2f6f4f;
+        --green-s: #eaf3ee;
+        --amber: #9a5b12;
+        --amber-s: #fdf4e6;
+        --red: #a33a30;
+        --red-s: #fbeeec;
+        --blue: #2a5c8a;
+        --blue-s: #ebf2f9;
+        --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: #fff;
+        color: var(--ink);
+        font:
+          16px/1.7 -apple-system,
+          BlinkMacSystemFont,
+          "PingFang SC",
+          "Hiragino Sans GB",
+          "Microsoft YaHei",
+          sans-serif;
+      }
+      .wrap {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 36px 20px 90px;
+      }
+      header {
+        border-bottom: 2px solid var(--ink);
+        padding-bottom: 20px;
+        margin-bottom: 8px;
+      }
+      h1 {
+        font-size: 27px;
+        margin: 0 0 6px;
+      }
+      .sub {
+        color: var(--ink2);
+        font-size: 15px;
+        margin: 0;
+      }
+      .meta {
+        color: var(--ink3);
+        font-size: 13px;
+        margin-top: 10px;
+      }
+      h2 {
+        font-size: 20px;
+        margin: 48px 0 6px;
+        padding-top: 14px;
+        border-top: 1px solid var(--line);
+      }
+      h2 .n {
+        color: var(--ink3);
+        font-weight: 400;
+        margin-right: 9px;
+      }
+      h3 {
+        font-size: 15px;
+        margin: 24px 0 8px;
+      }
+      p {
+        margin: 0 0 12px;
+      }
+      code {
+        font-family: var(--mono);
+        font-size: 0.87em;
+        background: #f3f5f7;
+        padding: 2px 5px;
+        border-radius: 3px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 0 0 16px;
+        font-size: 14.5px;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 8px 11px;
+        border-bottom: 1px solid var(--line);
+        vertical-align: top;
+      }
+      th {
+        background: var(--soft);
+        font-weight: 600;
+        font-size: 13.5px;
+      }
+      .card {
+        border: 1px solid var(--line);
+        border-left: 3px solid var(--green);
+        border-radius: 5px;
+        padding: 14px 18px;
+        margin: 0 0 16px;
+        background: var(--soft);
+      }
+      .card.warn {
+        border-left-color: var(--amber);
+        background: var(--amber-s);
+      }
+      .card.red {
+        border-left-color: var(--red);
+        background: var(--red-s);
+      }
+      .card.blue {
+        border-left-color: var(--blue);
+        background: var(--blue-s);
+      }
+      .card h3 {
+        margin: 0 0 8px;
+      }
+      .card > :last-child {
+        margin-bottom: 0;
+      }
+      .num {
+        font-family: var(--mono);
+        font-weight: 600;
+      }
+
+      /* 树 */
+      .tree {
+        margin: 0;
+        background: #f5f7f9;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 15px 17px;
+        overflow-x: auto;
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.75;
+        white-space: pre;
+      }
+      .tree .f {
+        color: var(--ink2);
+      }
+
+      /* 流程图 */
+      .flow {
+        margin: 16px 0 24px;
+      }
+      .row {
+        display: flex;
+        align-items: stretch;
+      }
+      .node {
+        border: 1.5px solid var(--ink);
+        border-radius: 7px;
+        background: #fff;
+        padding: 10px 12px;
+        flex: 1 1 0;
+        min-width: 0;
+      }
+      .node .t {
+        font-weight: 600;
+        font-size: 13.5px;
+        margin-bottom: 3px;
+        display: block;
+      }
+      .node .d {
+        font-size: 12.5px;
+        color: var(--ink2);
+        line-height: 1.5;
+        display: block;
+      }
+      .node.start,
+      .node.end {
+        border-color: var(--green);
+        background: var(--green-s);
+      }
+      .node.decide {
+        border-color: var(--amber);
+        background: var(--amber-s);
+        flex: 0 0 200px;
+      }
+      .node.act {
+        border-color: var(--blue);
+        background: var(--blue-s);
+      }
+      .node.io {
+        border-style: dashed;
+        border-color: var(--ink3);
+      }
+      .node.bad {
+        border-color: var(--red);
+        background: var(--red-s);
+      }
+      .arrowdown {
+        display: flex;
+        justify-content: center;
+        padding: 5px 0;
+      }
+      .arrowdown::before {
+        content: "";
+        width: 0;
+        height: 0;
+        border-left: 8px solid transparent;
+        border-right: 8px solid transparent;
+        border-top: 11px solid var(--ink2);
+      }
+      .side {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 13px;
+        margin-top: 11px;
+      }
+
+      /* 泳道 */
+      .swim {
+        display: grid;
+        grid-template-columns: 92px 1fr;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        overflow: hidden;
+        margin: 16px 0 22px;
+      }
+      .swim .lane {
+        background: var(--soft);
+        border-right: 1px solid var(--line);
+        padding: 11px 9px;
+        font-size: 12.5px;
+        font-weight: 600;
+        color: var(--ink2);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+      }
+      .swim .body {
+        padding: 11px;
+      }
+
+      /* 数字徽章 */
+      .badges {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin: 14px 0 22px;
+      }
+      .badge {
+        border: 1.5px solid var(--blue);
+        background: var(--blue-s);
+        border-radius: 8px;
+        padding: 10px 16px;
+        text-align: center;
+      }
+      .badge .v {
+        font-family: var(--mono);
+        font-size: 22px;
+        font-weight: 700;
+        color: var(--blue);
+      }
+      .badge .l {
+        font-size: 12px;
+        color: var(--ink2);
+        margin-top: 2px;
+      }
+      .badge.green {
+        border-color: var(--green);
+        background: var(--green-s);
+      }
+      .badge.green .v {
+        color: var(--green);
+      }
+      .badge.amber {
+        border-color: var(--amber);
+        background: var(--amber-s);
+      }
+      .badge.amber .v {
+        color: var(--amber);
+      }
+
+      .kv {
+        font-family: var(--mono);
+        font-size: 13px;
+      }
+      .tag {
+        display: inline-block;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        padding: 0 7px;
+        font-size: 12px;
+        font-family: var(--mono);
+        background: #f5f7f9;
+        margin-right: 6px;
+      }
+      @media (max-width: 820px) {
+        .wrap {
+          padding: 24px 14px 60px;
+        }
+        h1 {
+          font-size: 22px;
+        }
+        h2 {
+          font-size: 19px;
+          margin-top: 40px;
+        }
+        .row {
+          flex-direction: column;
+        }
+        .node.decide {
+          flex: 1 1 auto;
+        }
+        .side {
+          grid-template-columns: 1fr;
+        }
+        .swim {
+          grid-template-columns: 64px 1fr;
+        }
+        table {
+          font-size: 13.5px;
+        }
+        th,
+        td {
+          padding: 7px 8px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <h1>留痕 · 图解</h1>
+        <p class="sub">派发核心怎么把「发生过的事」写进磁盘、又怎么在重启后读回来。</p>
+        <p class="meta">pi-dispatch · 2026-11-18 · 主规格第 13 节的展开</p>
+      </header>
+
+      <div class="badges">
+        <div class="badge">
+          <div class="v">500</div>
+          <div class="l">终态记录热存上限（条）</div>
+        </div>
+        <div class="badge green">
+          <div class="v">30 天</div>
+          <div class="l">压缩归档保留期</div>
+        </div>
+        <div class="badge amber">
+          <div class="v">500</div>
+          <div class="l">启动时单批清理上限</div>
+        </div>
+        <div class="badge">
+          <div class="v">16 MB</div>
+          <div class="l">子代理输出内存上限</div>
+        </div>
+      </div>
+
+      <h2><span class="n">1</span>盘上长什么样</h2>
+
+      <p>
+        账本<b>不落项目里</b>，落在一个全局目录，按项目分桶。存哪个目录取决于外壳给的一个参数——<b>核心不管默认该落哪</b>，只往给定的目录写。
+      </p>
+      <p>
+        桶的键是<b>项目根</b>（向上找到 <code>.git</code> 或 <code>.pi</code> 的那一级），<b
+          >不是裸 cwd</b
+        >——从子目录启动也落同一个桶，不散账。
+      </p>
+
+      <pre class="tree">
+~/.pi/dispatch/                    <span class="f">← 全局存放目录（外壳注入，核心不知道默认）</span>
+├── &lt;项目A根编码&gt;/             <span class="f">← 一个项目一个桶</span>
+│   ├── records/                   <span class="f">← 记录：一条任务一个文件</span>
+│   │   ├── 01a1ec71….json         <span class="f">← 任务记录（每次变化重写整个文件）</span>
+│   │   └── 01a1ec71….json.tmp     <span class="f">← 写入中的临时文件（写完改名，原子落盘）</span>
+│   ├── tasks/
+│   │   └── 01a1ec71…/
+│   │       └── output.log         <span class="f">← 子代理的完整输出（超 16MB 砍头留尾）</span>
+│   └── archive/                   <span class="f">← 压缩归档：被挤掉的记录搬来这里</span>
+│       ├── 01a1ec71….json.gz      <span class="f">← 记录 + 归档时刻</span>
+│       └── 01a1ec71….output.gz    <span class="f">← 子代理输出（gzip）</span>
+└── &lt;项目B根编码&gt;/             <span class="f">← 另一个项目，另一个桶，账互不混</span>
+    └── …
+</pre>
+
+      <div class="card blue">
+        <h3>桶名怎么编码：照抄 pi 的写法</h3>
+        <p>
+          项目根是路径，不能直接当目录名。<b>编码函数照抄 pi</b>（pi 的会话目录就是这么命名的，本机
+          <code>~/.pi/agent/sessions/</code> 里那些 <code>--Users-…--</code> 就是）：
+        </p>
+        <p
+          style="
+            background: #fff;
+            border: 1px solid var(--line);
+            border-radius: 5px;
+            padding: 10px 14px;
+            font-family: var(--mono);
+            font-size: 13px;
+            margin: 0 0 10px;
+          "
+        >
+          "--" + 项目根路径(去掉开头的斜杠,所有 / \ : 换成 -) + "--"
+        </p>
+        <p style="margin-bottom: 0">
+          例：<code>/home/dev/proj</code> →
+          <code>--Users-real-user-proj--</code>。<b>可读</b>（人对得上哪个桶是哪个项目），<b
+            >跟 pi 一致</b
+          >（用户在 sessions 目录里见过同款）。撞名罕见（得同父目录下有 <code>a/b</code> 和
+          <code>a-b</code>），真撞再加 hash 后缀。
+        </p>
+      </div>
+
+      <div class="card warn">
+        <h3>编号会拼进路径</h3>
+        <p style="margin-bottom: 0">
+          <code>tasks/&lt;编号&gt;/output.log</code
+          >——编号直接当目录名用。所以编号里如果有<b>斜杠、竖线、两个点</b>，先拒绝，别拼路径。这是防「写到别处去」的。
+        </p>
+      </div>
+
+      <h2><span class="n">2</span>平时：两条写路径</h2>
+
+      <p>运行时只有两种东西会落盘，各自一套规矩。</p>
+
+      <div class="swim">
+        <div class="lane">记录</div>
+        <div class="body">
+          <div class="row">
+            <div class="node act">
+              <span class="t">记录变了 → 立刻写</span
+              ><span class="d">状态每次变迁都触发（订阅状态本的通知）</span>
+            </div>
+          </div>
+          <div class="arrowdown"></div>
+          <div class="row">
+            <div class="node act">
+              <span class="t">先写 <code>.tmp</code>，再改名</span
+              ><span class="d"
+                >写到一半崩了，磁盘上最多留一个没用的 <code>.tmp</code>，不会留半个
+                <code>.json</code></span
+              >
+            </div>
+          </div>
+          <div class="arrowdown"></div>
+          <div class="row">
+            <div class="node io">
+              <span class="t">写盘失败 → 不阻塞任务</span
+              ><span class="d">记录还在内存里，任务继续跑；磁盘这轮缺了，下轮补</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="swim">
+        <div class="lane">输出</div>
+        <div class="body">
+          <div class="row">
+            <div class="node act">
+              <span class="t">子代理出声 → 内存里攒着</span
+              ><span class="d">超过 16MB 就<b>砍头留尾</b>，并记下「被截断了」</span>
+            </div>
+          </div>
+          <div class="arrowdown"></div>
+          <div class="row">
+            <div class="node act">
+              <span class="t">跑完 → 写 <code>tasks/&lt;编号&gt;/output.log</code></span
+              ><span class="d">一次写整份；记「截断」的标记跟着记录走</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>为什么输出是「砍头留尾」而不是「全留」</h3>
+        <p style="margin-bottom: 0">
+          报告和用量都在输出的<b>最末尾</b>。头丢了无所谓（是中间过程），尾丢了就丢了交付凭证。所以超限时保尾不保头。
+        </p>
+      </div>
+
+      <h2><span class="n">3</span>挤掉最老的时候：两条路</h2>
+
+      <p>终态记录超过 500 条，把最老的挤掉。挤掉的东西去哪，分<b>什么时候挤</b>：</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>什么时候</th>
+            <th>挤掉的去哪</th>
+            <th>为什么</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><b>平时跑着的时候</b></td>
+            <td><span class="tag">压缩归档</span>搬去 <code>archive/</code>，还能回捞</td>
+            <td>留着还有取证价值</td>
+          </tr>
+          <tr>
+            <td><b>启动的时候</b></td>
+            <td><span class="tag">直接删</span></td>
+            <td>开机时一批批压缩会卡住启动</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="flow">
+        <div class="row">
+          <div class="node decide">
+            <span class="t">终态超 500 条了</span>
+            <span class="d">按「结束时刻 + 编号」排，最老的先出</span>
+          </div>
+        </div>
+        <div class="side">
+          <div class="node act">
+            <span class="t">平时：异步归档</span>
+            <span class="d">挂进异步链 → 逐个 gzip → 落位 → 删热文件（见下）</span>
+          </div>
+          <div class="node io">
+            <span class="t">启动时：同步直删</span>
+            <span class="d">挤掉的同时删掉文件，不压缩</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card warn">
+        <h3>注意：排队中的记录永不挤</h3>
+        <p style="margin-bottom: 0">
+          挤只挤<b>终态</b>（成了 / 败了 / 取消了 /
+          失联）。还在「在等」「在跑」「要停」的，不挤——那是活账。
+        </p>
+      </div>
+
+      <h2><span class="n">4</span>归档的三条规矩</h2>
+
+      <p>「平时归档」那条路不是随手 gzip 一下就完，有三条规矩，每条都对应一个踩过的坑。</p>
+
+      <div class="flow">
+        <div class="row">
+          <div class="node act">
+            <span class="t">① 先落位，再删原文件</span>
+            <span class="d"
+              ><code>.gz.tmp</code> 写完整 → 改名 <code>.gz</code> →
+              再删热文件。<b>半途死掉最多留两份</b>（热文件 + 归档），启动读盘时容忍重复</span
+            >
+          </div>
+        </div>
+        <div class="arrowdown"></div>
+        <div class="row">
+          <div class="node act">
+            <span class="t">② 走异步链，每次之间让事件循环转一圈</span>
+            <span class="d"
+              >一条链上一个一个来，中间插 <code>setImmediate</code>。不然连续的 gzip 会把主流程<b
+                >饿死</b
+              ></span
+            >
+          </div>
+        </div>
+        <div class="arrowdown"></div>
+        <div class="row">
+          <div class="node act">
+            <span class="t">③ 归档文件写成就不改写</span>
+            <span class="d"
+              >所以<b>文件的修改时间就是归档时刻</b>。过期判断直接看 mtime，不用再记一份账</span
+            >
+          </div>
+        </div>
+      </div>
+
+      <div class="card red">
+        <h3>归档失败 ≠ 丢</h3>
+        <p style="margin-bottom: 0">
+          gzip
+          挂了、磁盘满了——<b>热文件留着不动</b>。下一轮启动走「直删」路径收尸。归档这条路只允许「多留一份」，不允许「没归档就删了」。
+        </p>
+      </div>
+
+      <h2><span class="n">5</span>启动时：怎么读回来</h2>
+
+      <p>核心重启（或新开会话）时，把磁盘上的记录装回内存。顺序是固定的：</p>
+
+      <div class="flow">
+        <div class="row">
+          <div class="node start">
+            <span class="t">启动</span><span class="d">给了存放目录才走这条路</span>
+          </div>
+        </div>
+        <div class="arrowdown"></div>
+        <div class="row">
+          <div class="node act">
+            <span class="t">读 records/*.json，装回内存</span
+            ><span class="d">一个坏文件<b>跳过</b>，不许拖垮启动</span>
+          </div>
+        </div>
+        <div class="arrowdown"></div>
+        <div class="row">
+          <div class="node act">
+            <span class="t">订阅状态本</span><span class="d">以后记录每次变化都自动写盘</span>
+          </div>
+        </div>
+        <div class="arrowdown"></div>
+        <div class="row">
+          <div class="node decide">
+            <span class="t">对每条「还没结束」的记录</span>
+            <span class="d">它的主方还活着吗？</span>
+          </div>
+        </div>
+        <div class="side">
+          <div class="node io">
+            <span class="t">活着 → 不装</span>
+            <span class="d"
+              >是<b>另一个会话</b>的在飞任务。装进来也看不见、停不了，还会「假停」</span
+            >
+          </div>
+          <div class="node bad">
+            <span class="t">死了 → 标「失联」</span>
+            <span class="d">上次会话没来得及收。它到底干没干完，没法知道了</span>
+          </div>
+        </div>
+        <div class="arrowdown"></div>
+        <div class="row">
+          <div class="node act">
+            <span class="t">剪历史 + 清过期归档</span
+            ><span class="d">boot 模式挤掉即删 + 清 30 天前的压缩包（单次最多 500）</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card blue">
+        <h3>「还活着」怎么判：进程号 + 启动时刻</h3>
+        <p>
+          只看进程号会<b>认错人</b>——进程号会被系统重复使用。要进程号和启动时刻<b>两个都对</b>，才算这条记录的主方还活着。
+        </p>
+        <p style="margin-bottom: 0">
+          这条记录在建的时候就盖好了戳：<code>ownerPid</code> + <code>ownerBootMs</code>。
+        </p>
+      </div>
+
+      <h2><span class="n">6</span>一张图总览</h2>
+
+      <div class="swim">
+        <div class="lane">运行时</div>
+        <div class="body">
+          <div class="row">
+            <div class="node act">
+              <span class="t">任务在跑</span><span class="d">记录变化 → tmp+rename 写盘</span>
+            </div>
+          </div>
+          <div class="arrowdown"></div>
+          <div class="row">
+            <div class="node act">
+              <span class="t">任务终态</span
+              ><span class="d">写 output.log → 挂报告/收据 → 终态</span>
+            </div>
+          </div>
+          <div class="arrowdown"></div>
+          <div class="row">
+            <div class="node decide">
+              <span class="t">终态超 500？</span><span class="d">最老先出</span>
+            </div>
+          </div>
+          <div class="side">
+            <div class="node io">
+              <span class="t">是 → 异步归档</span><span class="d">gzip → 落位 → 删热文件</span>
+            </div>
+            <div class="node end"><span class="t">否 → 留着</span><span class="d">热存</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="swim">
+        <div class="lane">启动时</div>
+        <div class="body">
+          <div class="row">
+            <div class="node act">
+              <span class="t">读盘装回</span><span class="d">坏文件跳过</span>
+            </div>
+          </div>
+          <div class="arrowdown"></div>
+          <div class="row">
+            <div class="node act">
+              <span class="t">在飞的记录问「主方活着吗」</span
+              ><span class="d">活着不装 / 死了标失联</span>
+            </div>
+          </div>
+          <div class="arrowdown"></div>
+          <div class="row">
+            <div class="node io">
+              <span class="t">剪历史 + 清过期</span
+              ><span class="d">直删 + 30 天 TTL（单批 500）</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>为什么值得这么麻烦</h3>
+        <p>
+          不留痕的话：会话一关，「派过什么、谁干完了、孩子说了什么」全没了。下一次会话从零开始，重复派活、重复花钱。
+        </p>
+        <p style="margin-bottom: 0">
+          留痕换来的：<b>跨重启的账本</b>——父方随时能查「上次那个调研跑完没有」，孩子说过的话也都在盘上。
+        </p>
+      </div>
+    </div>
+  </body>
+</html>
