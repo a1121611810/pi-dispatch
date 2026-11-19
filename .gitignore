@@ -161,3 +161,6 @@ vite.config.ts.timestamp-*
 .nx/cache
 .nx/workspace-data
 .nx/migrate-runs
+
+# 变异测试快照（mutator 工具）
+.metrics/

@@ -31,7 +31,14 @@
     "check": "tsrs -p tsconfig.json",
     "lint": "oxlint",
     "fmt": "oxfmt",
-    "fmt:check": "oxfmt --check"
+    "fmt:check": "oxfmt --check",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "test:coverage": "node --test --experimental-test-coverage \"test/**/*.test.ts\"",
+    "test:node22": "npx -y node@22.19.0 --test \"test/**/*.test.ts\"",
+    "mutate": "mutator --no-coverage src/core",
+    "test:node24": "npx -y node@24 --test \"test/**/*.test.ts\"",
+    "test:mode": "node scripts/verify-modes.ts",
+    "check:breakpoints": "node scripts/breakpoints.ts"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.5.2",
