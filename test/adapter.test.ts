@@ -111,7 +111,12 @@ test("适配层：child_report 工具把报告放进 details.report", async () =
         details?: { report?: { summary?: string } };
       }>;
     };
-    const args = { summary: "结论", files_touched: ["a.ts"] };
+    const args = {
+      summary: "结论",
+      why: "任务是字面要求",
+      assessment: "边界没测全，有回归风险",
+      files_touched: ["a.ts"],
+    };
     const out = await def.execute("call_1", args);
     assert.equal(out.details?.report?.summary, "结论");
     assert.deepEqual(out.structuredContent, args);
@@ -243,7 +248,7 @@ test("deliver：未核实的交付在通知里写出警告", async () => {
   await registry.submit({
     kind: "attach-report",
     id: "abcdef1234",
-    report: { summary: "s" },
+    report: { summary: "s", why: "w", assessment: "a" },
     channel: "prompt-json",
     unverified: true,
   });

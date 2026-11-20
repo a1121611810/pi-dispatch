@@ -19,6 +19,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  assessmentVacuous,
   buildAppendBlock,
   buildPiArgv,
   deliveryUnverified,
@@ -27,6 +28,7 @@ import {
   pathMatches,
   spawnChild,
   supportsNoMcp,
+  CHILD_REPORT_SCHEMA,
   CHILD_REPORT_TOOL_NAME,
   REPORT_CONTRACT_BLOCK,
   SUBAGENT_CONTEXT_BLOCK,
@@ -183,7 +185,8 @@ test("附加块：理由被实体转义（<> 不会伪造标签）", () => {
 
 test("附加块：没给理由时不带理由段", () => {
   const block = buildAppendBlock({});
-  assert.ok(!block.includes("pi-dispatch-why"));
+  // 契约文案会提到 <pi-dispatch-why>（条件句），注入的理由段必有闭合标签——按闭合标签判有无
+  assert.ok(!block.includes("</pi-dispatch-why>"));
   assert.ok(block.includes(SUBAGENT_CONTEXT_BLOCK));
 });
 
@@ -194,6 +197,55 @@ test("附加块：报告契约总是带上", () => {
 test("报告契约：说清「报告是摘要，交付物是正文」", () => {
   assert.match(REPORT_CONTRACT_BLOCK, /NOT the deliverable/);
   assert.match(REPORT_CONTRACT_BLOCK, /never hide the deliverable/);
+});
+
+test("报告契约：三段分工 + 反话钉 + why 条件句", () => {
+  assert.match(REPORT_CONTRACT_BLOCK, /three sections/);
+  assert.match(REPORT_CONTRACT_BLOCK, /uniformly positive/);
+  assert.match(REPORT_CONTRACT_BLOCK, /<pi-dispatch-why> block, take it as input/);
+});
+
+test("报告 schema：三段必填", () => {
+  assert.deepEqual([...CHILD_REPORT_SCHEMA.required].sort(), ["assessment", "summary", "why"]);
+});
+
+test("收件：报告散文段超 2KB 截断，缺的 why/assessment 归一化为空串", () => {
+  const stream = JSON.stringify({
+    type: "message_end",
+    message: {
+      role: "toolResult",
+      toolName: "child_report",
+      details: { report: { summary: "x".repeat(3000) } },
+    },
+  });
+  const parsed = parseChildStream(stream);
+  assert.equal(parsed.toolReport?.summary.length, 2049, "2048 + 省略号");
+  assert.equal(parsed.toolReport?.why, "");
+  assert.equal(parsed.toolReport?.assessment, "");
+});
+
+test("vacuous：缺/短/全正面 ⇒ 空转；有具体风险 ⇒ 不空转", () => {
+  assert.equal(assessmentVacuous(undefined), true);
+  assert.equal(assessmentVacuous({ summary: "s", why: "w", assessment: "太短" }), true);
+  assert.equal(
+    assessmentVacuous({
+      summary: "s",
+      why: "w",
+      assessment:
+        "整体非常顺利，所有既定目标都已圆满达成，交付质量完全符合预期，可以直接进入下一阶段工作。",
+    }),
+    true,
+    "全正面且过信号词表 ⇒ 空转",
+  );
+  assert.equal(
+    assessmentVacuous({
+      summary: "s",
+      why: "w",
+      assessment:
+        "主流程已验证。边界场景还没覆盖全，存在回归风险，建议父方后续补一轮针对异常输入的测试再合入。",
+    }),
+    false,
+  );
 });
 
 test("拼命令：契约块里的工具名与常量一致", () => {

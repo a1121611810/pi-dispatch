@@ -1922,7 +1922,10 @@
         </div>
         <div class="node act">
           <span class="t">报告</span>
-          <span class="d">优先读工具通道；没有就从正文末尾抠 JSON 块；都没有就是没有。</span>
+          <span class="d"
+            >三段式：summary 是什么 · why 为什么 · assessment
+            怎么样。优先读工具通道；没有就从正文末尾抠 JSON 块；都没有就是没有。</span
+          >
         </div>
       </div>
       <div class="row" style="margin-top: 11px">
@@ -1963,6 +1966,76 @@
             </tr>
           </tbody>
         </table>
+      </div>
+
+      <div class="card">
+        <h3>报告三段式：是什么 · 为什么 · 怎么样</h3>
+        <table style="margin: 0">
+          <thead>
+            <tr>
+              <th>段</th>
+              <th>内容</th>
+              <th>性质</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>summary</code></td>
+              <td>一句话结论</td>
+              <td>判断</td>
+            </tr>
+            <tr>
+              <td><code>why</code></td>
+              <td>
+                自己结论的理由。收到
+                <code>&lt;pi-dispatch-why&gt;</code>
+                块时<b>以它为输入</b>（回应父方真实动机）；否则纯凭任务书自评。
+              </td>
+              <td>判断</td>
+            </tr>
+            <tr>
+              <td><code>assessment</code></td>
+              <td>
+                干得怎么样：质量判断、踩的坑、偏离、没验证的部分。主锚同 why
+                段。<b>反话钉</b>：必须点名至少一条具体问题/风险/局限/待复核——<b>全是正面视为没写</b>。
+              </td>
+              <td>判断</td>
+            </tr>
+            <tr>
+              <td><code>findings</code></td>
+              <td>承重证据（claim + 出处）</td>
+              <td>证据</td>
+            </tr>
+            <tr>
+              <td><code>files_touched</code> / <code>usage</code></td>
+              <td>给父方机器核对用，<b>不是散文</b></td>
+              <td>回执</td>
+            </tr>
+          </tbody>
+        </table>
+        <p style="margin-bottom: 0">
+          三段散文各限 2KB——report 本身是限字摘要，这是「有回执给小窗」的前提。
+        </p>
+      </div>
+
+      <div class="card warn">
+        <h3>信任记账：词表是粗筛，核对才是判官</h3>
+        <p>
+          <code>assessmentVacuous</code
+          >（缺/过短/全正面）只是<b>小窗资格粗筛</b>——它拦「连敷衍都懒得敷衍」的报告，不鉴定伪问题。
+        </p>
+        <p>信任只走记账规则：</p>
+        <ul>
+          <li>不可核的自述（assessment 全文）= <b>零分</b>；</li>
+          <li>可核对不上（自述 vs 收据）= 零分且<b>倒扣</b>（没有实测支撑 + 失去小窗资格）；</li>
+          <li>
+            对上 = <b>唯一正分来源</b>。想把声明变成得分，写进 findings/files_touched 接受核对。
+          </li>
+        </ul>
+        <p style="margin-bottom: 0">
+          读法：<code>whySuppressed=true</code> 时，why/assessment
+          都是<b>无动机自评</b>（孩子没见过父方的 why），降权精读。
+        </p>
       </div>
 
       <div class="card red">

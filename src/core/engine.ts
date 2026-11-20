@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { ChildActivityTracker, DEFAULT_STALL_MS, STALL_CHECK_INTERVAL_MS } from "./activity.ts";
 import {
+  assessmentVacuous,
   buildPiArgv,
   deliveryUnverified,
   parseChildStream,
@@ -450,6 +451,7 @@ export class TaskEngine {
       delivery: parsed.delivery,
       usage: parsed.observedUsageTotal ?? undefined,
       unverified,
+      vacuous: assessmentVacuous(report),
     });
     await this.#registry.submit({
       kind: "attach-output",
@@ -507,6 +509,7 @@ export class TaskEngine {
       reportChannel: record.reportChannel ?? "none",
       delivery: record.delivery,
       deliveryUnverified: record.deliveryUnverified,
+      assessmentVacuous: record.assessmentVacuous,
       outputTruncated: record.outputTruncated ?? false,
     };
   }

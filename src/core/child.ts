@@ -96,9 +96,13 @@ export const REPORT_CONTRACT_BLOCK = [
   "<child-report-contract>",
   `Before finishing, deliver a child report — preferably by calling the ${CHILD_REPORT_TOOL_NAME} tool (its schema fixes the shape); if that tool is not available, put a fenced JSON block at the very end of your final message:`,
   "```json",
-  '{ "summary": "one sentence conclusion", "findings": [{ "what": "claim", "evidence": "where it comes from" }], "files_touched": ["relative/path"], "usage": { "input": 0, "output": 0, "cost": 0, "turns": 0 } }',
+  '{ "summary": "one sentence conclusion", "why": "why you conclude so", "assessment": "how it actually went", "findings": [{ "what": "claim", "evidence": "where it comes from" }], "files_touched": ["relative/path"], "usage": { "input": 0, "output": 0, "cost": 0, "turns": 0 } }',
   "```",
-  'Rules: the report is a SUMMARY — it is NOT the deliverable. The deliverable is your prose answer, in exactly the format the task asked for; never hide the deliverable inside the JSON block. "summary" is one sentence of conclusion. "findings" carries load-bearing evidence only. Do NOT write report/summary .md files — your final message is what the parent reads.',
+  "Rules: the report is a SUMMARY — it is NOT the deliverable. The deliverable is your prose answer, in exactly the format the task asked for; never hide the deliverable inside the JSON block.",
+  'The report judges in three sections. "summary" = what you concluded (one sentence). "why" = why you conclude so — if your instructions contained a <pi-dispatch-why> block, take it as input (answer the parent\'s actual motive); otherwise reason from the task text alone. "assessment" = how the work actually went — quality judgment, problems hit, deviations, what remains unverified; its main anchor is the same: the why block if you received one, else the task text.',
+  'Goodhart pin: "assessment" must name at least one concrete problem, risk, limitation, or thing to recheck. If it is uniformly positive, the parent treats the whole report as not delivered.',
+  '"files_touched" and "usage" are a receipt for the parent\'s machine cross-check, not prose — keep them exact.',
+  "Do NOT write report/summary .md files — your final message is what the parent reads.",
   "findings/files_touched/usage may be omitted when empty.",
   "</child-report-contract>",
 ].join("\n");
@@ -111,6 +115,16 @@ export const CHILD_REPORT_SCHEMA = {
   type: "object",
   properties: {
     summary: { type: "string", description: "one sentence conclusion" },
+    why: {
+      type: "string",
+      description:
+        "why you conclude so — take the <pi-dispatch-why> block as input if you received one, else reason from the task text",
+    },
+    assessment: {
+      type: "string",
+      description:
+        "how it actually went: quality judgment, problems hit, deviations, what remains unverified; must name at least one concrete problem/risk/limitation/recheck — uniformly positive is treated as not delivered",
+    },
     findings: {
       type: "array",
       description: "load-bearing evidence only; omit this field when empty",
@@ -136,7 +150,7 @@ export const CHILD_REPORT_SCHEMA = {
       },
     },
   },
-  required: ["summary"],
+  required: ["summary", "why", "assessment"],
 } as const;
 
 /** 拼附加块：上下文 +（可选）理由 + 报告契约。 */
@@ -448,9 +462,18 @@ export function extractReportFromText(text: string): {
   return { report: null, channel: "none" };
 }
 
+/** 报告散文段的上限：summary/why/assessment 各 2KB——report 本身是限字摘要，这是「有回执优先」档的前提。 */
+const REPORT_PROSE_MAX_CHARS = 2048;
+
+function clipReportProse(text: string): string {
+  return text.length > REPORT_PROSE_MAX_CHARS ? `${text.slice(0, REPORT_PROSE_MAX_CHARS)}…` : text;
+}
+
 function normalizeReport(parsed: ChildReport): ChildReport {
   return {
-    summary: parsed.summary,
+    summary: clipReportProse(parsed.summary),
+    why: typeof parsed.why === "string" ? clipReportProse(parsed.why) : "",
+    assessment: typeof parsed.assessment === "string" ? clipReportProse(parsed.assessment) : "",
     findings: Array.isArray(parsed.findings)
       ? parsed.findings.filter((f) => typeof f?.what === "string")
       : undefined,
@@ -459,6 +482,45 @@ function normalizeReport(parsed: ChildReport): ChildReport {
       : undefined,
     usage: parsed.usage && typeof parsed.usage === "object" ? parsed.usage : undefined,
   };
+}
+
+/**
+ * assessment 是否空转——小窗资格粗筛，不是信任判官（信任只走记账：可核对不上倒扣，对上得分）。
+ * 启发式三判据：缺/空、过短（<40 字符）、负面清单信号词零命中。伪问题骗得过词表也进不了正分，无妨。
+ */
+const ASSESSMENT_SIGNALS = [
+  "problem",
+  "risk",
+  "issue",
+  "limitation",
+  "deviation",
+  "concern",
+  "caveat",
+  "recheck",
+  "fail",
+  "wrong",
+  "missing",
+  "bug",
+  "debt",
+  "担心",
+  "问题",
+  "风险",
+  "不足",
+  "局限",
+  "偏差",
+  "遗留",
+  "待复核",
+  "缺陷",
+  "坑",
+  "错误",
+  "没做",
+  "未完成",
+];
+
+export function assessmentVacuous(report: ChildReport | undefined): boolean {
+  const text = report?.assessment?.trim() ?? "";
+  if (text.length < 40) return true;
+  return !ASSESSMENT_SIGNALS.some((signal) => text.includes(signal));
 }
 
 /**

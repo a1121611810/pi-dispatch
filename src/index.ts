@@ -210,6 +210,7 @@ function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
           usage: r.usage,
           delivery: r.delivery,
           deliveryUnverified: r.deliveryUnverified,
+          assessmentVacuous: r.assessmentVacuous,
           outputPath: r.outputPath,
           outputTruncated: r.outputTruncated,
         }));

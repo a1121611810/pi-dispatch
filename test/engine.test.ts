@@ -507,6 +507,39 @@ test("引擎：自述改了文件、收据一个都对不上 ⇒ 结果带 deliv
   assert.equal(result.deliveryUnverified, true, "收据里没有任何路径支持这个自述");
 });
 
+test("引擎：assessment 全正面 ⇒ 结果带 assessmentVacuous；有具体风险 ⇒ 不带", async () => {
+  const makeStream = (assessment: string) =>
+    JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "toolResult",
+        toolName: "child_report",
+        content: [{ type: "text", text: "received" }],
+        details: {
+          report: { summary: "做完了", why: "任务是字面要求", assessment },
+        },
+      },
+    });
+  const dispatch = async (assessment: string) => {
+    const { engine } = freshEngine({
+      spawn: fakeSpawn({ stdout: makeStream(assessment), exitCode: 0 }),
+      hostMode: "one-shot",
+    });
+    return (await engine.dispatch({ task: "干活" })) as {
+      status: string;
+      assessmentVacuous?: boolean;
+    };
+  };
+  const vacuous = await dispatch(
+    "整体非常顺利，所有既定目标都已圆满达成，交付质量完全符合预期，可以直接进入下一阶段工作。",
+  );
+  assert.equal(vacuous.assessmentVacuous, true, "全正面视为空转");
+  const real = await dispatch(
+    "主流程已验证。边界场景还没覆盖全，存在回归风险，建议父方后续补一轮针对异常输入的测试再合入。",
+  );
+  assert.equal(real.assessmentVacuous, undefined, "有具体风险 ⇒ 不标记");
+});
+
 test("引擎：自述与收据是同一文件（写法不同）⇒ 不报没有实测支撑", async () => {
   const stream = [
     JSON.stringify({

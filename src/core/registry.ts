@@ -30,6 +30,8 @@ export type TaskCommand =
       usage?: TaskRecord["usage"];
       /** 自述对不上收据（没有实测支撑） */
       unverified?: boolean;
+      /** assessment 空转（小窗资格粗筛） */
+      vacuous?: boolean;
     }
   | { kind: "attach-output"; id: string; outputPath: string; truncated?: boolean };
 
@@ -147,6 +149,7 @@ export class TaskRegistry {
           delivery: command.delivery ?? current.delivery,
           usage: command.usage ?? current.usage,
           ...(command.unverified ? { deliveryUnverified: true } : {}),
+          ...(command.vacuous ? { assessmentVacuous: true } : {}),
         };
         this.#records.set(command.id, next);
         this.#emit(next, current);

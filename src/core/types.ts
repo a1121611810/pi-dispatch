@@ -86,9 +86,11 @@ export interface ChildUsage {
 /** 报告的到达通道。none = 什么都没交，要说出来，不要装成交了。 */
 export type ReportChannel = "tool" | "prompt-json" | "none";
 
-/** 孩子交回的结构化报告。 */
+/** 孩子交回的结构化报告。三段式：summary=是什么，why=为什么，assessment=怎么样；后两段是判断，findings 是证据，files_touched/usage 是回执。 */
 export interface ChildReport {
   summary: string;
+  why: string;
+  assessment: string;
   findings?: Array<{ what: string; evidence?: string }>;
   files_touched?: string[];
   usage?: ChildUsage;
@@ -117,6 +119,8 @@ export interface TaskRecord {
   delivery?: ChildDelivery;
   /** 自述的文件和收据一个都对不上——没有实测支撑 */
   deliveryUnverified?: boolean;
+  /** assessment 空转（缺/过短/全正面）——小窗资格粗筛结果，信任只走记账规则 */
+  assessmentVacuous?: boolean;
   /** 产出落盘位置 */
   outputPath?: string;
   /** 孩子 stdout 超尾部上限被截断 */
@@ -150,6 +154,8 @@ export interface DispatchResult {
   delivery?: ChildDelivery;
   /** 自述的文件和收据一个都对不上——没有实测支撑 */
   deliveryUnverified?: boolean;
+  /** assessment 空转（缺/过短/全正面）——小窗资格粗筛结果，信任只走记账规则 */
+  assessmentVacuous?: boolean;
   outputTruncated: boolean;
 }
 
