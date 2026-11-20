@@ -40,3 +40,5 @@ pi 的扩展：派子代理（队列 / 座位池 / 生命周期），收四样�
 - JSONL 断言喂真机抓的样本（`test/child.test.ts` 的 `REAL_STREAM` / `REAL_TOOL_STREAM` / `REAL_USAGE_STREAM`）。
 - 孩子 argv 每段都有理由；新增旗标要进 spec 的命令表，并补测试 + 破坏点。
 - `pnpm mutate` 退出码 3 是基线（既有等价变异），新代码零幸存才是线。
+- 门禁入口是 `scripts/test.ts`（`pnpm test`）：它先擦掉继承来的 `NODE_TEST_CONTEXT` / `PI_DISPATCH_DEPTH`，否则在测试进程或子代理里 `node --test` 一条用例都不跑却退出 0（假绿）。别直接 `node --test`。
+- `pnpm check:breakpoints` 同时只能有一个在跑：它会临时改写源码再复原，并行两跑会读到对方改到一半的源码（实测：别人的中间态让锚点「出现 0 次」）。
