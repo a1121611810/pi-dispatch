@@ -410,8 +410,12 @@ export class TaskEngine {
       }
     });
 
+    let stderrTail = "";
     const exitCode = await new Promise<number>((resolveExit) => {
-      child.onExit((code) => resolveExit(code));
+      child.onExit((code, stderr) => {
+        stderrTail = stderr;
+        resolveExit(code);
+      });
     });
     if (timer) clearTimeout(timer);
     if (stallGuard) clearInterval(stallGuard);
@@ -457,7 +461,12 @@ export class TaskEngine {
     // 若那时还没放，一次性宿主会读到空正文（实测 race）。
     // 只有一次性宿主会读它；长驻模式不存，否则每个任务的正文会永久留在内存。
     if (this.#hostMode === "one-shot") this.#finalTexts.set(taskId, finalText);
-    const result = await this.#registry.submit({ kind: "resolve-exit", id: taskId, exitCode });
+    const result = await this.#registry.submit({
+      kind: "resolve-exit",
+      id: taskId,
+      exitCode,
+      detail: exitDetail(exitCode, stderrTail),
+    });
     // 终态落库后才还座位（先定终态，后还座位——顺序不能反）
     this.#notifyTerminal(result.record);
     this.#evictAndPurge("runtime");
@@ -645,4 +654,13 @@ export class TaskEngine {
       child.kill("SIGTERM");
     }
   }
+}
+
+/** 非零退出的死因摘要：errorMessage 第一行给模型和调用方读——退出码 + stderr 末行（provider 401、段错误都写在 stderr 里）。 */
+function exitDetail(exitCode: number, stderrTail: string): string | undefined {
+  if (exitCode === 0) return undefined;
+  const lastLine = (stderrTail.trim().split("\n").pop() ?? "").trim();
+  const clipped = lastLine.length > 200 ? `…${lastLine.slice(-200)}` : lastLine;
+  if (exitCode === -1) return clipped || "exit code -1（信号不明或起不来）";
+  return clipped ? `exit code ${exitCode} — ${clipped}` : `exit code ${exitCode}`;
 }

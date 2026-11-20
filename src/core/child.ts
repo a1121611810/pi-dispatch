@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { constants as osConstants } from "node:os";
 import type { ChildDelivery, ChildReport, ChildUsage, ReportChannel } from "./types.ts";
 
 // 起子代理：拼命令 + spawn。
@@ -41,10 +42,13 @@ export function spawnChild(argv: string[], env: NodeJS.ProcessEnv = process.env)
   });
   let exitCode: number | null = null;
   let onExit: ((code: number, stderr: string) => void) | undefined;
-  const settle = (code: number): void => {
+  // close 对「被信号杀死」的进程给 (null, signal)：按 POSIX 记 128+signo（SIGKILL=137、SIGTERM=143）；
+  // 起不来（spawn error，code=-1）或信号不明才记 -1。
+  const settle = (code: number | null, signal: NodeJS.Signals | null = null): void => {
     if (exitCode !== null) return;
-    exitCode = code;
-    onExit?.(code, stderr);
+    const signo = signal ? osConstants.signals[signal] : undefined;
+    exitCode = code ?? (signo !== undefined ? 128 + signo : -1);
+    onExit?.(exitCode, stderr);
   };
   // spawn 失败（ENOENT 等）只发 error 不发 exit：不监听会以未捕获异常崩掉宿主
   child.on("error", (error) => {
@@ -52,7 +56,7 @@ export function spawnChild(argv: string[], env: NodeJS.ProcessEnv = process.env)
     settle(-1);
   });
   // close 等 stdio 流关闭后才触发；exit 可能早于管道尾部数据（报告/usage 会丢尾）
-  child.on("close", (code) => settle(code ?? -1));
+  child.on("close", (code, signal) => settle(code, signal));
   return {
     pid: child.pid ?? 0,
     onOutput: (callback) => {
@@ -241,6 +245,8 @@ export interface ParsedChildStream {
   toolReport: ChildReport | null;
   /** 宿主侧 message_end 上报的 usage */
   observedUsage: ChildUsage | null;
+  /** 所有轮次的用量合计（每轮 usage 是单次请求量，账要按累计算） */
+  observedUsageTotal: ChildUsage | null;
   /** 流里实测到的孩子模型/provider */
   observedModel: string | null;
   observedProvider: string | null;

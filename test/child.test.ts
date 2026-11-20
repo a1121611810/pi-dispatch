@@ -448,14 +448,23 @@ test("真起进程：起一个不存在的命令 ⇒ 报失败，不抛异常", 
   assert.notEqual(exitCode, 0, "起不来要报失败");
 });
 
-test("真起进程：信号杀死的孩子退出码是 -1", async () => {
-  // close 事件对「被信号杀死」的进程给 null ⇒ 核心记 -1（区别于进程自己 exit 1）。
+test("真起进程：SIGKILL 的孩子退出码按 POSIX 记 137", async () => {
+  // close 事件对「被信号杀死」的进程给 (null, signal) ⇒ 核心按 POSIX 记 128+signo。
   const child = spawnChild(["/bin/sh", "-c", "sleep 30"], process.env);
   const exitCode = await new Promise<number>((resolve) => {
     child.onExit((code) => resolve(code));
     setTimeout(() => child.kill("SIGKILL"), 100);
   });
-  assert.equal(exitCode, -1, "信号杀死的进程 close code 是 null ⇒ 核心记 -1");
+  assert.equal(exitCode, 137, "SIGKILL ⇒ 128+9=137，旧口径的 -1 分不清信号");
+});
+
+test("真起进程：SIGTERM 的孩子退出码按 POSIX 记 143", async () => {
+  const child = spawnChild(["/bin/sh", "-c", "sleep 30"], process.env);
+  const exitCode = await new Promise<number>((resolve) => {
+    child.onExit((code) => resolve(code));
+    setTimeout(() => child.kill("SIGTERM"), 100);
+  });
+  assert.equal(exitCode, 143, "SIGTERM ⇒ 128+15=143");
 });
 
 test("真起进程：晚订阅也要拿到退出码（退出早于订阅）", async () => {

@@ -18,7 +18,7 @@ export type TaskCommand =
   | { kind: "transition"; id: string; to: TaskStatus }
   | { kind: "stop"; id: string; reason: string }
   | { kind: "cancel-queued"; id: string; reason: string }
-  | { kind: "resolve-exit"; id: string; exitCode: number }
+  | { kind: "resolve-exit"; id: string; exitCode: number; detail?: string }
   | { kind: "reconcile-lost"; id: string; reason: string }
   | {
       kind: "attach-report";
@@ -127,6 +127,8 @@ export class TaskRegistry {
         if (current.status === "running") {
           return this.#move(command.id, command.exitCode === 0 ? "succeeded" : "failed", {
             exitCode: command.exitCode,
+            // 孩子自己非零退出：死因进 stopReason——errorMessage 第一行才可读（模型和调用方最先读它）
+            ...(command.exitCode !== 0 && command.detail ? { stopReason: command.detail } : {}),
           });
         }
         return { record: current, fromStatus: current.status, changed: false };

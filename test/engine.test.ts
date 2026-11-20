@@ -34,9 +34,10 @@ function machineReader(availableBytes = 5369 * MiB): MachineReader {
   return { readSpec: () => spec, readAvailable: () => availableBytes };
 }
 
-/** 假 spawn：可控 stdout / 退出码 / 时序。 */
+/** 假 spawn：可控 stdout / 退出码 / stderr / 时序。 */
 function fakeSpawn(options: {
   stdout?: string;
+  stderr?: string;
   exitCode?: number;
   delayMs?: number;
 }): (argv: string[], env: NodeJS.ProcessEnv) => ChildHandle {
@@ -48,7 +49,7 @@ function fakeSpawn(options: {
       if (exitCode !== null) return;
       exitCode = code;
       clearTimeout(timer); // 退出后放行事件循环（孩子死了就不再拽着）
-      for (const l of exitListeners) l(code, "");
+      for (const l of exitListeners) l(code, options.stderr ?? "");
     };
     // 假孩子也要拽住事件循环直到退出——否则 node 会在派发后立刻退出（真进程不会）
     const timer = setTimeout(() => {
@@ -60,7 +61,7 @@ function fakeSpawn(options: {
       onOutput: (cb) => listeners.push(cb),
       onExit: (cb) => {
         exitListeners.push(cb);
-        if (exitCode !== null) cb(exitCode, "");
+        if (exitCode !== null) cb(exitCode, options.stderr ?? "");
       },
       kill: () => finish(143),
     };
@@ -1241,6 +1242,53 @@ test("引擎：失败时的 exitCode 是真实退出码，不是一律 -1", asyn
   const outcome = await engine.dispatch({ task: "干活" });
   assert.equal((outcome as { status: string }).status, "failed");
   assert.equal((outcome as { exitCode: number }).exitCode, 3, "要透传真实退出码");
+});
+
+test("引擎：孩子自己非零退出，errorMessage 带退出码而不是单词 failed", async () => {
+  const { engine } = freshEngine({
+    spawn: fakeSpawn({ stdout: "err", exitCode: 1 }),
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活" });
+  assert.equal((outcome as { status: string }).status, "failed");
+  assert.match(
+    (outcome as { errorMessage?: string }).errorMessage ?? "",
+    /exit code 1/,
+    "第一行要可读：模型和调用方最先读 errorMessage",
+  );
+});
+
+test("引擎：非零退出把 stderr 末行拼进 errorMessage", async () => {
+  // provider 401、段错误都写在 stderr 里——死因摘要比光一个码有用。
+  const { engine } = freshEngine({
+    spawn: fakeSpawn({
+      stdout: "x",
+      exitCode: 1,
+      stderr: 'provider boom\n{"error":"401 Unauthorized"}',
+    }),
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活" });
+  assert.match(
+    (outcome as { errorMessage?: string }).errorMessage ?? "",
+    /exit code 1 — .*401/,
+    "stderr 末行要拼上",
+  );
+});
+
+test("引擎：起不来的孩子，errorMessage 直接给 spawn 错误", async () => {
+  // exitCode -1（起不来/信号不明）时没有码可读，stderr 尾巴就是全部死因。
+  const { engine } = freshEngine({
+    spawn: fakeSpawn({ stdout: "", exitCode: -1, stderr: "spawn error: ENOENT pi" }),
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活" });
+  assert.equal((outcome as { status: string }).status, "failed");
+  assert.match(
+    (outcome as { errorMessage?: string }).errorMessage ?? "",
+    /ENOENT/,
+    "spawn 错误要出现在第一行",
+  );
 });
 
 test("引擎：shutdown 取消排队任务时，一次性等待者拿到的是 canceled 不是 failed", async () => {
