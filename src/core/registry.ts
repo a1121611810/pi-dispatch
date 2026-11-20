@@ -26,6 +26,8 @@ export type TaskCommand =
       report: TaskRecord["report"];
       channel: TaskRecord["reportChannel"];
       delivery?: TaskRecord["delivery"];
+      /** 引擎观测到的真实用量（与报告独立：孩子没交报告，账也要有） */
+      usage?: TaskRecord["usage"];
       /** 自述对不上收据（没有实测支撑） */
       unverified?: boolean;
     }
@@ -141,6 +143,7 @@ export class TaskRegistry {
           report: command.report,
           reportChannel: command.channel,
           delivery: command.delivery ?? current.delivery,
+          usage: command.usage ?? current.usage,
           ...(command.unverified ? { deliveryUnverified: true } : {}),
         };
         this.#records.set(command.id, next);

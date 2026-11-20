@@ -9,6 +9,10 @@
 //   src/core/engine.ts 的 `this.#storage?.x`（504/509/574 行）——storage 是可选的，
 //   没注入时 `?.` 与 `.` 都抛？不，?. 返回 undefined，. 抛 TypeError。
 //   但那些路径都有 `?? undefined` 兜底 ⇒ 等价。
+//   shutdown 里 `this.#teardown = true` → false——派发在闸口就被 sessionEndingGate
+//   （读 #ending）拒掉，#teardown 是第二道防线；默认闸口下不可达 ⇒ 等价。
+//   shutdown 循环里 `this.#registry.get(taskId)?.status` 的 ?. → .——在跑的孩子必有记录
+//   （记录只在终态后才被挤掉），get 不会返回 undefined ⇒ 等价。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, readdirSync } from "node:fs";
@@ -371,6 +375,112 @@ test("引擎：用量自报为空时用观察到的顶上去", async () => {
   const outcome = await engine.dispatch({ task: "干活" });
   const result = outcome as { status: string; report?: { usage?: { input?: number } } };
   assert.equal(result.report?.usage?.input, 42, "自报是 0 ⇒ 用观察到的 42");
+});
+
+test("引擎：没交报告时用量仍从记录里出来", async () => {
+  // 孩子完全没交报告（reportChannel=none）：账不能跟着丢
+  const stream = [
+    JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "只有正文" }],
+        usage: { input: 42, output: 7 },
+      },
+    }),
+  ].join("\n");
+  const { engine } = freshEngine({
+    spawn: fakeSpawn({ stdout: stream, exitCode: 0 }),
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活" });
+  const result = outcome as { status: string; usage?: { input?: number } };
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.usage?.input, 42, "没交报告 ⇒ 用宿主观测到的用量");
+});
+
+test("引擎：用量按轮累加，不是最后一条", async () => {
+  const stream = [
+    JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "第一轮" }],
+        usage: { input: 30, output: 3 },
+      },
+    }),
+    JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "第二轮" }],
+        usage: { input: 12, output: 2 },
+      },
+    }),
+  ].join("\n");
+  const { engine } = freshEngine({
+    spawn: fakeSpawn({ stdout: stream, exitCode: 0 }),
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活" });
+  const result = outcome as { usage?: { input?: number } };
+  assert.equal(result.usage?.input, 42, "30+12=42，不是最后一条的 12");
+});
+
+test("引擎：报告通道 tool > prompt-json > none", async () => {
+  const promptText = [
+    "这是正文。",
+    "```json",
+    '{ "summary": "来自正文", "usage": { "input": 0 } }',
+    "```",
+  ].join("\n");
+  const assistant = JSON.stringify({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: promptText }],
+      usage: { input: 11, output: 1 },
+    },
+  });
+  const toolResult = JSON.stringify({
+    type: "message_end",
+    message: {
+      role: "toolResult",
+      toolName: "child_report",
+      content: [{ type: "text", text: "child report received" }],
+      details: { report: { summary: "来自工具" } },
+    },
+  });
+  const dispatch = async (stdout: string) => {
+    const { engine } = freshEngine({
+      spawn: fakeSpawn({ stdout, exitCode: 0 }),
+      hostMode: "one-shot",
+    });
+    const outcome = await engine.dispatch({ task: "干活" });
+    return outcome as {
+      status: string;
+      reportChannel: string;
+      report?: { summary?: string };
+    };
+  };
+
+  const both = await dispatch([assistant, toolResult].join("\n"));
+  assert.equal(both.status, "succeeded");
+  assert.equal(both.reportChannel, "tool");
+  assert.equal(both.report?.summary, "来自工具");
+
+  const promptOnly = await dispatch(assistant);
+  assert.equal(promptOnly.reportChannel, "prompt-json");
+  assert.equal(promptOnly.report?.summary, "来自正文");
+
+  const neither = await dispatch(
+    JSON.stringify({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "只有正文" }] },
+    }),
+  );
+  assert.equal(neither.reportChannel, "none");
+  assert.equal(neither.report, undefined);
 });
 
 test("引擎：自述改了文件、收据一个都对不上 ⇒ 结果带 deliveryUnverified", async () => {

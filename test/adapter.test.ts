@@ -1,11 +1,21 @@
 // 适配层探针：session_start 重复触发时不能累积 handler。
 // 假 pi 只做两件事：记 handler、给退订函数——够验证第 5 条修复为止。
+//
+// 等价变异（变异器杀不掉，也不该杀）：
+//   `JSON.stringify(value ?? null, null, 2) ?? "null"` 的第二个 ?? —— JSON.stringify 只在
+//   undefined / function / symbol 时返回 undefined（此时两者都给 "null"），它从不返回空串 ⇒ 等价。
+//   `process.env.HOME ?? "~"` —— HOME 未设（都给 "~"）或是非空绝对路径（都给路径）；
+//   空串不是合法 HOME，pi 的 getAgentDir 也按同样口径处理 ⇒ 等价。
+//   `Number(process.env.PI_DISPATCH_DEPTH ?? 0)` —— 未设时都给 0；设了是数字串，
+//   "0" 在 ?? 下是 "0"、在 || 下是 0，Number 之后都是 0 ⇒ 等价。
+//   `if (!engine) throw` 的 delete ! —— 工具只在 session_start 里注册，而 engine 在
+//   注册之前已赋值 ⇒ 这条分支到不了 ⇒ 等价。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import entry, { deliver, textResult } from "../src/index.ts";
+import entry, { deliver, textResult, toHostMode } from "../src/index.ts";
 import { NotificationCenter } from "../src/core/notifications.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
 
@@ -59,7 +69,7 @@ test("适配层：session_start 触发两次后，turn_end 只剩 1 个 handler"
   }
 });
 
-test("适配层：子代理进程（depth>0）不注册任何东西", async () => {
+test("适配层：子代理进程（depth>0）只注册 child_report", async () => {
   const home = mkdtempSync(join(tmpdir(), "dispatch-adapter2-"));
   const oldHome = process.env.HOME;
   const oldDepth = process.env.PI_DISPATCH_DEPTH;
@@ -70,13 +80,92 @@ test("适配层：子代理进程（depth>0）不注册任何东西", async () =
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     entry(pi as any);
     await [...(handlers.get("session_start") ?? [])][0]!(undefined, fakeCtx(home));
-    assert.equal(tools.size, 0, "孩子不该注册父方工具");
+    assert.deepEqual([...tools.keys()], ["child_report"], "孩子只拿回执工具");
     assert.equal(handlers.get("turn_end")?.size ?? 0, 0, "孩子不该装通知投递");
   } finally {
     if (oldHome === undefined) delete process.env.HOME;
     else process.env.HOME = oldHome;
     if (oldDepth === undefined) delete process.env.PI_DISPATCH_DEPTH;
     else process.env.PI_DISPATCH_DEPTH = oldDepth;
+  }
+});
+
+test("适配层：child_report 工具把报告放进 details.report", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dispatch-adapter3-"));
+  const oldHome = process.env.HOME;
+  const oldDepth = process.env.PI_DISPATCH_DEPTH;
+  process.env.HOME = home;
+  process.env.PI_DISPATCH_DEPTH = "1";
+  try {
+    const { pi, handlers, tools } = fakePi();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    entry(pi as any);
+    await [...(handlers.get("session_start") ?? [])][0]!(undefined, fakeCtx(home));
+    const def = tools.get("child_report") as {
+      execute: (
+        id: string,
+        args: unknown,
+      ) => Promise<{
+        content: Array<{ type: string; text: string }>;
+        structuredContent?: unknown;
+        details?: { report?: { summary?: string } };
+      }>;
+    };
+    const args = { summary: "结论", files_touched: ["a.ts"] };
+    const out = await def.execute("call_1", args);
+    assert.equal(out.details?.report?.summary, "结论");
+    assert.deepEqual(out.structuredContent, args);
+    assert.ok(out.content[0]?.text);
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+    if (oldDepth === undefined) delete process.env.PI_DISPATCH_DEPTH;
+    else process.env.PI_DISPATCH_DEPTH = oldDepth;
+  }
+});
+
+test("适配层：停不存在的任务不崩（status 是 undefined）", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dispatch-adapter4-"));
+  const oldHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const { pi, handlers, tools } = fakePi();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    entry(pi as any);
+    await [...(handlers.get("session_start") ?? [])][0]!(undefined, fakeCtx(home));
+    const def = tools.get("dispatch_stop") as {
+      execute: (id: string, args: unknown) => Promise<{ content: Array<{ text: string }> }>;
+    };
+    let out: { content: Array<{ text: string }> } | undefined;
+    await assert.doesNotReject(async () => {
+      out = await def.execute("call_1", { taskId: "不存在的编号" });
+    });
+    const payload = JSON.parse(out!.content[0]!.text) as { status?: string; reason: string };
+    assert.equal(payload.status, undefined, "没这条记录 ⇒ status 是 undefined");
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+  }
+});
+
+test("适配层：理由是空串当没给（回落 user stop）", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dispatch-adapter5-"));
+  const oldHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const { pi, handlers, tools } = fakePi();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    entry(pi as any);
+    await [...(handlers.get("session_start") ?? [])][0]!(undefined, fakeCtx(home));
+    const def = tools.get("dispatch_stop") as {
+      execute: (id: string, args: unknown) => Promise<{ content: Array<{ text: string }> }>;
+    };
+    const out = await def.execute("call_1", { taskId: "不存在的编号", reason: "" });
+    const payload = JSON.parse(out.content[0]!.text) as { reason: string };
+    assert.equal(payload.reason, "user stop", "空串是坏值 ⇒ 回落默认理由");
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
   }
 });
 
@@ -87,12 +176,38 @@ test("textResult：undefined 也输出合法 JSON（pi 下一轮读 .length 会�
   assert.equal(out.content[0]!.text, "null");
 });
 
+test("toHostMode：rpc/tui 长驻，print/json 一次性", () => {
+  assert.equal(toHostMode("rpc"), "long-lived");
+  assert.equal(toHostMode("tui"), "long-lived");
+  assert.equal(toHostMode("print"), "one-shot");
+  assert.equal(toHostMode("json"), "one-shot");
+});
+
+test("textResult：0 是有效值（不是 null）", () => {
+  assert.equal(textResult(0).content[0]!.text, "0");
+  assert.equal(textResult(false).content[0]!.text, "false");
+  assert.equal(textResult("").content[0]!.text, '""');
+});
+
 test("textResult：对象按缩进 2 输出", () => {
   assert.equal(textResult({ a: 1 }).content[0]!.text, '{\n  "a": 1\n}');
 });
 
 test("textResult：details 是 undefined（pi 的类型要求显式给）", () => {
   assert.equal(textResult(1).details, undefined);
+});
+
+test("deliver：通知带 display=true", async () => {
+  const registry = new TaskRegistry();
+  const notifications = new NotificationCenter();
+  notifications.attach(registry as never);
+  await registry.submit({
+    kind: "spawn",
+    record: { id: "abcdef1234", status: "succeeded", task: "t", finishedAt: 1700000000000 },
+  });
+  const sent: Array<{ display?: boolean }> = [];
+  deliver({ sendMessage: (m: { display?: boolean }) => sent.push(m) } as never, notifications);
+  assert.equal(sent[0]!.display, true, "通知要显示出来（display 不为 true 会被 pi 折叠掉）");
 });
 
 test("deliver：把待投递的通知发成一条 custom 消息（编号前缀 + 状态）", async () => {

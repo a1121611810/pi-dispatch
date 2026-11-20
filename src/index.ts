@@ -1,5 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
+import { fileURLToPath } from "node:url";
+import { CHILD_REPORT_SCHEMA, CHILD_REPORT_TOOL_NAME } from "./core/child.ts";
 import { TaskEngine } from "./core/engine.ts";
 import { TaskRegistry } from "./core/registry.ts";
 import { NotificationCenter } from "./core/notifications.ts";
@@ -10,7 +12,7 @@ import type { DispatchInput, HostMode } from "./core/types.ts";
 // 不写任何业务规则——业务规则全在 src/core/。
 
 /** ctx.mode → 核心层的宿主模式。加 tui 时只加一行。 */
-function toHostMode(mode: string): HostMode {
+export function toHostMode(mode: string): HostMode {
   if (mode === "rpc" || mode === "tui") return "long-lived";
   return "one-shot"; // print / json
 }
@@ -81,8 +83,11 @@ export default function piDispatchEntry(pi: ExtensionAPI): void {
     void engine?.shutdown();
     cleanup = undefined;
 
-    // 子代理进程（depth>0）：不装配宿主侧，不做任何事
-    if (Number(process.env.PI_DISPATCH_DEPTH ?? 0) > 0) return;
+    // 子代理进程（depth>0）：只装配回执工具，不做宿主侧任何事
+    if (Number(process.env.PI_DISPATCH_DEPTH ?? 0) > 0) {
+      registerChildReportTool(pi);
+      return;
+    }
 
     const session = startSession(pi, ctx);
     engine = session.engine;
@@ -107,6 +112,7 @@ function startSession(
     storage,
     hostMode: toHostMode(ctx.mode),
     piVersion: safe(() => PI_VERSION),
+    childExtensionPath: fileURLToPath(import.meta.url),
     sessionModel: () => {
       try {
         return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
@@ -201,6 +207,7 @@ function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
           finishedAt: r.finishedAt,
           stopReason: r.stopReason,
           reportChannel: r.reportChannel,
+          usage: r.usage,
           delivery: r.delivery,
           deliveryUnverified: r.deliveryUnverified,
           outputPath: r.outputPath,
@@ -224,14 +231,32 @@ function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
     } as never,
     execute: async (_id, args) => {
       const a = args as { taskId: string; reason?: string };
-      await current().stop(a.taskId, a.reason ?? "user stop");
+      // 空串当没给：理由是坏值时回落默认（与 core 的 nonEmpty 口径一致）
+      const reason = a.reason || "user stop";
+      await current().stop(a.taskId, reason);
       // 停完要回一句话（pi 的 details 是必填；text 不能是 undefined）
       return textResult({
         taskId: a.taskId,
-        reason: a.reason ?? "user stop",
+        reason,
         status: current().registry.get(a.taskId)?.status,
       });
     },
+  });
+}
+
+/** 孩子的回执工具：四样报告经 toolResult 的 details.report 回给父方（tool 通道）。 */
+function registerChildReportTool(pi: ExtensionAPI): void {
+  pi.registerTool({
+    name: CHILD_REPORT_TOOL_NAME,
+    label: "交报告",
+    description:
+      "把四样结构化回执交给父方（summary / findings / files_touched / usage）。报告只是摘要，交付物仍是你最终消息的正文。",
+    parameters: CHILD_REPORT_SCHEMA as never,
+    execute: async (_id, args) => ({
+      content: [{ type: "text", text: "child report received" }],
+      structuredContent: args,
+      details: { report: args },
+    }),
   });
 }
 

@@ -111,6 +111,8 @@ export interface TaskRecord {
   whySuppressed?: boolean;
   report?: ChildReport;
   reportChannel?: ReportChannel;
+  /** 孩子的真实用量（引擎从事件流逐轮累加，不依赖孩子交报告） */
+  usage?: ChildUsage;
   /** 孩子的真实交付轨迹（引擎抽的，不是模型自述） */
   delivery?: ChildDelivery;
   /** 自述的文件和收据一个都对不上——没有实测支撑 */

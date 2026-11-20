@@ -72,6 +72,8 @@ export interface EngineDeps {
   sessionModel?: () => string | undefined;
   /** pi 可执行文件路径 */
   piPath?: string;
+  /** 孩子自己的扩展文件路径（-e 装进孩子，回执工具才在） */
+  childExtensionPath?: string;
   /** 时钟（测试注入假时钟） */
   now?: () => number;
 }
@@ -122,6 +124,7 @@ export class TaskEngine {
   readonly #piVersion?: string;
   readonly #sessionModel?: () => string | undefined;
   readonly #piPath?: string;
+  readonly #childExtensionPath?: string;
   readonly #now: () => number;
   readonly #owner: { pid: number; startMs: number };
   readonly #ready: Promise<void>;
@@ -159,6 +162,7 @@ export class TaskEngine {
     this.#piVersion = deps.piVersion;
     this.#sessionModel = deps.sessionModel;
     this.#piPath = deps.piPath;
+    this.#childExtensionPath = deps.childExtensionPath;
     this.#now = cfg.now;
     this.#spec = this.#machine.readSpec();
     this.#launchLimit = maxConcurrentStarts(this.#spec.cpus);
@@ -356,6 +360,7 @@ export class TaskEngine {
       sessionModel: this.#sessionModel?.(),
       piVersion: this.#piVersion,
       piPath: this.#piPath,
+      childExtensionPath: this.#childExtensionPath,
     });
   }
 
@@ -429,8 +434,8 @@ export class TaskEngine {
     // 自报 usage 为空/零时，用主方观察到的顶上去
     const selfUsage = report?.usage;
     const selfUsageEmpty = !selfUsage || (!selfUsage.input && !selfUsage.output && !selfUsage.cost);
-    if (report && selfUsageEmpty && parsed.observedUsage) {
-      report = { ...report, usage: parsed.observedUsage };
+    if (report && selfUsageEmpty && parsed.observedUsageTotal) {
+      report = { ...report, usage: parsed.observedUsageTotal };
     }
     const unverified = deliveryUnverified(report, parsed.delivery);
     await this.#registry.submit({
@@ -439,6 +444,7 @@ export class TaskEngine {
       report,
       channel,
       delivery: parsed.delivery,
+      usage: parsed.observedUsageTotal ?? undefined,
       unverified,
     });
     await this.#registry.submit({
@@ -482,7 +488,7 @@ export class TaskEngine {
       exitCode: record.exitCode ?? (record.status === "succeeded" ? 0 : -1),
       started: startedAt > 0,
       durationMs: startedAt && finishedAt ? finishedAt - startedAt : 0,
-      usage: record.report?.usage,
+      usage: record.usage ?? record.report?.usage,
       errorMessage:
         record.status === "succeeded" ? undefined : (record.stopReason ?? record.status),
       readOnlyTier: input.readOnly ?? "lenient",

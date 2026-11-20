@@ -10,6 +10,8 @@
 //   非空串，undefined 是假值 ⇒ ?? 与 || 相同 ⇒ 等价。
 //   第四处 `report?.files_touched ?? []`——files_touched 是数组或 undefined，
 //   数组恒真 ⇒ ?? 与 || 在可达输入上等价。
+//   addUsage 的 `(a ?? 0)`——a 是 JSON 解析出的有限数或 undefined（JSON 无 NaN），
+//   a 为 0 时 ?? 与 || 都给 0 ⇒ 等价。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -25,6 +27,7 @@ import {
   pathMatches,
   spawnChild,
   supportsNoMcp,
+  CHILD_REPORT_TOOL_NAME,
   REPORT_CONTRACT_BLOCK,
   SUBAGENT_CONTEXT_BLOCK,
 } from "../src/core/child.ts";
@@ -44,6 +47,22 @@ const REAL_STREAM = [
   '{"type":"turn_end","message":{"role":"assistant","content":[]},"toolResults":[]}',
   '{"type":"agent_end","messages":[],"willRetry":false}',
   '{"type":"agent_settled","aborted":false}',
+].join("\n");
+
+/** 真机抓的样本（2026-11-19，pi 1.5.2）：孩子调 child_report，成功回执经 details.report 回来。 */
+const REAL_TOOL_STREAM =
+  '{"type":"message_end","message":{"role":"toolResult","toolCallId":"call_5e3cbe08098c4961a046c7ee","toolName":"child_report","content":[{"type":"text","text":"child report received"}],"details":{"report":{"findings":[{"evidence":"read of /etc/hosts showed 12 lines; bash `wc -l /etc/hosts` → 12 and `awk END{print NR}` → 12","what":"/etc/hosts contains exactly 12 lines (295 bytes, newline-terminated)"},{"evidence":"full file read; hexdump of tail confirms final byte is 0x0a","what":"File ends with a trailing newline, so line count is unambiguous"}],"summary":"/etc/hosts has 12 lines (verified with both read and wc -l).","usage":{"cost":0,"input":0,"output":0,"turns":3}}},"isError":false,"durationMs":0,"timestamp":1795099891058}}';
+
+/** 真机抓的样本（2026-11-19，pi 1.5.2）：7 轮 assistant，每轮 usage 是单次请求量（非累计）。
+ *  合计 input=4571 / output=1367 / cacheRead=19456 / cost≈0.001798；最后一条 input 只有 354。 */
+const REAL_USAGE_STREAM = [
+  '{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_af424c31565348bbad99cb9f","name":"read","arguments":{"path":"/etc/hosts"}}],"usage":{"input":2605,"output":29,"cacheRead":128,"cacheWrite":0,"cost":{"total":0.00041006999999999995}},"stopReason":"toolUse"}}',
+  '{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_9ae971afc7274287b9d821c0","name":"bash","arguments":{"command":"wc -l /etc/hosts"}}],"usage":{"input":189,"output":62,"cacheRead":2688,"cacheWrite":0,"cost":{"total":0.00010586999999999999}},"stopReason":"toolUse"}}',
+  '{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_0f1a50cf85574ce7a81622d3","name":"bash","arguments":{"command":"wc -c /etc/hosts"}}],"usage":{"input":131,"output":159,"cacheRead":2816,"cacheWrite":0,"cost":{"total":0.00015729}},"stopReason":"toolUse"}}',
+  '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"12 lines"}],"usage":{"input":131,"output":438,"cacheRead":2944,"cacheWrite":0,"cost":{"total":0.00032661}},"stopReason":"toolUse"}}',
+  '{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_99a212a1e87943da8dda937f","name":"child_report","arguments":{"summary":"s"}}],"usage":{"input":668,"output":239,"cacheRead":3072,"cacheWrite":0,"cost":{"total":0.00028967999999999995}},"stopReason":"toolUse"}}',
+  '{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_5e3cbe08098c4961a046c7ee","name":"child_report","arguments":{"summary":"s"}}],"usage":{"input":493,"output":245,"cacheRead":3712,"cacheWrite":0,"cost":{"total":0.00027663}},"stopReason":"toolUse"}}',
+  '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"`/etc/hosts` has **12 lines**"}],"usage":{"input":354,"output":195,"cacheRead":4096,"cacheWrite":0,"cost":{"total":0.00023153999999999997}},"stopReason":"stop"}}',
 ].join("\n");
 
 // ── 拼命令 ────────────────────────────────────────────────────────────────
@@ -102,11 +121,11 @@ test("拼命令：思考档位挂在 :<thinking> 后缀", () => {
   assert.ok(argv.includes("a/b:high"));
 });
 
-test("拼命令：只读档位 strict 时工具表只有读集", () => {
+test("拼命令：只读档位 strict 时工具表是读集 + 回执工具", () => {
   const argv = buildPiArgv({ task: "t", readOnly: "strict" });
   const idx = argv.indexOf("--tools");
   assert.ok(idx >= 0);
-  assert.equal(argv[idx + 1], "read,grep,find,ls");
+  assert.equal(argv[idx + 1], "read,grep,find,ls,child_report");
 });
 
 test("拼命令：lenient 时不收窄（不发 --tools）", () => {
@@ -126,13 +145,13 @@ test("拼命令：allowScripts + strict 时工具表是读集 + codemode", () =>
   const argv = buildPiArgv({ task: "t", allowScripts: true, readOnly: "strict" });
   const idx = argv.indexOf("--tools");
   assert.ok(idx >= 0, "strict 要发 --tools");
-  assert.equal(argv[idx + 1], "read,grep,find,ls,codemode");
+  assert.equal(argv[idx + 1], "read,grep,find,ls,child_report,codemode");
 });
 
-test("拼命令：strict 但不开 allowScripts 时工具表只有读集", () => {
+test("拼命令：strict 档白名单也留 child_report", () => {
   const argv = buildPiArgv({ task: "t", readOnly: "strict" });
   const idx = argv.indexOf("--tools");
-  assert.equal(argv[idx + 1], "read,grep,find,ls");
+  assert.equal(argv[idx + 1], "read,grep,find,ls,child_report");
   assert.ok(!argv.includes("-e"));
 });
 
@@ -141,6 +160,14 @@ test("拼命令：allowScripts 时带 -e builtin:codemode（不是「内建:」�
   const idx = argv.indexOf("-e");
   assert.ok(idx >= 0, "allowScripts 要带 -e");
   assert.equal(argv[idx + 1], "builtin:codemode");
+});
+
+test("拼命令：孩子装自己的回执扩展（-e <path>）", () => {
+  const argv = buildPiArgv({ task: "t", childExtensionPath: "/x/pi-dispatch.js" });
+  const idx = argv.indexOf("-e");
+  assert.ok(idx >= 0, "要带 -e");
+  assert.equal(argv[idx + 1], "/x/pi-dispatch.js");
+  assert.ok(!buildPiArgv({ task: "t" }).includes("/x/pi-dispatch.js"));
 });
 
 test("拼命令：不 allowScripts 时不带 -e", () => {
@@ -167,6 +194,15 @@ test("附加块：报告契约总是带上", () => {
 test("报告契约：说清「报告是摘要，交付物是正文」", () => {
   assert.match(REPORT_CONTRACT_BLOCK, /NOT the deliverable/);
   assert.match(REPORT_CONTRACT_BLOCK, /never hide the deliverable/);
+});
+
+test("拼命令：契约块里的工具名与常量一致", () => {
+  // 整句匹配：includes 会让 "child_reportX" 这种漂移蒙混过关
+  assert.match(
+    REPORT_CONTRACT_BLOCK,
+    new RegExp(`calling the ${CHILD_REPORT_TOOL_NAME} tool`),
+    `契约里写的工具名必须就是 ${CHILD_REPORT_TOOL_NAME}`,
+  );
 });
 
 // ── 收件：解析 JSONL ──────────────────────────────────────────────────────
@@ -253,6 +289,48 @@ test("收件：报告通道优先级——structuredContent > details.report > d
     '{"type":"message_end","message":{"role":"toolResult","toolName":"child_report","details":{"summary":"来自 details"}}}',
   ].join("\n");
   assert.equal(parseChildStream(withPlainDetails).toolReport?.summary, "来自 details");
+});
+
+test("收件：真机工具回执样本（child_report → details.report）", () => {
+  const parsed = parseChildStream(REAL_TOOL_STREAM);
+  assert.equal(
+    parsed.toolReport?.summary,
+    "/etc/hosts has 12 lines (verified with both read and wc -l).",
+  );
+  assert.equal(parsed.toolReport?.findings?.length, 2);
+});
+
+test("收件：多轮用量累加（不是最后一条）", () => {
+  const parsed = parseChildStream(REAL_USAGE_STREAM);
+  // 每轮 usage 是单次请求量；账要按累计算，最后一条（input=354）只是 1/13
+  assert.equal(parsed.observedUsageTotal?.input, 4571);
+  assert.equal(parsed.observedUsageTotal?.output, 1367);
+  assert.equal(parsed.observedUsageTotal?.cacheRead, 19456);
+  assert.ok(Math.abs((parsed.observedUsageTotal?.cost ?? 0) - 0.00179769) < 1e-6, "cost 也要累加");
+  // 最后一条单独的值仍在（供「报告自报为空时顶上去」用）
+  assert.equal(parsed.observedUsage?.input, 354);
+});
+
+test("收件：缺席的用量字段按 0 累加", () => {
+  // provider 可能省略 cache 字段：undefined 要当 0，不能污染合计
+  const stream = [
+    '{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":10,"output":1}}}',
+    '{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":5,"output":2}}}',
+  ].join("\n");
+  const parsed = parseChildStream(stream);
+  assert.equal(parsed.observedUsageTotal?.input, 15);
+  assert.equal(parsed.observedUsageTotal?.cacheRead, 0, "缺席字段按 0 计");
+  assert.equal(parsed.observedUsageTotal?.cost, 0);
+});
+
+test("收件：工具结果的文本不覆盖正文", () => {
+  const stream = [
+    '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"正文"}]}}',
+    '{"type":"message_end","message":{"role":"toolResult","toolName":"child_report","content":[{"type":"text","text":"child report received"}],"details":{"report":{"summary":"回执"}}}}',
+  ].join("\n");
+  const parsed = parseChildStream(stream);
+  assert.equal(parsed.text, "正文");
+  assert.equal(parsed.toolReport?.summary, "回执");
 });
 
 test("收件：不是 child_report 的工具结果不进报告通道", () => {
@@ -368,6 +446,16 @@ test("真起进程：起一个不存在的命令 ⇒ 报失败，不抛异常", 
     });
   });
   assert.notEqual(exitCode, 0, "起不来要报失败");
+});
+
+test("真起进程：信号杀死的孩子退出码是 -1", async () => {
+  // close 事件对「被信号杀死」的进程给 null ⇒ 核心记 -1（区别于进程自己 exit 1）。
+  const child = spawnChild(["/bin/sh", "-c", "sleep 30"], process.env);
+  const exitCode = await new Promise<number>((resolve) => {
+    child.onExit((code) => resolve(code));
+    setTimeout(() => child.kill("SIGKILL"), 100);
+  });
+  assert.equal(exitCode, -1, "信号杀死的进程 close code 是 null ⇒ 核心记 -1");
 });
 
 test("真起进程：晚订阅也要拿到退出码（退出早于订阅）", async () => {

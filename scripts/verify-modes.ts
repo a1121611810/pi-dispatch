@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import {
   judgeAllowScripts,
+  judgeChildReport,
   judgeDispatch,
   judgeJsonStream,
   judgeReject,
@@ -147,6 +148,20 @@ async function caseAllowScripts(mode: "print" | "json"): Promise<void> {
   });
 }
 
+async function caseChildReport(mode: "print" | "json"): Promise<void> {
+  await withTempProject(async (dir) => {
+    // 故意不要求交报告：孩子多半 reportChannel=none——账上仍要有宿主观测的用量
+    const prompt =
+      "Use the dispatch_task tool to dispatch a subagent with taskDescription " +
+      '"Answer with the single word: done". ' +
+      "Then report the dispatch result.";
+    await runPrintLike(mode, prompt, dir);
+    const record = readRecords(dir)[0];
+    const v = judgeChildReport(record);
+    report(mode, "没交报告账上也有数（宿主观测用量非零）", v.ok, v.detail);
+  });
+}
+
 async function caseJsonEventShape(mode: "json"): Promise<void> {
   await withTempProject(async (dir) => {
     const prompt =
@@ -234,6 +249,7 @@ async function main(): Promise<void> {
   await caseDispatch("print");
   await caseReject("print");
   await caseAllowScripts("print");
+  await caseChildReport("print");
   console.log();
   await caseDispatch("json");
   await caseJsonEventShape("json");

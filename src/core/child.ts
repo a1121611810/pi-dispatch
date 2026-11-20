@@ -81,13 +81,16 @@ function escapeXmlText(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/** 回执工具名——契约块与解析器共用，别写两处。 */
+export const CHILD_REPORT_TOOL_NAME = "child_report";
+
 /**
  * 报告契约。刻意零 import——这里是契约的唯一持有者。
  * 报告是摘要，**交付物是正文**——不能把正文藏进 JSON 块。
  */
 export const REPORT_CONTRACT_BLOCK = [
   "<child-report-contract>",
-  "Before finishing, deliver a child report — preferably by calling the child_report tool (its schema fixes the shape); if that tool is not available, put a fenced JSON block at the very end of your final message:",
+  `Before finishing, deliver a child report — preferably by calling the ${CHILD_REPORT_TOOL_NAME} tool (its schema fixes the shape); if that tool is not available, put a fenced JSON block at the very end of your final message:`,
   "```json",
   '{ "summary": "one sentence conclusion", "findings": [{ "what": "claim", "evidence": "where it comes from" }], "files_touched": ["relative/path"], "usage": { "input": 0, "output": 0, "cost": 0, "turns": 0 } }',
   "```",
@@ -95,6 +98,42 @@ export const REPORT_CONTRACT_BLOCK = [
   "findings/files_touched/usage may be omitted when empty.",
   "</child-report-contract>",
 ].join("\n");
+
+/**
+ * 工具通道的入参形状——与契约块里的 JSON 例子一一对应。
+ * pi 按它校验孩子的调用；父方从 toolResult 的 details.report 读回。
+ */
+export const CHILD_REPORT_SCHEMA = {
+  type: "object",
+  properties: {
+    summary: { type: "string", description: "one sentence conclusion" },
+    findings: {
+      type: "array",
+      description: "load-bearing evidence only; omit this field when empty",
+      items: {
+        type: "object",
+        properties: { what: { type: "string" }, evidence: { type: "string" } },
+        required: ["what"],
+      },
+    },
+    files_touched: {
+      type: "array",
+      description: "relative paths you touched; omit this field when empty",
+      items: { type: "string" },
+    },
+    usage: {
+      type: "object",
+      description: "omit this field when empty",
+      properties: {
+        input: { type: "number" },
+        output: { type: "number" },
+        cost: { type: "number" },
+        turns: { type: "number" },
+      },
+    },
+  },
+  required: ["summary"],
+} as const;
 
 /** 拼附加块：上下文 +（可选）理由 + 报告契约。 */
 export function buildAppendBlock(options: { why?: string }): string {
@@ -119,6 +158,8 @@ export interface BuildArgvOptions {
   projectContext?: "auto" | "none";
   /** 子代理能不能写脚本批量调工具。 */
   allowScripts?: boolean;
+  /** 孩子自己的扩展文件路径——用 -e 装进孩子，回执工具才在。 */
+  childExtensionPath?: string;
   /** 会话当前模型（调用没给时的回落）。 */
   sessionModel?: string;
   /** pi 版本——--no-mcp 只在 1.1.0 之后有。 */
@@ -158,6 +199,8 @@ export function buildPiArgv(options: BuildArgvOptions): string[] {
   argv.push("--append-system-prompt", buildAppendBlock(options));
   // 减量：砍自动发现带进孩子的宿主面散文与技能
   argv.push("--no-extensions", "--no-skills");
+  // 回执工具：把本扩展自己装进孩子（显式 -e 不受 --no-extensions 影响）
+  if (options.childExtensionPath) argv.push("-e", options.childExtensionPath);
   // 孩子的固定税一大块：项目上下文（AGENTS.md/CLAUDE.md）
   if (options.projectContext === "none") argv.push("--no-context-files");
   if (supportsNoMcp(options.piVersion)) argv.push("--no-mcp");
@@ -168,17 +211,26 @@ export function buildPiArgv(options: BuildArgvOptions): string[] {
     const thinking = nonEmpty(options.thinkingLevel);
     argv.push("--model", thinking ? `${model}:${thinking}` : model);
   }
-  // 工具表：只有 strict 才收窄成读集；宽档（默认）不收窄——收窄会把 bash/edit/write 全砍掉。
-  // allowScripts 时读集里必须含 codemode，否则「能力进来了也调不到」
-  // （实测：--tools 白名单会砍掉没列进去的扩展工具）。
-  if (options.readOnly === "strict") {
-    const tools = options.allowScripts ? [...READ_ONLY_TOOLS, "codemode"] : READ_ONLY_TOOLS;
-    argv.push("--tools", tools.join(","));
-  }
+  argv.push(...strictToolsArgv(options));
   // allowScripts：命令行显式给的扩展不受 --no-extensions 影响 ⇒ 减量效果不丢
   if (options.allowScripts) argv.push("-e", "builtin:codemode");
   argv.push(options.task);
   return argv;
+}
+
+/**
+ * 只读档位的工具名单；非 strict 不收窄——收窄会把 bash/edit/write 全砍掉。
+ * allowScripts 时读集里必须含 codemode，否则「能力进来了也调不到」
+ * （实测：--tools 白名单会砍掉没列进去的扩展工具）。
+ */
+function strictToolsArgv(options: BuildArgvOptions): string[] {
+  if (options.readOnly !== "strict") return [];
+  const tools = [
+    ...READ_ONLY_TOOLS,
+    CHILD_REPORT_TOOL_NAME,
+    ...(options.allowScripts ? ["codemode"] : []),
+  ];
+  return ["--tools", tools.join(",")];
 }
 
 /** 从 pi 的事件流里抽出来的东西。 */
@@ -204,6 +256,8 @@ interface StreamAcc {
   text: string;
   toolReport: ChildReport | null;
   observedUsage: ChildUsage | null;
+  /** 所有轮次的用量合计（每轮 usage 是单次请求量，账要按累计算） */
+  usageTotal: ChildUsage | null;
   observedModel: string | null;
   observedProvider: string | null;
   tools: Record<string, number>;
@@ -270,6 +324,8 @@ function takeUsage(usage: NonNullable<NonNullable<StreamEvent["message"]>["usage
 
 /** assistant 消息：正文「最后一段胜出」，顺带记模型与用量。 */
 function takeAssistant(message: NonNullable<StreamEvent["message"]>, acc: StreamAcc): void {
+  // 工具回执的文本不能当正文——交付物只从 assistant 消息取
+  if (message.role !== "assistant") return;
   if (typeof message.model === "string") acc.observedModel = message.model;
   if (typeof message.provider === "string") acc.observedProvider = message.provider;
   // content 形状随 pi 版本变：非数组按「没有文本」跳过
@@ -278,12 +334,29 @@ function takeAssistant(message: NonNullable<StreamEvent["message"]>, acc: Stream
     .filter((part) => part.type === "text" && typeof part.text === "string")
     .map((part) => part.text!)
     .join("\n");
-  if (message.usage) acc.observedUsage = takeUsage(message.usage);
+  if (message.usage) {
+    const usage = takeUsage(message.usage);
+    acc.observedUsage = usage;
+    // 正文取最后一条，用量要累加——每一轮都花了钱
+    acc.usageTotal = addUsage(acc.usageTotal, usage);
+  }
+}
+
+/** 用量累加：逐轮相加（每轮 usage 是单次请求量，不是累计值）。 */
+function addUsage(total: ChildUsage | null, next: ChildUsage): ChildUsage {
+  const sum = (a: number | undefined, b: number | undefined): number => (a ?? 0) + (b ?? 0);
+  return {
+    input: sum(total?.input, next.input),
+    output: sum(total?.output, next.output),
+    cacheRead: sum(total?.cacheRead, next.cacheRead),
+    cacheWrite: sum(total?.cacheWrite, next.cacheWrite),
+    cost: sum(total?.cost, next.cost),
+  };
 }
 
 /** 工具通道的报告：structuredContent > details.report > details 本体。 */
 function takeToolReport(message: NonNullable<StreamEvent["message"]>, acc: StreamAcc): void {
-  if (message.role !== "toolResult" || message.toolName !== "child_report") return;
+  if (message.role !== "toolResult" || message.toolName !== CHILD_REPORT_TOOL_NAME) return;
   const candidate = (message.structuredContent ??
     (message.details as { report?: unknown })?.report ??
     message.details) as ChildReport | undefined;
@@ -311,6 +384,7 @@ export function parseChildStream(stdout: string): ParsedChildStream {
     text: "",
     toolReport: null,
     observedUsage: null,
+    usageTotal: null,
     observedModel: null,
     observedProvider: null,
     tools: {},
@@ -332,6 +406,7 @@ export function parseChildStream(stdout: string): ParsedChildStream {
     text: acc.text,
     toolReport: acc.toolReport,
     observedUsage: acc.observedUsage,
+    observedUsageTotal: acc.usageTotal,
     observedModel: acc.observedModel,
     observedProvider: acc.observedProvider,
     delivery: {

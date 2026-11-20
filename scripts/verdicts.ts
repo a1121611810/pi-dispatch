@@ -31,6 +31,17 @@ export function judgeJsonStream(stdout: string): Verdict {
   return { ok: tools.length > 0, detail: `工具=${tools.join(",") || "无"}` };
 }
 
+/** 账上有数：无论孩子交没交报告，宿主观测的用量都要非零。 */
+export function judgeChildReport(record: TaskRecord | undefined): Verdict {
+  const channel = record?.reportChannel;
+  const usage = record?.usage ?? record?.report?.usage;
+  const ok = typeof usage?.input === "number" && usage.input > 0;
+  return {
+    ok,
+    detail: `通道=${channel ?? "无"} 用量=${usage?.input ?? 0}`,
+  };
+}
+
 /** rpc：工具往返与终态通知都到了。 */
 export function judgeRpc(sawToolEnd: boolean, sawNotification: boolean): Verdict {
   return {
