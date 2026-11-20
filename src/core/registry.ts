@@ -30,6 +30,8 @@ export type TaskCommand =
       usage?: TaskRecord["usage"];
       /** 自述对不上收据（没有实测支撑） */
       unverified?: boolean;
+      /** 谎报自检（声称的命令一条都没观测到） */
+      verifyUnverified?: boolean;
       /** assessment 空转（小窗资格粗筛） */
       vacuous?: boolean;
     }
@@ -149,6 +151,7 @@ export class TaskRegistry {
           delivery: command.delivery ?? current.delivery,
           usage: command.usage ?? current.usage,
           ...(command.unverified ? { deliveryUnverified: true } : {}),
+          ...(command.verifyUnverified ? { verifyUnverified: true } : {}),
           ...(command.vacuous ? { assessmentVacuous: true } : {}),
         };
         this.#records.set(command.id, next);

@@ -507,6 +507,59 @@ test("引擎：自述改了文件、收据一个都对不上 ⇒ 结果带 deliv
   assert.equal(result.deliveryUnverified, true, "收据里没有任何路径支持这个自述");
 });
 
+test("引擎：谎报自检（声称跑了命令、收据没有）⇒ 结果带 verifyUnverified", async () => {
+  const stream = JSON.stringify({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [
+        {
+          type: "text",
+          text: '做完了\n```json\n{"summary":"ok","verified":[{"command":"pnpm test","exitCode":0}]}\n```',
+        },
+      ],
+    },
+  });
+  const { engine } = freshEngine({
+    spawn: fakeSpawn({ stdout: stream, exitCode: 0 }),
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活" });
+  const result = outcome as { status: string; verifyUnverified?: boolean };
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.verifyUnverified, true, "声称跑了 pnpm test，收据里一条命令都没有");
+});
+
+test("引擎：声称与观测一致 ⇒ 结果不带 verifyUnverified", async () => {
+  const stream = [
+    JSON.stringify({
+      type: "tool_execution_start",
+      toolName: "bash",
+      args: { command: "pnpm test" },
+    }),
+    JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: '做完了\n```json\n{"summary":"ok","verified":[{"command":"pnpm test","exitCode":0}]}\n```',
+          },
+        ],
+      },
+    }),
+  ].join("\n");
+  const { engine } = freshEngine({
+    spawn: fakeSpawn({ stdout: stream, exitCode: 0 }),
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活" });
+  const result = outcome as { status: string; verifyUnverified?: boolean };
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.verifyUnverified, undefined, "观测到同一条命令 ⇒ 不标记");
+});
+
 test("引擎：assessment 全正面 ⇒ 结果带 assessmentVacuous；有具体风险 ⇒ 不带", async () => {
   const makeStream = (assessment: string) =>
     JSON.stringify({

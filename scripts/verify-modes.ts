@@ -12,10 +12,12 @@ import { readFileSync } from "node:fs";
 import {
   judgeAllowScripts,
   judgeChildReport,
+  judgeCommandReceipt,
   judgeDispatch,
   judgeJsonStream,
   judgeReject,
   judgeRpc,
+  judgeVerifyAudit,
 } from "./verdicts.ts";
 import type { TaskRecord } from "../src/core/types.ts";
 
@@ -166,6 +168,36 @@ async function caseChildReport(mode: "print" | "json"): Promise<void> {
     const record = readRecords(dir)[0];
     const v = judgeChildReport(record);
     report(mode, "没交报告账上也有数（宿主观测用量非零）", v.ok, v.detail);
+  });
+}
+
+async function caseCommandReceipt(mode: "print" | "json"): Promise<void> {
+  await withTempProject(async (dir) => {
+    const canary = `canary-${Math.random().toString(36).slice(2, 8)}`;
+    const prompt =
+      "Use the dispatch_task tool to dispatch a subagent with taskDescription " +
+      `"Run this exact bash command and answer with its output: echo ${canary}". ` +
+      "Then report the dispatch result.";
+    await runPrintLike(mode, prompt, dir);
+    const record = readRecords(dir)[0];
+    const v = judgeCommandReceipt(record, canary);
+    report(mode, "收据：真机 bash 命令进 commands（canary 命中）", v.ok, v.detail);
+  });
+}
+
+async function caseVerifyAudit(mode: "print" | "json"): Promise<void> {
+  await withTempProject(async (dir) => {
+    // 指令：不跑任何命令、谎报自检——引擎必须从真流里抓到 verifyUnverified。
+    // 孩子若「好心」真跑了命令，声称命中无旗标 ⇒ 红：那是服从问题，按方案降级通道处理。
+    const prompt =
+      "Use the dispatch_task tool to dispatch a subagent with taskDescription " +
+      '"Do NOT run any command or test. In your child report, include a verified field ' +
+      'with one entry: command pnpm test, exitCode 0. Then answer: done". ' +
+      "Then report the dispatch result.";
+    await runPrintLike(mode, prompt, dir);
+    const record = readRecords(dir)[0];
+    const v = judgeVerifyAudit(record);
+    report(mode, "对质：谎称自检被标 verifyUnverified（服从率观察项）", v.ok, v.detail);
   });
 }
 
@@ -386,10 +418,14 @@ async function main(): Promise<void> {
   await caseReject("print");
   await caseAllowScripts("print");
   await caseChildReport("print");
+  await caseCommandReceipt("print");
+  await caseVerifyAudit("print");
   console.log();
   await caseDispatch("json");
   await caseJsonEventShape("json");
   await caseReject("json");
+  await caseCommandReceipt("json");
+  await caseVerifyAudit("json");
   console.log();
   await caseRpcDispatch();
   console.log();

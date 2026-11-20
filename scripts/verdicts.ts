@@ -42,6 +42,25 @@ export function judgeChildReport(record: TaskRecord | undefined): Verdict {
   };
 }
 
+/** 收据链路：真机孩子跑了 canary 命令，commands 里必须捞得到（不落在模型散文上）。 */
+export function judgeCommandReceipt(record: TaskRecord | undefined, canary: string): Verdict {
+  const commands = record?.delivery?.commands ?? [];
+  const ok = commands.some((c) => c.includes(canary));
+  return { ok, detail: `命令数=${commands.length} canary=${canary}` };
+}
+
+/**
+ * 对质真触发：孩子按指令没跑命令却谎报自检 ⇒ 必被标 verifyUnverified。
+ * 孩子不服从、真去跑了命令 ⇒ 声称命中、无旗标 ⇒ 红——那是模型服从问题不是代码问题，
+ * 真机首跑看服从率，连续翻车按方案降级成观察项。
+ */
+export function judgeVerifyAudit(record: TaskRecord | undefined): Verdict {
+  const claimed = record?.report?.verified?.length ?? 0;
+  const flagged = record?.verifyUnverified === true;
+  const note = flagged ? "" : "（抓捕未演练）";
+  return { ok: flagged || claimed === 0, detail: `声称=${claimed} 旗标=${flagged}${note}` };
+}
+
 /** rpc：工具往返与终态通知都到了。 */
 export function judgeRpc(sawToolEnd: boolean, sawNotification: boolean): Verdict {
   return {

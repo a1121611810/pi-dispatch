@@ -14,7 +14,7 @@ Programmable subagent dispatch for [pi](https://github.com/earendil-works/pi).
 - **排队** —— 座位是从内存池切出来的份额，满了 FIFO 排队等，**永远不拒绝**
 - **管住** —— 盯卡住（静默 5 分钟 + 无在飞工具）、超时收掉、能停（排队中的抽掉，在跑的 SIGTERM→SIGKILL）
 - **留痕** —— 每次派发一条记录，落 `~/.pi/dispatch/<项目桶>/`，原子写、压缩归档、重启恢复
-- **核对** —— 收据从子代理的动作抽（不依赖它自述）；报告三种通道（tool / prompt-json / none）；自述的文件和收据一个都对不上时标 `deliveryUnverified`（后缀匹配，相对/绝对路径都认）
+- **核对** —— 收据从子代理的动作抽（不依赖它自述）；报告三种通道（tool / prompt-json / none）；自述的文件和收据一个都对不上时标 `deliveryUnverified`（后缀匹配，相对/绝对路径都认）；谎报自检（`verified` 声称跑过的命令、收据 commands 里一条都没观测到）标 `verifyUnverified`——意思是「没有实测支撑」，不是「一定在撒谎」
 
 ## 父方工具
 

@@ -274,6 +274,31 @@ test("deliver：未核实的交付在通知里写出警告", async () => {
   assert.match(sent[0]!, /没有实测支撑/);
 });
 
+test("deliver：谎报自检在通知里写出警告", async () => {
+  const registry = new TaskRegistry();
+  const notifications = new NotificationCenter();
+  notifications.attach(registry as never);
+  await registry.submit({
+    kind: "spawn",
+    record: { id: "abcdef1234", status: "queued", task: "t" },
+  });
+  await registry.submit({ kind: "transition", id: "abcdef1234", to: "running" });
+  await registry.submit({
+    kind: "attach-report",
+    id: "abcdef1234",
+    report: { summary: "s", why: "w", assessment: "a" },
+    channel: "prompt-json",
+    verifyUnverified: true,
+  });
+  await registry.submit({ kind: "resolve-exit", id: "abcdef1234", exitCode: 0 });
+  const sent: string[] = [];
+  deliver(
+    { sendMessage: (m: { content?: string }) => sent.push(m.content ?? "") } as never,
+    notifications,
+  );
+  assert.ok(sent[0]!.includes("自检没有实测支撑"), "谎报自检要写出自己的警告");
+});
+
 test("deliver：sendMessage 抛错不冒出去（best-effort）", async () => {
   const registry = new TaskRegistry();
   const notifications = new NotificationCenter();
@@ -354,6 +379,21 @@ test("归约：回执空转或核对挂了 ⇒ 落回大窗", () => {
   assert.ok(!unverified.text.includes("摘要见 report"), "核对挂了失去小窗资格");
 });
 
+test("归约：谎报自检 ⇒ 落回大窗", () => {
+  const out = excerptDeliverable(
+    resultWith({
+      report: {
+        summary: "s",
+        why: "w",
+        assessment: "主流程已验证。边界场景还没覆盖全，存在回归风险。",
+      },
+      reportChannel: "tool",
+      verifyUnverified: true,
+    }) as never,
+  );
+  assert.ok(!out.text.includes("摘要见 report"), "谎报自检失去小窗资格");
+});
+
 test("归约：无 outputPath 不截——交付物必须可达", () => {
   const out = excerptDeliverable(resultWith({ outputPath: "" }) as never);
   assert.equal(out.text, BIG_TEXT);
@@ -385,6 +425,19 @@ test("anchoredRead：空白不敏感与格式/越界明说", () => {
   assert.equal(hit.error, undefined, "行首空格不影响锚");
   assert.match(anchoredRead("a\nb", { around: "xx" }).error!, /锚格式不对/);
   assert.match(anchoredRead("a\nb", { around: `9:${lineHash("x")}` }).error!, /越界/);
+});
+
+test("anchoredRead：无 around 全量读出按 1 起编号", () => {
+  const out = anchoredRead(["alpha", "beta"].join("\n"));
+  assert.equal(out.error, undefined);
+  assert.equal(out.text, `1:${lineHash("alpha")}|alpha\n2:${lineHash("beta")}|beta`);
+  const win = anchoredRead(["alpha", "beta", "gamma"].join("\n"), {
+    around: `2:${lineHash("beta")}`,
+    contextLines: 0,
+  });
+  assert.equal(win.error, undefined);
+  assert.equal(win.from, 2, "窗口起点按 1 起报");
+  assert.equal(win.to, 2);
 });
 
 test("lineHash：钉死算法国定向量——锚是会话内的线路格式，不许静默漂移", () => {

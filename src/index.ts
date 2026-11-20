@@ -44,7 +44,8 @@ function hasReliableReport(result: DispatchResult): boolean {
     result.report &&
     result.reportChannel !== "none" &&
     !result.assessmentVacuous &&
-    !result.deliveryUnverified,
+    !result.deliveryUnverified &&
+    !result.verifyUnverified,
   );
 }
 
@@ -261,9 +262,10 @@ export function deliver(pi: ExtensionAPI, notifications: NotificationCenter): vo
   for (const batch of notifications.drain()) {
     const text = batch
       .map((n) => {
-        const hint = n.deliveryUnverified
-          ? "｜报告里的改动没有实测支撑（查 dispatch_list 复核）"
-          : "";
+        const hint = [
+          n.deliveryUnverified ? "｜报告里的改动没有实测支撑（查 dispatch_list 复核）" : "",
+          n.verifyUnverified ? "｜报告声称的自检没有实测支撑（查 dispatch_list 复核）" : "",
+        ].join("");
         return `· 任务 ${n.taskId.slice(0, 8)}… ${n.status}（${new Date(n.at).toLocaleTimeString()}）${hint}`;
       })
       .join("\n");
@@ -329,6 +331,7 @@ function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
           usage: r.usage,
           delivery: r.delivery,
           deliveryUnverified: r.deliveryUnverified,
+          verifyUnverified: r.verifyUnverified,
           assessmentVacuous: r.assessmentVacuous,
           outputPath: r.outputPath,
           outputTruncated: r.outputTruncated,

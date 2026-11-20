@@ -2029,8 +2029,14 @@
               <td>证据</td>
             </tr>
             <tr>
-              <td><code>files_touched</code> / <code>usage</code></td>
-              <td>给父方机器核对用，<b>不是散文</b></td>
+              <td>
+                <code>files_touched</code> / <code>verified</code> /
+                <code>usage</code>
+              </td>
+              <td>
+                给父方机器核对用，<b>不是散文</b>。verified =
+                交付前跑过的自检（命令原样），对质走收据里的 bash 命令
+              </td>
               <td>回执</td>
             </tr>
           </tbody>
@@ -2051,7 +2057,12 @@
           <li>不可核的自述（assessment 全文）= <b>零分</b>；</li>
           <li>可核对不上（自述 vs 收据）= 零分且<b>倒扣</b>（没有实测支撑 + 失去小窗资格）；</li>
           <li>
-            对上 = <b>唯一正分来源</b>。想把声明变成得分，写进 findings/files_touched 接受核对。
+            谎报自检（<code>verified</code> 声称跑过、收据 commands 里一条都没观测到）= 同族倒扣：
+            <code>verifyUnverified</code>——没有实测支撑，不是「一定在撒谎」；
+          </li>
+          <li>
+            对上 = <b>唯一正分来源</b>。想把声明变成得分，写进 findings/files_touched/verified
+            接受核对。
           </li>
         </ul>
         <p style="margin-bottom: 0">
@@ -2076,7 +2087,7 @@
           </thead>
           <tbody>
             <tr>
-              <td>三要件全满足（回执在 ∧ 非空转 ∧ 核对没挂）</td>
+              <td>四要件全满足（回执在 ∧ 非空转 ∧ 核对没挂 ∧ 自检没谎报）</td>
               <td><b>8KB</b></td>
               <td>头 4KB + 省略标记 + 尾 4KB</td>
             </tr>
@@ -2106,6 +2117,12 @@
           <b>但这个判断很容易误伤。</b>实测过：直接拿子代理的文件名去对收据里的路径，<b
             >会误伤 67%</b
           >（子代理说 <code>src/a.ts</code>，它实际碰的是 <code>a.ts</code>）。
+        </p>
+        <p>
+          命令对质是<b>段级 × token 级</b>：按 && || ; | 切段、段首 VAR=value
+          剥掉，命令必须「是」某段的前缀、或同首 token 的参数交错序列——<code>echo pnpm test</code>
+          只是提到，不算跑过；空白归一 + 截尾省略号宽容仍保留。不认 time/sudo 等 wrapper
+          前缀，换行不拆（heredoc 由段首挡住）——已知边界，误报出现再补。
         </p>
         <p style="margin-bottom: 0">
           ⇒ <b>用后缀匹配</b>：子代理的文件名是收据路径的后缀就算命中。这样<b>零误伤</b>。

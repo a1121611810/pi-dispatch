@@ -4,10 +4,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   judgeAllowScripts,
+  judgeCommandReceipt,
   judgeDispatch,
   judgeJsonStream,
   judgeReject,
   judgeRpc,
+  judgeVerifyAudit,
 } from "../scripts/verdicts.ts";
 import type { TaskRecord } from "../src/core/types.ts";
 
@@ -15,7 +17,13 @@ const good: TaskRecord = {
   id: "9e7e6d16",
   status: "succeeded",
   task: "读 /etc/hosts 报行数",
-  delivery: { tools: { read: 1, bash: 1 }, paths: ["/etc/hosts"], errors: 0, textChars: 230 },
+  delivery: {
+    tools: { read: 1, bash: 1 },
+    paths: ["/etc/hosts"],
+    commands: ["wc -l /etc/hosts"],
+    errors: 0,
+    textChars: 230,
+  },
 };
 
 const failed: TaskRecord = { id: "b", status: "failed", task: "t" };
@@ -92,4 +100,35 @@ test("判断·rpc：通知没到 ⇒ 红", () => {
 
 test("判断·rpc：工具往返没到 ⇒ 红", () => {
   assert.equal(judgeRpc(false, true).ok, false);
+});
+
+// ── 收据命令 / 对质（verified × commands 闭环） ─────────────────────────
+
+test("判断·命令收据：canary 命中 ⇒ 绿，没命中或无记录 ⇒ 红", () => {
+  assert.equal(judgeCommandReceipt(good, "wc -l").ok, true);
+  assert.equal(judgeCommandReceipt(good, "canary-zzz").ok, false);
+  assert.equal(judgeCommandReceipt(undefined, "wc -l").ok, false);
+});
+
+test("判断·对质：谎称被标 ⇒ 绿；没声称（服从变体）⇒ 绿；声称了没被标 ⇒ 红", () => {
+  const lying: TaskRecord = {
+    ...good,
+    verifyUnverified: true,
+    report: { summary: "s", why: "w", assessment: "a", verified: [{ command: "pnpm test" }] },
+  };
+  assert.equal(judgeVerifyAudit(lying).ok, true);
+  const obedientNoClaim: TaskRecord = {
+    ...good,
+    report: { summary: "s", why: "w", assessment: "a" },
+  };
+  assert.equal(judgeVerifyAudit(obedientNoClaim).ok, true, "没声称不判——只读档孩子的正常形态");
+  const disobeyed: TaskRecord = {
+    ...good,
+    report: { summary: "s", why: "w", assessment: "a", verified: [{ command: "pnpm test" }] },
+  };
+  assert.equal(
+    judgeVerifyAudit(disobeyed).ok,
+    false,
+    "声称了但没被标 = 孩子真跑了命令（服从失败），按设计转红",
+  );
 });

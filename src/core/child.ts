@@ -96,14 +96,14 @@ export const REPORT_CONTRACT_BLOCK = [
   "<child-report-contract>",
   `Before finishing, deliver a child report — preferably by calling the ${CHILD_REPORT_TOOL_NAME} tool (its schema fixes the shape); if that tool is not available, put a fenced JSON block at the very end of your final message:`,
   "```json",
-  '{ "summary": "one sentence conclusion", "why": "why you conclude so", "assessment": "how it actually went", "findings": [{ "what": "claim", "evidence": "where it comes from" }], "files_touched": ["relative/path"], "usage": { "input": 0, "output": 0, "cost": 0, "turns": 0 } }',
+  '{ "summary": "one sentence conclusion", "why": "why you conclude so", "assessment": "how it actually went", "findings": [{ "what": "claim", "evidence": "where it comes from" }], "files_touched": ["relative/path"], "verified": [{ "command": "pnpm test", "exitCode": 0 }], "usage": { "input": 0, "output": 0, "cost": 0, "turns": 0 } }',
   "```",
   "Rules: the report is a SUMMARY — it is NOT the deliverable. The deliverable is your prose answer, in exactly the format the task asked for; never hide the deliverable inside the JSON block.",
   'The report judges in three sections. "summary" = what you concluded (one sentence). "why" = why you conclude so — if your instructions contained a <pi-dispatch-why> block, take it as input (answer the parent\'s actual motive); otherwise reason from the task text alone. "assessment" = how the work actually went — quality judgment, problems hit, deviations, what remains unverified; its main anchor is the same: the why block if you received one, else the task text.',
   'Goodhart pin: "assessment" must name at least one concrete problem, risk, limitation, or thing to recheck. If it is uniformly positive, the parent treats the whole report as not delivered.',
-  '"files_touched" and "usage" are a receipt for the parent\'s machine cross-check, not prose — keep them exact.',
+  '"files_touched", "verified" and "usage" are a receipt for the parent\'s machine cross-check, not prose — keep them exact: files you actually touched, checks you actually ran (commands exactly as run).',
   "Do NOT write report/summary .md files — your final message is what the parent reads.",
-  "findings/files_touched/usage may be omitted when empty.",
+  "findings/files_touched/verified/usage may be omitted when empty.",
   "</child-report-contract>",
 ].join("\n");
 
@@ -138,6 +138,19 @@ export const CHILD_REPORT_SCHEMA = {
       type: "array",
       description: "relative paths you touched; omit this field when empty",
       items: { type: "string" },
+    },
+    verified: {
+      type: "array",
+      description:
+        "self-checks you ran before delivering (tests, typecheck, build); commands exactly as run; omit when none",
+      items: {
+        type: "object",
+        properties: {
+          command: { type: "string" },
+          exitCode: { type: "number" },
+        },
+        required: ["command"],
+      },
     },
     usage: {
       type: "object",
@@ -271,6 +284,11 @@ export interface ParsedChildStream {
 /** 路径清单上限：父面只看前几条，超出部分不记。 */
 const MAX_PATHS = 20;
 
+/** 命令清单上限：留最近 N 条——对质关心的是交付前跑没跑。 */
+const MAX_COMMANDS = 20;
+/** 单条命令保留长度：超长截尾。匹配方向是「声称 ⊆ 观测」，截观测的尾不伤命中。 */
+const COMMAND_KEEP_CHARS = 500;
+
 /** 事件流的累积器。解析分四个小家，各自只碰自己那部分。 */
 interface StreamAcc {
   text: string;
@@ -282,6 +300,7 @@ interface StreamAcc {
   observedProvider: string | null;
   tools: Record<string, number>;
   paths: string[];
+  commands: string[];
   errors: number;
 }
 
@@ -305,7 +324,7 @@ interface StreamEvent {
     details?: unknown;
   };
   toolName?: string;
-  args?: { path?: unknown };
+  args?: { path?: unknown; command?: unknown };
   isError?: boolean;
   result?: { isError?: boolean };
 }
@@ -318,13 +337,30 @@ function recordPath(args: { path?: unknown } | undefined, paths: string[]): void
   paths.push(path);
 }
 
-/** 工具轨迹：start 计次并记路径，end 计错。 */
+/** 记一条跑过的命令：只收 bash——只有它的效果就是命令行（codemode 最终也走 bash 执行）。原样记串不解析；保最近 N 条（交付前的验证命令在尾部）。 */
+function recordCommand(
+  toolName: string,
+  args: { command?: unknown } | undefined,
+  commands: string[],
+): void {
+  if (toolName !== "bash") return;
+  const command = args?.command;
+  if (typeof command !== "string" || !command) return;
+  const kept =
+    command.length > COMMAND_KEEP_CHARS ? `${command.slice(0, COMMAND_KEEP_CHARS)}…` : command;
+  if (commands.includes(kept)) return;
+  commands.push(kept);
+  if (commands.length > MAX_COMMANDS) commands.shift();
+}
+
+/** 工具轨迹：start 计次并记路径/命令，end 计错。 */
 function takeToolEvent(event: StreamEvent, acc: StreamAcc): void {
   if (event.type === "tool_execution_start") {
     const name = typeof event.toolName === "string" ? event.toolName : "unknown";
     acc.tools[name] = (acc.tools[name] ?? 0) + 1;
-    // bash 的 args 是 {command}，不猜它的命令行
+    // 路径只收文件类工具的 args.path（bash 的 args 没有 path）；命令串走 recordCommand
     recordPath(event.args, acc.paths);
+    recordCommand(name, event.args, acc.commands);
   } else if (event.type === "tool_execution_end") {
     if (event.isError === true || event.result?.isError === true) acc.errors++;
   }
@@ -409,6 +445,7 @@ export function parseChildStream(stdout: string): ParsedChildStream {
     observedProvider: null,
     tools: {},
     paths: [],
+    commands: [],
     errors: 0,
   };
   for (const line of stdout.split("\n")) {
@@ -432,6 +469,7 @@ export function parseChildStream(stdout: string): ParsedChildStream {
     delivery: {
       tools: acc.tools,
       paths: acc.paths,
+      commands: acc.commands,
       errors: acc.errors,
       textChars: acc.text.length,
     },
@@ -465,6 +503,9 @@ export function extractReportFromText(text: string): {
 /** 报告散文段的上限：summary/why/assessment 各 2KB——report 本身是限字摘要，这是「有回执优先」档的前提。 */
 const REPORT_PROSE_MAX_CHARS = 2048;
 
+/** 自称命令的保留长度：声称要短，截尾只伤奇葩不构成误报。 */
+const VERIFIED_COMMAND_MAX_CHARS = 200;
+
 function clipReportProse(text: string): string {
   return text.length > REPORT_PROSE_MAX_CHARS ? `${text.slice(0, REPORT_PROSE_MAX_CHARS)}…` : text;
 }
@@ -479,6 +520,17 @@ function normalizeReport(parsed: ChildReport): ChildReport {
       : undefined,
     files_touched: Array.isArray(parsed.files_touched)
       ? parsed.files_touched.filter((f): f is string => typeof f === "string")
+      : undefined,
+    verified: Array.isArray(parsed.verified)
+      ? parsed.verified
+          .filter((v) => typeof v?.command === "string")
+          .map((v) => ({
+            command:
+              v.command.length > VERIFIED_COMMAND_MAX_CHARS
+                ? `${v.command.slice(0, VERIFIED_COMMAND_MAX_CHARS)}…`
+                : v.command,
+            ...(typeof v.exitCode === "number" ? { exitCode: v.exitCode } : {}),
+          }))
       : undefined,
     usage: parsed.usage && typeof parsed.usage === "object" ? parsed.usage : undefined,
   };
@@ -540,4 +592,69 @@ export function deliveryUnverified(
   const claims = report?.files_touched ?? [];
   if (claims.length === 0 || !delivery) return false;
   return !claims.some((claim) => delivery.paths.some((path) => pathMatches(claim, path)));
+}
+
+/**
+ * 自检对质：报告声称跑过的命令，收据里一条都没观测到 ⇒ 声称没有实测支撑。
+ * 没声称就不判（只读档孩子没有 bash，契约允许 omit 此字段）。
+ * 段级 × token 级：命令必须「是」观测里跑过的一条命令，不能只是别人嘴里的词
+ * （echo/grep 正文里的同名字符串不算跑过）。参数交错与环境变量前缀容忍；
+ * 方向仍是宁漏勿冤：标了由父方复核，和 deliveryUnverified 一个哲学。
+ * shortcut: 不认 time/sudo/npx 等 wrapper 前缀（会误标未跑），也不拆换行（heredoc 由段首挡住）；
+ * 误报出现再补 wrapper 白名单。
+ */
+export function verifyUnverified(
+  report: ChildReport | undefined,
+  delivery: ChildDelivery | undefined,
+): boolean {
+  const claims = (report?.verified ?? []).filter((c) => c.command.trim().length > 0);
+  if (claims.length === 0 || !delivery) return false;
+  return !claims.some((claim) =>
+    commandSegments(claim.command).some((claimSeg) =>
+      delivery.commands.some((command) =>
+        commandSegments(command).some((observedSeg) => segmentsMatch(claimSeg, observedSeg)),
+      ),
+    ),
+  );
+}
+
+/** 空白归一 + 去截尾省略号：截断产生的 … 在 token 化前当通配抹掉。 */
+function normalizeCommand(command: string): string {
+  return command.trim().replace(/\s+/g, " ").replace(/…$/, "");
+}
+
+/**
+ * 按 shell 分隔符切成「命令段」，每段成 token 表；段首 VAR=value 剥掉。
+ * 不按换行切——heredoc 正文留在 cat 段内，段首不是声称命令就不算跑过。
+ */
+function commandSegments(command: string): string[][] {
+  return normalizeCommand(command)
+    .split(/&&|\|\||;|\|/)
+    .map((segment) => {
+      const tokens = segment.trim().split(/\s+/).filter(Boolean);
+      while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0]!)) tokens.shift();
+      return tokens;
+    })
+    .filter((tokens) => tokens.length > 0);
+}
+
+/** a 是 b 的 token 前缀；最后一个 token 允许前缀（截断/半词宽容）。 */
+function tokensPrefix(a: string[], b: string[]): boolean {
+  if (a.length === 0 || a.length > b.length) return false;
+  for (let i = 0; i < a.length - 1; i++) if (a[i] !== b[i]) return false;
+  return b[a.length - 1]!.startsWith(a[a.length - 1]!);
+}
+
+/** 同一条基础命令、参数交错：a 的 token 按序出现在 b 里（首 token 必须相同）。 */
+function tokensRunInOrder(a: string[], b: string[]): boolean {
+  if (a.length === 0 || a[0] !== b[0]) return false;
+  let j = 1;
+  for (let i = 1; i < b.length && j < a.length; i++) if (b[i] === a[j]) j++;
+  return j === a.length;
+}
+
+function segmentsMatch(a: string[], b: string[]): boolean {
+  return (
+    tokensPrefix(a, b) || tokensPrefix(b, a) || tokensRunInOrder(a, b) || tokensRunInOrder(b, a)
+  );
 }

@@ -67,6 +67,8 @@ export type ChildDelivery = {
   tools: Record<string, number>;
   /** 实际碰过的路径（去重，按出现顺序） */
   paths: string[];
+  /** 实际跑过的 bash 命令（原样记串不解析；去重、有上限）——对质「自检跑了没」的观测侧 */
+  commands: string[];
   /** 工具执行失败次数 */
   errors: number;
   /** 孩子最终正文长度（字符）——0 = 空交 */
@@ -93,6 +95,8 @@ export interface ChildReport {
   assessment: string;
   findings?: Array<{ what: string; evidence?: string }>;
   files_touched?: string[];
+  /** 交付前跑过的自检（声称——对质走收据 commands；没跑就不给此字段） */
+  verified?: Array<{ command: string; exitCode?: number }>;
   usage?: ChildUsage;
 }
 
@@ -119,6 +123,8 @@ export interface TaskRecord {
   delivery?: ChildDelivery;
   /** 自述的文件和收据一个都对不上——没有实测支撑 */
   deliveryUnverified?: boolean;
+  /** 谎报自检被抓：声称跑过的命令，收据里一条都没观测到 */
+  verifyUnverified?: boolean;
   /** assessment 空转（缺/过短/全正面）——小窗资格粗筛结果，信任只走记账规则 */
   assessmentVacuous?: boolean;
   /** 产出落盘位置 */
@@ -154,6 +160,8 @@ export interface DispatchResult {
   delivery?: ChildDelivery;
   /** 自述的文件和收据一个都对不上——没有实测支撑 */
   deliveryUnverified?: boolean;
+  /** 谎报自检被抓：声称跑过的命令，收据里一条都没观测到 */
+  verifyUnverified?: boolean;
   /** assessment 空转（缺/过短/全正面）——小窗资格粗筛结果，信任只走记账规则 */
   assessmentVacuous?: boolean;
   outputTruncated: boolean;

@@ -9,6 +9,8 @@ export interface TaskNotification {
   at: number;
   /** 自述对不上收据（没有实测支撑） */
   deliveryUnverified?: boolean;
+  /** 谎报自检（声称的命令没观测到） */
+  verifyUnverified?: boolean;
 }
 
 export const NOTIFICATION_BATCH_MAX_BYTES = 100 * 1024;
@@ -49,6 +51,7 @@ export class NotificationCenter {
         status: next.status,
         at: next.finishedAt ?? Date.now(),
         ...(next.deliveryUnverified ? { deliveryUnverified: true } : {}),
+        ...(next.verifyUnverified ? { verifyUnverified: true } : {}),
       });
     });
   }

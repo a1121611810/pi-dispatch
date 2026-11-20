@@ -10,6 +10,7 @@
 // 用法：pnpm check:breakpoints [功能点片段…]
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
+import { scrubbedEnv } from "./test-env.ts";
 
 type Breakpoint = {
   /** 功能点（一句话） */
@@ -593,8 +594,8 @@ const CASES: Breakpoint[] = [
   {
     feature: "通知文本写出未核实",
     file: "src/index.ts",
-    from: '        const hint = n.deliveryUnverified\n          ? "｜报告里的改动没有实测支撑（查 dispatch_list 复核）"\n          : "";',
-    to: '        const hint = "";',
+    from: '          n.deliveryUnverified ? "｜报告里的改动没有实测支撑（查 dispatch_list 复核）" : "",',
+    to: '          "",',
     test: "test/adapter.test.ts",
     red: "deliver：未核实的交付在通知里写出警告",
     why: "标记随通知到了，但父方看不见",
@@ -602,11 +603,75 @@ const CASES: Breakpoint[] = [
   {
     feature: "通知警告不许恒显",
     file: "src/index.ts",
-    from: '        const hint = n.deliveryUnverified\n          ? "｜报告里的改动没有实测支撑（查 dispatch_list 复核）"\n          : "";',
-    to: '        const hint = "｜报告里的改动没有实测支撑（查 dispatch_list 复核）";',
+    from: '          n.deliveryUnverified ? "｜报告里的改动没有实测支撑（查 dispatch_list 复核）" : "",',
+    to: '          "｜报告里的改动没有实测支撑（查 dispatch_list 复核）",',
     test: "test/adapter.test.ts",
     red: "deliver：把待投递的通知发成一条 custom 消息（编号前缀 + 状态）",
     why: "每条完成通知都带警告，标注本身失去意义",
+  },
+  // ── verified × commands 对质 ────────────────────────────────────────────
+  {
+    feature: "收据记 bash 命令",
+    file: "src/core/child.ts",
+    from: "    recordPath(event.args, acc.paths);\n    recordCommand(name, event.args, acc.commands);",
+    to: "    recordPath(event.args, acc.paths);",
+    test: "test/child.test.ts",
+    red: "收件：bash 命令进收据（真机样本）",
+    why: "收据不记命令，对质永远无米下锅",
+  },
+  {
+    feature: "verified 回执规范化",
+    file: "src/core/child.ts",
+    from: '          .filter((v) => typeof v?.command === "string")',
+    to: "          .filter(() => true)",
+    test: "test/child.test.ts",
+    red: "报告：verified 透传并过滤——command 非字符串的项丢掉",
+    why: "脏 verified 进报告，对质拿非字符串崩或误标",
+  },
+  {
+    feature: "自检对质判定",
+    file: "src/core/child.ts",
+    from: "  return !claims.some((claim) =>\n    commandSegments(claim.command).some((claimSeg) =>\n      delivery.commands.some((command) =>\n        commandSegments(command).some((observedSeg) => segmentsMatch(claimSeg, observedSeg)),\n      ),\n    ),\n  );",
+    to: "  return false;",
+    test: "test/child.test.ts",
+    red: "自检对质：声称了但一条都没观测到 ⇒ 标",
+    why: "对质永远说「已验证」，标记失去意义",
+  },
+  {
+    feature: "提到命令不算跑过",
+    file: "src/core/child.ts",
+    from: "  return !claims.some((claim) =>\n    commandSegments(claim.command).some((claimSeg) =>\n      delivery.commands.some((command) =>\n        commandSegments(command).some((observedSeg) => segmentsMatch(claimSeg, observedSeg)),\n      ),\n    ),\n  );",
+    to: "  return !claims.some((claim) =>\n    delivery.commands.some((observed) => observed.includes(claim.command)),\n  );",
+    test: "test/child.test.ts",
+    red: "自检对质：提到命令不算跑过——echo 不提行",
+    why: "退回到 substring——echo/grep 里提到命令就算跑过（逃逸口复现）",
+  },
+  {
+    feature: "对质结果透传",
+    file: "src/core/engine.ts",
+    from: "      verifyUnverified: verifyFailed,",
+    to: "      verifyUnverified: false,",
+    test: "test/engine.test.ts",
+    red: "引擎：谎报自检（声称跑了命令、收据没有）⇒ 结果带 verifyUnverified",
+    why: "判定算出来了，结果里永远不出现",
+  },
+  {
+    feature: "谎报失去小窗资格",
+    file: "src/index.ts",
+    from: "    !result.deliveryUnverified &&\n    !result.verifyUnverified,",
+    to: "    !result.deliveryUnverified,",
+    test: "test/adapter.test.ts",
+    red: "归约：谎报自检 ⇒ 落回大窗",
+    why: "谎报自检仍吃 8KB 小窗信任档",
+  },
+  {
+    feature: "通知带谎报标记",
+    file: "src/core/notifications.ts",
+    from: "        ...(next.verifyUnverified ? { verifyUnverified: true } : {}),",
+    to: "        ...({}),",
+    test: "test/adapter.test.ts",
+    red: "deliver：谎报自检在通知里写出警告",
+    why: "标记到不了通知，rpc 父方看不见谎报",
   },
   // ── 回执 tool 通道 ──────────────────────────────────────────────────────
   {
@@ -728,8 +793,8 @@ const CASES: Breakpoint[] = [
   {
     feature: "小窗三要件门",
     file: "src/index.ts",
-    from: "    !result.assessmentVacuous &&\n    !result.deliveryUnverified,",
-    to: "    !result.assessmentVacuous ||\n    !result.deliveryUnverified,",
+    from: "    !result.assessmentVacuous &&\n    !result.deliveryUnverified &&\n    !result.verifyUnverified,",
+    to: "    !result.assessmentVacuous ||\n    !result.deliveryUnverified ||\n    !result.verifyUnverified,",
     test: "test/adapter.test.ts",
     red: "归约：回执空转或核对挂了 ⇒ 落回大窗",
     why: "核对挂了仍享受小窗，倒扣规则被短路",
@@ -897,6 +962,55 @@ const CASES: Breakpoint[] = [
     red: "tui：全部终态即清",
     why: "任务全终态后面板残留不消，一直占着编辑器上方",
   },
+  // ── 门禁自身 ──────────────────────────────────────────────────────────────
+  // 这三条守的是「跑门禁的人身上带着什么」：测试进程/子代理的上下文一旦漏进门禁，
+  // 门禁会一杀用例都不跑却退出 0（假绿），或者把适配层按子代理装配（红错地方）。
+  {
+    feature: "测试门禁：擦掉继承来的测试上下文",
+    file: "scripts/test-env.ts",
+    from: "  for (const key of INHERITED_TEST_CONTEXT) delete env[key];",
+    to: "  for (const key of INHERITED_TEST_CONTEXT) void key;",
+    test: "test/test-runner.test.ts",
+    red: "测试门禁：在测试进程里也真跑用例（不再假绿，退出码照传）",
+    why: "在测试进程里起门禁，一条用例不跑但退出 0——门禁全假绿",
+  },
+  {
+    feature: "测试门禁：擦掉派发子代理的深度",
+    file: "scripts/test-env.ts",
+    from: "  delete env[INHERITED_DISPATCH_DEPTH];",
+    to: "  void env[INHERITED_DISPATCH_DEPTH];",
+    test: "test/test-runner.test.ts",
+    red: "测试门禁：在派发子代理里也擦掉深度（否则适配层按子代理装配）",
+    why: "子代理里跑门禁，适配层只装 child_report ⇒ 宿主侧用例全红",
+  },
+  {
+    feature: "测试门禁：旗标透传，缺文件时默认整棵 test/",
+    file: "scripts/test.ts",
+    from: '  const flags = args.filter((arg) => arg.startsWith("-"));',
+    to: "  const flags: string[] = [];",
+    test: "test/test-runner.test.ts",
+    red: "测试门禁：旗标透传，缺文件时默认整棵 test/",
+    why: "--experimental-test-coverage 之类被当文件传给 node --test",
+  },
+  {
+    feature: "测试门禁：经软链调用也真跑",
+    file: "scripts/test.ts",
+    from: "    return realpathSync(argv1) === realpathSync(self);",
+    to: "    return argv1 === self;",
+    test: "test/test-runner.test.ts",
+    red: "测试门禁：经软链调用也真跑（overlay 把 scripts/ 做成软链）",
+    why: "mutator 的 overlay 里 scripts/ 是软链 ⇒ 门禁静默空转退出 0，变异全假活",
+  },
+  {
+    feature: "破坏点跑器：也擦掉继承来的测试上下文",
+    file: "scripts/breakpoints.ts",
+    // 锚点分两段拼：这张表就在同一个文件里，整段写死会连同本条一起匹配到自己
+    from: '      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ' + "env: scrubbedEnv() },",
+    to: '      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },',
+    test: "test/test-runner.test.ts",
+    red: "破坏点跑器：子代理环境里也真判红（擦掉继承来的测试上下文）",
+    why: "子代理里跑验红，每条都报「原本不是绿的」——验红门禁全瘫",
+  },
 ];
 
 /** 数一个子串在文本里出现几次。 */
@@ -918,13 +1032,13 @@ function escapeRe(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** 跑一条指名用例，返回 TAP 原文。 */
+/** 跑一条指名用例，返回 TAP 原文。环境要擦干净：在测试进程/子代理里否则一条用例都不跑。 */
 function runOne(file: string, red: string): string {
   try {
     return execFileSync(
       process.execPath,
       ["--test", "--test-reporter=tap", `--test-name-pattern=${escapeRe(red)}`, file],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: scrubbedEnv() },
     );
   } catch (error) {
     // 非零退出也可能带着 TAP 输出——照读，归属判断只看文本

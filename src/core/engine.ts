@@ -8,6 +8,7 @@ import {
   extractReportFromText,
   spawnChild,
   STDOUT_KEEP_CHARS,
+  verifyUnverified,
   type ChildHandle,
   type SpawnChild,
 } from "./child.ts";
@@ -443,6 +444,7 @@ export class TaskEngine {
       report = { ...report, usage: parsed.observedUsageTotal };
     }
     const unverified = deliveryUnverified(report, parsed.delivery);
+    const verifyFailed = verifyUnverified(report, parsed.delivery);
     await this.#registry.submit({
       kind: "attach-report",
       id: taskId,
@@ -451,6 +453,7 @@ export class TaskEngine {
       delivery: parsed.delivery,
       usage: parsed.observedUsageTotal ?? undefined,
       unverified,
+      verifyUnverified: verifyFailed,
       vacuous: assessmentVacuous(report),
     });
     await this.#registry.submit({
@@ -509,6 +512,7 @@ export class TaskEngine {
       reportChannel: record.reportChannel ?? "none",
       delivery: record.delivery,
       deliveryUnverified: record.deliveryUnverified,
+      verifyUnverified: record.verifyUnverified,
       assessmentVacuous: record.assessmentVacuous,
       outputTruncated: record.outputTruncated ?? false,
     };
