@@ -7,11 +7,12 @@ import { TaskRegistry } from "./core/registry.ts";
 import { NotificationCenter } from "./core/notifications.ts";
 import { Storage, findProjectRoot } from "./core/storage.ts";
 import type { DispatchInput, DispatchResult, HostMode } from "./core/types.ts";
+import { attachTuiSurface } from "./tui.ts";
 
 // pi 适配层：注册工具、装事件、投递通知。
 // 不写任何业务规则——业务规则全在 src/core/。
 
-/** ctx.mode → 核心层的宿主模式。加 tui 时只加一行。 */
+/** ctx.mode → 核心层的宿主模式。tui 与 rpc 同属长驻；人看面另挂 src/tui.ts。 */
 export function toHostMode(mode: string): HostMode {
   if (mode === "rpc" || mode === "tui") return "long-lived";
   return "one-shot"; // print / json
@@ -236,6 +237,10 @@ function startSession(
   });
   notifications.attach(engine.registry);
 
+  // TUI 常驻面：在飞/排队给人看（模型面终态通知仍走 turn 边界的 deliver）
+  const detachTui =
+    ctx.mode === "tui" ? attachTuiSurface({ registry: engine.registry, ui: ctx.ui }) : undefined;
+
   // 终态进待投递队列，turn 边界按 100 KB 分批投递
   const offTurn = pi.on("turn_end", () => deliver(pi, notifications));
   const offShutdown = pi.on("session_shutdown", () => {
@@ -246,6 +251,7 @@ function startSession(
     cleanup: () => {
       offTurn();
       offShutdown();
+      detachTui?.();
     },
   };
 }

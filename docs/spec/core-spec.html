@@ -1523,6 +1523,28 @@
         </ol>
       </div>
 
+      <div class="card">
+        <h3>TUI 人看面（适配层 src/tui.ts，core 不知道）</h3>
+        <ul style="margin-bottom: 0">
+          <li>
+            tui 宿主挂常驻 widget（编辑器上方，≤10 行）+ footer 状态：在飞/排队逐条一行 +
+            汇总计数，<b>全部跑完即清</b>。
+          </li>
+          <li>
+            只显示<b>本会话</b>任务：主方戳（ownerPid + ownerStartMs）两个都对才算——restore
+            装回的历史记录、同项目别家进程的记录不上板。
+          </li>
+          <li>
+            模型面终态通知不变（turn 边界 100 KB 分批的 custom 消息）。notify
+            槽全局共享、会被别家扩展顶掉，不用于内容送达。
+          </li>
+          <li>
+            真机验收：pty + pyte 重建屏幕帧断言「出现过、跑完清掉」（scripts/verify-modes.ts tui
+            腿）。
+          </li>
+        </ul>
+      </div>
+
       <h2><span class="n">8</span>状态怎么流转</h2>
 
       <div class="states">

@@ -23,8 +23,8 @@ export function isTerminal(status: TaskStatus): boolean {
 }
 
 /**
- * 宿主模式：长驻（rpc）可以异步派发 + 终态通知；一次性（print/json）必须同步等终态。
- * tui 本期不做，但映射表留好位置。
+ * 宿主模式：长驻（rpc / tui）可以异步派发 + 终态通知；一次性（print/json）必须同步等终态。
+ * tui 的人看面在适配层 src/tui.ts（常驻 widget + footer 状态），core 不知道。
  */
 export type HostMode = "long-lived" | "one-shot";
 

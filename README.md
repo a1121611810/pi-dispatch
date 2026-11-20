@@ -10,7 +10,7 @@ Programmable subagent dispatch for [pi](https://github.com/earendil-works/pi).
 
 ## 它能干什么
 
-- **派子代理** —— `dispatch_task` 递一段任务，立刻拿编号（长驻宿主 rpc）或等它跑完拿交付物（一次性宿主 print/json）
+- **派子代理** —— `dispatch_task` 递一段任务，立刻拿编号（长驻宿主 rpc/tui）或等它跑完拿交付物（一次性宿主 print/json）
 - **排队** —— 座位是从内存池切出来的份额，满了 FIFO 排队等，**永远不拒绝**
 - **管住** —— 盯卡住（静默 5 分钟 + 无在飞工具）、超时收掉、能停（排队中的抽掉，在跑的 SIGTERM→SIGKILL）
 - **留痕** —— 每次派发一条记录，落 `~/.pi/dispatch/<项目桶>/`，原子写、压缩归档、重启恢复
@@ -27,13 +27,14 @@ Programmable subagent dispatch for [pi](https://github.com/earendil-works/pi).
 ## 设计要点
 
 - **核心层不 import pi** —— 全部业务规则在 `src/core/`，四个依赖（spawn / 读机器 / 时钟 / 存储目录）可注入
-- **等待语义由宿主模式定** —— rpc 异步（立刻编号 + 终态通知），print/json 同步等终态（一次性宿主进程会先退出，异步会丢交付物）
+- **等待语义由宿主模式定** —— rpc/tui 异步（立刻编号 + 终态通知），print/json 同步等终态（一次性宿主进程会先退出，异步会丢交付物）
+- **TUI 人看面** —— tui 宿主挂常驻 widget + footer 状态（在飞/排队逐条 + 汇总，全部跑完即清）；只算本会话任务（主方戳双对），restore 的历史不上板；模型面通知不变
 - **座位 = 内存池份额** —— 池子量 = 可用 − 预留（总内存 10%），每座份额 = max(512 MiB, 总内存 2%)（实测校准：子代理峰值 RSS 约 148 MiB）
 - **`allowScripts`** —— 一个布尔透传到拼命令：宽档只加 `-e builtin:codemode`（不动工具表），只读档在 `--tools` 名单里补上 `codemode`——两处都要，漏一处能力就看不见
 
 ## 已知边界
 
-- **通知在 turn 边界投递** —— rpc 长驻宿主的终态通知 `deliverAs: "nextTurn"`，要等**下一个** turn 才到模型眼前。子代理在 turn N 结束时完成的通知，turn N 的 turn_end 已过了，最早 turn N+1 才投递。交互式使用没问题（用户会持续发消息）；纯脚本驱动要预期这一点。
+- **通知在 turn 边界投递** —— rpc/tui 长驻宿主的终态通知 `deliverAs: "nextTurn"`，要等**下一个** turn 才到模型眼前。子代理在 turn N 结束时完成的通知，turn N 的 turn_end 已过了，最早 turn N+1 才投递。交互式使用没问题（用户会持续发消息）；纯脚本驱动要预期这一点。tui 里人的实时状态看常驻 widget，不依赖这条通道。
 - **print/json 同步等待可能很长** —— 子代理跑几分钟，父方工具调用就一直挂着。有 `timeoutMs` 与卡住判定兜底。
 - **座位 0 时一次性宿主直接退回** —— 机器太挤（可用低于预留）时 `seatCap` 是 0，这个进程里没有任何子代理能结束并腾出座位，因此不等、直接回「machine is too tight」，避免挂死父方。
 - **只读档位不是沙箱** —— strict 挡「改」不挡「读」，pi 的读工具没有目录囚禁。
@@ -50,7 +51,7 @@ pnpm test              # node:test（Node 22.19+ 原生跑 TS）
 pnpm test:node22       # 用 Node 22.19.0（engines floor）跑一遍
 pnpm check:breakpoints # 破坏点表：每个功能点改坏一处，指名的测试用例必须红
 pnpm mutate            # 广谱变异（需本机 mutator 工具）
-pnpm test:mode         # 三模式真机验收（print/json/rpc，真模型调用，慢且花钱）
+pnpm test:mode         # 四模式真机验收（print/json/rpc/tui，真模型调用，慢且花钱；tui 腿需 python3+pyte）
 ```
 
 ### 两条测试纪律

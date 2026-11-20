@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// 三模式真机验收：print / json / rpc 各起真 pi 进程 + 装本扩展 + 发指令 + 断言产出。
+// 四模式真机验收：print / json / rpc / tui 各起真 pi 进程 + 装本扩展 + 发指令 + 断言产出。
 // 手动触发：pnpm test:mode
 // 真模型调用，慢且花钱——不进 node --test 快腿。
+// tui 腿另需 python3 + pyte（缺了跳过不判失败），用真 pty 重建屏幕帧断言常驻面板。
 import { spawn, execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,11 +20,17 @@ import {
 import type { TaskRecord } from "../src/core/types.ts";
 
 const EXT = join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "index.js");
-const RESULTS: Array<{ mode: string; case: string; ok: boolean; detail: string }> = [];
+const RESULTS: Array<{
+  mode: string;
+  case: string;
+  ok: boolean;
+  detail: string;
+  skipped?: boolean;
+}> = [];
 
-function report(mode: string, testCase: string, ok: boolean, detail = ""): void {
-  RESULTS.push({ mode, case: testCase, ok, detail });
-  const icon = ok ? "✅" : "❌";
+function report(mode: string, testCase: string, ok: boolean, detail = "", skipped = false): void {
+  RESULTS.push({ mode, case: testCase, ok, detail, skipped });
+  const icon = skipped ? "⏭️" : ok ? "✅" : "❌";
   console.log(`  ${icon} [${mode}] ${testCase}${detail ? ` — ${detail}` : ""}`);
 }
 
@@ -231,8 +238,137 @@ async function caseRpcDispatch(): Promise<void> {
   });
 }
 
+/**
+ * TUI 腿的 pty+pyte 驱动：真 pty 起 pi TUI，管道喂 prompt + 显式 \r 提交（管道换行不提交），
+ * pyte 重建屏幕帧，轮询断言常驻面板出现过（sawWidget）且跑完清掉（sawClear）。
+ * 程序与证据见 ai-memory procedures/real-pi-tui-verification-via-pty。
+ */
+const TUI_DRIVER = String.raw`import fcntl, json, os, pty, select, struct, subprocess, sys, termios, time
+
+import pyte
+
+ext, cwd, prompt = sys.argv[1], sys.argv[2], sys.argv[3]
+ROWS, COLS = 40, 120
+master, slave = pty.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+proc = subprocess.Popen(
+    ["pi", "--no-session", "-ne", "-e", ext],
+    cwd=cwd, stdin=slave, stdout=slave, stderr=slave, close_fds=True,
+)
+os.close(slave)
+screen = pyte.Screen(COLS, ROWS)
+stream = pyte.Stream(screen)
+saw_widget = False
+saw_clear = False
+clear_streak = 0
+sent_prompt = False
+sent_cr = False
+tail = b""
+start = time.time()
+while time.time() - start < 150:
+    r, _, _ = select.select([master], [], [], 0.5)
+    if r:
+        try:
+            data = os.read(master, 65536)
+        except OSError:
+            break
+        if not data:
+            break
+        tail = (tail + data)[-65536:]
+        stream.feed(data.decode("utf-8", "ignore"))
+    elapsed = time.time() - start
+    if not sent_prompt and elapsed >= 3:
+        os.write(master, prompt.encode("utf-8"))
+        sent_prompt = True
+    if not sent_cr and elapsed >= 5:
+        os.write(master, b"\r")
+        sent_cr = True
+    text = "\n".join(screen.display)
+    if "派单" in text and "在飞" in text:
+        saw_widget = True
+    if saw_widget:
+        clear_streak = clear_streak + 1 if "派单" not in text else 0
+        if clear_streak >= 3:
+            saw_clear = True
+            break
+try:
+    proc.terminate()
+    proc.wait(timeout=3)
+except Exception:
+    try:
+        proc.kill()
+    except Exception:
+        pass
+try:
+    os.close(master)
+except Exception:
+    pass
+print(json.dumps({"sawWidget": saw_widget, "sawClear": saw_clear, "tail": tail.decode("utf-8", "ignore")[-2000:]}))
+`;
+
+function runTuiDriver(
+  cwd: string,
+  prompt: string,
+): Promise<{ sawWidget: boolean; sawClear: boolean; tail: string }> {
+  return new Promise((resolve) => {
+    const child = spawn("python3", ["-c", TUI_DRIVER, EXT, cwd, prompt], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (c) => (stdout += String(c)));
+    child.stderr.on("data", (c) => (stderr += String(c)));
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve({ sawWidget: false, sawClear: false, tail: `[driver 超时] ${stderr.slice(-400)}` });
+    }, 180_000);
+    child.on("close", () => {
+      clearTimeout(timer);
+      const line = stdout.trim().split("\n").at(-1) ?? "";
+      try {
+        const parsed = JSON.parse(line) as { sawWidget: boolean; sawClear: boolean; tail: string };
+        resolve({ ...parsed, tail: `${parsed.tail}${stderr.slice(-400)}` });
+      } catch {
+        resolve({
+          sawWidget: false,
+          sawClear: false,
+          tail: `${stdout.slice(-800)}${stderr.slice(-400)}`,
+        });
+      }
+    });
+  });
+}
+
+/** TUI 模式：真 pty 起 pi TUI，pyte 重建屏幕帧，断言常驻面板「出现过、跑完清掉」。 */
+async function caseTuiDispatch(): Promise<void> {
+  await withTempProject(async (dir) => {
+    try {
+      execFileSync("python3", ["-c", "import pyte"], { stdio: "ignore" });
+    } catch {
+      report("tui", "在飞状态上过屏", true, "跳过：python3 缺 pyte（pip3 install pyte）", true);
+      report("tui", "跑完面板即清", true, "跳过：python3 缺 pyte（pip3 install pyte）", true);
+      return;
+    }
+    const prompt =
+      'Use the dispatch_task tool with taskDescription "Say hi". Report the taskId it returned.';
+    const result = await runTuiDriver(dir, prompt);
+    report(
+      "tui",
+      "在飞状态上过屏",
+      result.sawWidget,
+      result.sawWidget ? "" : `屏幕帧里没见面板；回放尾流：${result.tail.slice(-400)}`,
+    );
+    report(
+      "tui",
+      "跑完面板即清",
+      result.sawClear,
+      result.sawClear ? "" : `面板没清或没等全；回放尾流：${result.tail.slice(-400)}`,
+    );
+  });
+}
+
 async function main(): Promise<void> {
-  console.log("pi-dispatch 三模式真机验收\n");
+  console.log("pi-dispatch 四模式真机验收\n");
   // 确认扩展已构建
   if (!existsSync(EXT)) {
     console.error(`扩展产物不存在：${EXT}\n先跑 pnpm build`);
@@ -257,9 +393,15 @@ async function main(): Promise<void> {
   console.log();
   await caseRpcDispatch();
   console.log();
+  await caseTuiDispatch();
+  console.log();
 
   const failed = RESULTS.filter((r) => !r.ok);
-  console.log(`\n${RESULTS.length - failed.length}/${RESULTS.length} 通过`);
+  const skipped = RESULTS.filter((r) => r.skipped);
+  console.log(
+    `\n${RESULTS.length - failed.length - skipped.length}/${RESULTS.length - skipped.length} 通过` +
+      (skipped.length ? `，${skipped.length} 跳过` : ""),
+  );
   if (failed.length > 0) {
     console.log("失败：");
     for (const f of failed) console.log(`  ❌ [${f.mode}] ${f.case} — ${f.detail}`);

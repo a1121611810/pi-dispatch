@@ -23,7 +23,7 @@ pi 的扩展：派子代理（队列 / 座位池 / 生命周期），收四样�
 
 ## 何时跑真机
 
-`pnpm test:mode` 花真模型钱，只在改了这三处后手动跑：拼命令（`buildPiArgv`）、事件流解析（`parseChildStream`）、报告通道 / 用量。完成线：全部用例 ✅，含「没交报告账上也有数」（`reportChannel=none` 时用量仍非零）。
+`pnpm test:mode` 花真模型钱，只在改了这三处后手动跑：拼命令（`buildPiArgv`）、事件流解析（`parseChildStream`）、报告通道 / 用量。外加：TUI 人看面（`src/tui.ts` 的渲染/接线/清面）——完成线含 tui 腿「在飞上过屏、跑完面板即清」全 ✅。其余腿的完成线照旧：全部用例 ✅，含「没交报告账上也有数」（`reportChannel=none` 时用量仍非零）。
 
 ## 文档分工（各司其职）
 

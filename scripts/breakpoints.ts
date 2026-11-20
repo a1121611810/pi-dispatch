@@ -878,6 +878,25 @@ const CASES: Breakpoint[] = [
     red: "引擎：没交报告时用量仍从记录里出来",
     why: "registry 不存用量字段 ⇒ 记录里没有账，父方读不到",
   },
+  // ── TUI 常驻面 ────────────────────────────────────────────────────────────
+  {
+    feature: "TUI 面板只挂本会话的任务",
+    file: "src/tui.ts",
+    from: "  return record.ownerPid === owner.pid && record.ownerStartMs === owner.startMs;",
+    to: "  return true;",
+    test: "test/tui.test.ts",
+    red: "tui：别家会话的记录不混进来",
+    why: "restore 装回的历史记录、别家进程的记录混进面板计数",
+  },
+  {
+    feature: "TUI 面板全跑完即清",
+    file: "src/tui.ts",
+    from: "  if (active.length + queued.length === 0) return undefined;",
+    to: "  if (false) return undefined;",
+    test: "test/tui.test.ts",
+    red: "tui：全部终态即清",
+    why: "任务全终态后面板残留不消，一直占着编辑器上方",
+  },
 ];
 
 /** 数一个子串在文本里出现几次。 */
