@@ -35,7 +35,7 @@
     "test": "node --test \"test/**/*.test.ts\"",
     "test:coverage": "node --test --experimental-test-coverage \"test/**/*.test.ts\"",
     "test:node22": "npx -y node@22.19.0 --test \"test/**/*.test.ts\"",
-    "mutate": "mutator --no-coverage src/core",
+    "mutate": "mutator --no-coverage src",
     "test:node24": "npx -y node@24 --test \"test/**/*.test.ts\"",
     "test:mode": "node scripts/verify-modes.ts",
     "check:breakpoints": "node scripts/breakpoints.ts"

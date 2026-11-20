@@ -164,3 +164,6 @@ vite.config.ts.timestamp-*
 
 # 变异测试快照（mutator 工具）
 .metrics/
+
+# 变异测试的符号链接覆盖层工作目录（mutator 工具，含循环软链）
+target/
