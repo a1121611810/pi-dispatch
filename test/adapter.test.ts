@@ -12,12 +12,20 @@
 //   注册之前已赋值 ⇒ 这条分支到不了 ⇒ 等价。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import entry, { deliver, textResult, toHostMode } from "../src/index.ts";
+import entry, {
+  anchoredRead,
+  deliver,
+  excerptDeliverable,
+  lineHash,
+  textResult,
+  toHostMode,
+} from "../src/index.ts";
 import { NotificationCenter } from "../src/core/notifications.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
+import { encodeBucket, findProjectRoot } from "../src/core/storage.ts";
 
 /** 最小假 pi：只实现本扩展用到的 API。 */
 function fakePi() {
@@ -62,7 +70,12 @@ test("适配层：session_start 触发两次后，turn_end 只剩 1 个 handler"
 
     assert.equal(handlers.get("turn_end")!.size, 1, "turn_end 不能累积");
     assert.equal(handlers.get("session_shutdown")!.size, 1, "session_shutdown 不能累积");
-    assert.deepEqual([...tools.keys()].sort(), ["dispatch_list", "dispatch_stop", "dispatch_task"]);
+    assert.deepEqual([...tools.keys()].sort(), [
+      "dispatch_list",
+      "dispatch_read",
+      "dispatch_stop",
+      "dispatch_task",
+    ]);
   } finally {
     if (oldHome === undefined) delete process.env.HOME;
     else process.env.HOME = oldHome;
@@ -273,4 +286,163 @@ test("deliver：sendMessage 抛错不冒出去（best-effort）", async () => {
   };
   assert.doesNotThrow(() => deliver(pi as never, notifications));
   assert.equal(notifications.pendingCount(), 0, "失败也取走了，不阻塞下一轮");
+});
+
+// ── 模型面归约 ──────────────────────────────────────────────────────────────
+
+const BIG_TEXT = "x".repeat(60 * 1024);
+
+function resultWith(overrides: Record<string, unknown>) {
+  return {
+    status: "succeeded",
+    taskId: "t",
+    text: BIG_TEXT,
+    exitCode: 0,
+    started: true,
+    durationMs: 1,
+    readOnlyTier: "lenient" as const,
+    outputPath: "/tmp/out.log",
+    reportChannel: "none" as const,
+    outputTruncated: false,
+    ...overrides,
+  };
+}
+
+test("归约：无回执 ⇒ 50KB 大窗，省略标记不点名 report", () => {
+  const out = excerptDeliverable(resultWith({}) as never);
+  assert.match(out.text, /省略 \d+ 字符/);
+  assert.ok(!out.text.includes("摘要见 report"), "无回执不点名 report");
+  assert.ok(out.text.length > 50 * 1024, "50KB 预算 + 标记");
+  assert.ok(out.text.length < 51 * 1024);
+});
+
+test("归约：可靠回执 ⇒ 8KB 小窗且标记点名 report", () => {
+  const out = excerptDeliverable(
+    resultWith({
+      report: {
+        summary: "s",
+        why: "w",
+        assessment: "主流程已验证。边界场景还没覆盖全，存在回归风险。",
+      },
+      reportChannel: "tool",
+    }) as never,
+  );
+  assert.ok(out.text.includes("摘要见 report"));
+  assert.ok(out.text.length < 12 * 1024, "8KB 窗 + 标记");
+});
+
+test("归约：回执空转或核对挂了 ⇒ 落回大窗", () => {
+  const vacuous = excerptDeliverable(
+    resultWith({
+      report: { summary: "s", why: "w", assessment: "整体非常顺利圆满达成。" },
+      reportChannel: "tool",
+      assessmentVacuous: true,
+    }) as never,
+  );
+  assert.ok(!vacuous.text.includes("摘要见 report"), "空回执不享受小窗");
+  const unverified = excerptDeliverable(
+    resultWith({
+      report: {
+        summary: "s",
+        why: "w",
+        assessment: "主流程已验证。边界场景还没覆盖全，存在回归风险。",
+      },
+      reportChannel: "tool",
+      deliveryUnverified: true,
+    }) as never,
+  );
+  assert.ok(!unverified.text.includes("摘要见 report"), "核对挂了失去小窗资格");
+});
+
+test("归约：无 outputPath 不截——交付物必须可达", () => {
+  const out = excerptDeliverable(resultWith({ outputPath: "" }) as never);
+  assert.equal(out.text, BIG_TEXT);
+});
+
+test("归约：小文本原样过", () => {
+  const out = excerptDeliverable(resultWith({ text: "短文" }) as never);
+  assert.equal(out.text, "短文");
+});
+
+// ── dispatch_read 行锚 ──────────────────────────────────────────────────────
+
+test("anchoredRead：around 命中给窗口，失配拒绝并回鲜锚", () => {
+  const prose = ["alpha", "beta", "gamma", "delta", "epsilon"].join("\n");
+  const hit = anchoredRead(prose, { around: `3:${lineHash("gamma")}`, contextLines: 1 });
+  assert.equal(hit.error, undefined);
+  assert.match(
+    hit.text!,
+    new RegExp(`^2:[0-9a-f]{4}\\|beta\\n3:[0-9a-f]{4}\\|gamma\\n4:[0-9a-f]{4}\\|delta$`),
+  );
+  const miss = anchoredRead(prose, { around: "3:0000" });
+  assert.match(miss.error!, /锚失配/);
+  assert.equal(miss.freshAnchor, `3:${lineHash("gamma")}`);
+});
+
+test("anchoredRead：空白不敏感与格式/越界明说", () => {
+  const prose = "  indented line\nplain";
+  const hit = anchoredRead(prose, { around: `1:${lineHash("indented line")}` });
+  assert.equal(hit.error, undefined, "行首空格不影响锚");
+  assert.match(anchoredRead("a\nb", { around: "xx" }).error!, /锚格式不对/);
+  assert.match(anchoredRead("a\nb", { around: `9:${lineHash("x")}` }).error!, /越界/);
+});
+
+test("lineHash：钉死算法国定向量——锚是会话内的线路格式，不许静默漂移", () => {
+  assert.equal(lineHash("gamma"), "140a");
+  assert.equal(lineHash("第一行结论"), "de92");
+  assert.equal(lineHash(""), "9dc5");
+  assert.equal(lineHash("  gamma  "), "140a", "空白不敏感");
+});
+
+test("anchoredRead：超 maxChars 给头尾窗口并提示 around", () => {
+  const prose = Array.from({ length: 500 }, (_, i) => `line ${i}`).join("\n");
+  const out = anchoredRead(prose, { maxChars: 2048 });
+  assert.match(out.text!, /省略 \d+ 字符：用 around="N:hash" 拉窗口/);
+});
+
+test("适配层：dispatch_read 把原始 JSONL 散文化并带行锚", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dispatch-adapter-read-"));
+  const project = mkdtempSync(join(tmpdir(), "dispatch-proj-"));
+  mkdirSync(join(project, ".git"), { recursive: true });
+  const oldHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const { pi, handlers, tools } = fakePi();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    entry(pi as any);
+    await [...(handlers.get("session_start") ?? [])][0]!(undefined, fakeCtx(project));
+    const stream = JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "第一行结论\n第二行细节" }],
+      },
+    });
+    const outDir = join(
+      home,
+      ".pi",
+      "dispatch",
+      encodeBucket(findProjectRoot(project)),
+      "tasks",
+      "abc123",
+    );
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(join(outDir, "output.log"), stream, "utf8");
+
+    const def = tools.get("dispatch_read") as {
+      execute: (id: string, args: unknown) => Promise<{ content: Array<{ text: string }> }>;
+    };
+    const out = await def.execute("call_1", { taskId: "abc123" });
+    const payload = JSON.parse(out.content[0]!.text) as { text?: string; error?: string };
+    assert.equal(payload.error, undefined);
+    assert.match(payload.text!, /^1:[0-9a-f]{4}\|第一行结论\n2:[0-9a-f]{4}\|第二行细节$/);
+    assert.ok(!payload.text!.includes("message_end"), "不给原始 JSONL");
+
+    const missing = await def.execute("call_2", { taskId: "nope" });
+    const missingPayload = JSON.parse(missing.content[0]!.text) as { error?: string };
+    assert.match(missingPayload.error!, /还没落盘/);
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+  }
 });

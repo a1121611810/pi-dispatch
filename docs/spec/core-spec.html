@@ -2038,6 +2038,45 @@
         </p>
       </div>
 
+      <div class="card">
+        <h3>模型面归约：正文不整包进上下文</h3>
+        <p>
+          工具结果在会话历史里<b>每轮重发</b>——大正文是持续的税，且 pi
+          对扩展工具结果没有尺寸守卫。所以 <code>dispatch_task</code> 返回的正文按预算截窗：
+        </p>
+        <table style="margin: 0">
+          <thead>
+            <tr>
+              <th>回执质量</th>
+              <th>预算</th>
+              <th>形状</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>三要件全满足（回执在 ∧ 非空转 ∧ 核对没挂）</td>
+              <td><b>8KB</b></td>
+              <td>头 4KB + 省略标记 + 尾 4KB</td>
+            </tr>
+            <tr>
+              <td>无回执或回执不达标</td>
+              <td><b>50KB</b></td>
+              <td>头 1/4 + 省略标记 + 尾 3/4</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>
+          省略标记写清总字符数与全文去向。硬规矩：<b>没有 outputPath 就不截</b
+          >——交付物必须可达。全文读回走 <code>dispatch_read</code>。
+        </p>
+        <p style="margin-bottom: 0">
+          <code>dispatch_read</code>：读盘的原始流是 JSONL，先散文化成正文，再给每行打
+          <code>N:hash|</code> 内容锚（omp hashline 口径，空白不敏感）。照抄锚用
+          <code>around="142:9f3a"</code> 拉该行 ±20
+          行窗口；<b>锚失配拒绝并回鲜锚</b>——钉住引用不漂移。
+        </p>
+      </div>
+
       <div class="card red">
         <h3>收据唯一要紧的一件事：别乱报警</h3>
         <p>子代理说「我改了这些文件」，但收据里一个都对不上时，要提示「没有实测支撑」。</p>

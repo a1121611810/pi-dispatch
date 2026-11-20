@@ -1,12 +1,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 import { fileURLToPath } from "node:url";
-import { CHILD_REPORT_SCHEMA, CHILD_REPORT_TOOL_NAME } from "./core/child.ts";
+import { CHILD_REPORT_SCHEMA, CHILD_REPORT_TOOL_NAME, parseChildStream } from "./core/child.ts";
 import { TaskEngine } from "./core/engine.ts";
 import { TaskRegistry } from "./core/registry.ts";
 import { NotificationCenter } from "./core/notifications.ts";
 import { Storage, findProjectRoot } from "./core/storage.ts";
-import type { DispatchInput, HostMode } from "./core/types.ts";
+import type { DispatchInput, DispatchResult, HostMode } from "./core/types.ts";
 
 // pi 适配层：注册工具、装事件、投递通知。
 // 不写任何业务规则——业务规则全在 src/core/。
@@ -25,6 +25,119 @@ export function textResult(value: unknown): {
   return {
     content: [{ type: "text", text: JSON.stringify(value ?? null, null, 2) ?? "null" }],
     details: undefined,
+  };
+}
+
+// ── 模型面归约 ──────────────────────────────────────────────────────────────
+// dispatch_task 的正文全量进工具结果 = 每轮重发的大税（pi 对扩展工具结果没有尺寸守卫，
+// 只有事后压缩）。归约成头+尾窗口，全文走 dispatch_read / outputPath。
+// shortcut: 只按字符预算触发，未抄 pi 的 2000 行副条件——正文已散文化，字符预算是有效上界。
+
+const SMALL_WINDOW_HEAD = 4 * 1024;
+const SMALL_WINDOW_TAIL = 4 * 1024;
+const BIG_WINDOW_MAX_CHARS = 50 * 1024;
+
+/** 小窗三要件：回执在、非空转、核对挂过——全满足才享受 8KB 档，否则 50KB 档（无回执兜底窗）。 */
+function hasReliableReport(result: DispatchResult): boolean {
+  return Boolean(
+    result.report &&
+    result.reportChannel !== "none" &&
+    !result.assessmentVacuous &&
+    !result.deliveryUnverified,
+  );
+}
+
+export function excerptDeliverable(result: DispatchResult): DispatchResult {
+  if (!result.text || !result.outputPath) return result; // 无盘路径不截：交付物必须可达
+  const budget = hasReliableReport(result)
+    ? { head: SMALL_WINDOW_HEAD, tail: SMALL_WINDOW_TAIL }
+    : {
+        head: Math.floor(BIG_WINDOW_MAX_CHARS / 4),
+        tail: BIG_WINDOW_MAX_CHARS - Math.floor(BIG_WINDOW_MAX_CHARS / 4),
+      };
+  if (result.text.length <= budget.head + budget.tail) return result;
+  const omitted = result.text.length - budget.head - budget.tail;
+  const marker = `\n\n…【省略 ${omitted} 字符：${
+    hasReliableReport(result) ? "摘要见 report；" : ""
+  }全文经 dispatch_read 或 ${result.outputPath} 可达】\n\n`;
+  return {
+    ...result,
+    text: result.text.slice(0, budget.head) + marker + result.text.slice(-budget.tail),
+  };
+}
+
+// ── dispatch_read：散文化 + 行锚 ────────────────────────────────────────────
+// 盘上是原始 JSONL 事件流，模型直接读会拿到一堆 JSON 行——先 parseChildStream 取散文正文，
+// 再打 omp hashline 口径的行锚（内容哈希，空白不敏感）：引用证据照抄 N:hash，窗口精读用 around。
+
+const AROUND_ANCHOR_RE = /^(\d+):([0-9a-f]{4})$/;
+const READ_MAX_CHARS_CAP = BIG_WINDOW_MAX_CHARS;
+
+/** FNV-1a 取低 16 位（4 hex），对 trim 后的行内容——omp hashline 的加宽版。 */
+export function lineHash(line: string): string {
+  let h = 0x811c9dc5;
+  const s = line.trim();
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return (h & 0xffff).toString(16).padStart(4, "0");
+}
+
+export interface AnchoredReadResult {
+  text?: string;
+  totalLines: number;
+  /** around 命中的窗口（1 起，含端点） */
+  from?: number;
+  to?: number;
+  /** 锚失配时回该行当前的鲜锚 */
+  freshAnchor?: string;
+  error?: string;
+}
+
+export function anchoredRead(
+  prose: string,
+  opts: { maxChars?: number; around?: string; contextLines?: number } = {},
+): AnchoredReadResult {
+  const lines = prose.split("\n");
+  if (opts.around !== undefined) {
+    const m = AROUND_ANCHOR_RE.exec(opts.around.trim());
+    if (!m) return { totalLines: lines.length, error: `锚格式不对：${opts.around}（要 N:hash）` };
+    const n = Number(m[1]);
+    const line = lines[n - 1];
+    if (line === undefined)
+      return { totalLines: lines.length, error: `行号 ${n} 越界（共 ${lines.length} 行）` };
+    const fresh = lineHash(line);
+    if (fresh !== m[2])
+      return {
+        totalLines: lines.length,
+        error: `锚失配：第 ${n} 行内容已变或锚写错，拒绝读取`,
+        freshAnchor: `${n}:${fresh}`,
+      };
+    const ctx = Math.max(0, Math.floor(opts.contextLines ?? 20));
+    const from = Math.max(0, n - 1 - ctx);
+    const to = Math.min(lines.length, n - 1 + ctx + 1);
+    return {
+      text: lines
+        .slice(from, to)
+        .map((l, i) => `${from + i + 1}:${lineHash(l)}|${l}`)
+        .join("\n"),
+      totalLines: lines.length,
+      from: from + 1,
+      to,
+    };
+  }
+  const joined = lines.map((l, i) => `${i + 1}:${lineHash(l)}|${l}`).join("\n");
+  const maxChars = Math.min(opts.maxChars ?? 8192, READ_MAX_CHARS_CAP);
+  if (joined.length <= maxChars) return { text: joined, totalLines: lines.length };
+  const head = Math.floor(maxChars / 4);
+  const tail = maxChars - head;
+  return {
+    text:
+      joined.slice(0, head) +
+      `\n…【省略 ${joined.length - head - tail} 字符：用 around="N:hash" 拉窗口】\n` +
+      joined.slice(-tail),
+    totalLines: lines.length,
   };
 }
 
@@ -188,7 +301,7 @@ function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
         allowScripts: a.allowScripts,
       };
       const outcome = await current().dispatch(input);
-      return textResult(outcome);
+      return textResult("text" in outcome ? excerptDeliverable(outcome) : outcome);
     },
   });
 
@@ -215,6 +328,37 @@ function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
           outputTruncated: r.outputTruncated,
         }));
       return textResult({ total: records.length, records });
+    },
+  });
+
+  pi.registerTool({
+    name: "dispatch_read",
+    label: "读产出",
+    description:
+      '读任务产出的散文正文（不是原始 JSONL 流）。每行带 N:hash 锚；用 around="N:hash" 拉该行±contextLines 窗口，锚失配会拒绝并回新鲜锚。',
+    parameters: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "任务编号" },
+        maxChars: { type: "number", description: "无 around 时摘要上限（默认 8192）" },
+        around: { type: "string", description: '形如 "12:9f3a" 的行锚' },
+        contextLines: { type: "number", description: "around 窗口半径（默认 20）" },
+      },
+      required: ["taskId"],
+    } as never,
+    execute: async (_id, args) => {
+      const a = args as {
+        taskId: string;
+        maxChars?: number;
+        around?: string;
+        contextLines?: number;
+      };
+      const raw = await current().readOutput(a.taskId);
+      if (raw === undefined)
+        return textResult({ taskId: a.taskId, error: "还没落盘：任务未结束或编号不存在" });
+      // 盘上的是原始 JSONL 事件流——模型直接读会拿到一堆 JSON 行；先散文化再锚定
+      const prose = parseChildStream(raw).text || raw;
+      return textResult({ taskId: a.taskId, ...anchoredRead(prose, a) });
     },
   });
 
