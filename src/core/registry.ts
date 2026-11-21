@@ -1,4 +1,4 @@
-import { isTerminal, type TaskRecord, type TaskStatus } from "./types.ts";
+import { isTerminal, type TaskRecord, type TaskStatus, type WorktreeInfo } from "./types.ts";
 
 // 状态机：queued 入队即存在；终态没有出边。
 // 往终态上写的迟到消息静默丢弃——竞态下这是常事，不报错。
@@ -18,8 +18,13 @@ export type TaskCommand =
   | { kind: "transition"; id: string; to: TaskStatus }
   | { kind: "stop"; id: string; reason: string }
   | { kind: "cancel-queued"; id: string; reason: string }
-  | { kind: "resolve-exit"; id: string; exitCode: number; detail?: string }
+  | { kind: "resolve-exit"; id: string; exitCode: number; detail?: string; notStarted?: boolean }
   | { kind: "reconcile-lost"; id: string; reason: string }
+  | {
+      kind: "attach-worktree";
+      id: string;
+      worktree: WorktreeInfo;
+    }
   | {
       kind: "attach-report";
       id: string;
@@ -130,6 +135,9 @@ export class TaskRegistry {
         if (current.status === "stopping") return this.#move(command.id, "canceled", {});
         if (current.status === "running") {
           return this.#move(command.id, command.exitCode === 0 ? "succeeded" : "failed", {
+            // 孩子压根没起（建 worktree 失败）：startedAt 要清——
+            // 记录里 startedAt 有值必须恒等于「孩子真起过」。
+            ...(command.notStarted ? { startedAt: undefined } : {}),
             exitCode: command.exitCode,
             // 孩子自己非零退出：死因进 stopReason——errorMessage 第一行才可读（模型和调用方最先读它）
             ...(command.exitCode !== 0 && command.detail ? { stopReason: command.detail } : {}),
@@ -157,6 +165,15 @@ export class TaskRegistry {
         this.#records.set(command.id, next);
         this.#emit(next, current);
         return { record: next, fromStatus: current.status, changed: true };
+      }
+      case "attach-worktree": {
+        // worktree 回执是磁盘观测事实，不是生命周期：全状态可写（含终态），
+        // 永不改 status（终态上补写是崩溃恢复对账，无害）。
+        const current = this.#require(command.id);
+        const next: TaskRecord = { ...current, worktree: command.worktree };
+        this.#records.set(command.id, next);
+        this.#emit(next, current);
+        return { record: next, fromStatus: current.status, changed: next !== current };
       }
       case "attach-output": {
         // 产出路径挂记录：任务链的「产出」锚点；终态上的迟到写入静默丢弃
@@ -192,8 +209,11 @@ export class TaskRegistry {
       ...current,
       ...patch,
       status: to,
-      // 出队转 running 的那一刻盖 startedAt，durationMs 量孩子跑起来之后的时间
-      startedAt: to === "running" ? Date.now() : current.startedAt,
+      // 出队转 running 的那一刻盖 startedAt，durationMs 量孩子跑起来之后的时间。
+      // patch 显式给了 startedAt（notStarted ⇒ undefined）就照 patch 走：
+      // 孩子压根没起，记录里不能留起始时刻。
+      startedAt:
+        "startedAt" in patch ? patch.startedAt : to === "running" ? Date.now() : current.startedAt,
       finishedAt: isTerminal(to) ? Date.now() : current.finishedAt,
     };
     this.#records.set(id, next);

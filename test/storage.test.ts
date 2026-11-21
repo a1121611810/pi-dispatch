@@ -377,3 +377,55 @@ test("locale：中文环境下进程启动时刻仍读得到（ps 输出带 LC_A
     else process.env.LANG = old;
   }
 });
+
+// ── worktree 目录与归档查询 ───────────────────────────────────────────────
+
+test("golden：默认关——桶里没有 worktrees 目录", () => {
+  const { storage } = freshStorage();
+  storage.persistRecord(record("a"));
+  storage.persistOutput("a", "x");
+  const bucketRoot = storage.recordPath("a").replace(/records.*$/, "");
+  assert.equal(existsSync(join(bucketRoot, "worktrees")), false, "隔离没开就不建这个目录");
+});
+
+test("worktree：路径落在受管根下，编号不安全时抛", () => {
+  const { storage } = freshStorage();
+  const path = storage.worktreePath("task-1");
+  assert.ok(path.includes("worktrees"));
+  assert.ok(path.endsWith("task-1"));
+  assert.throws(() => storage.worktreePath("../evil"), /invalid task id/);
+});
+
+test("worktree：worktreesDir 是桶下的固定位置", () => {
+  const { storage } = freshStorage();
+  assert.equal(
+    storage.worktreesDir,
+    join(storage.recordPath("x").replace(/records.*$/, ""), "worktrees"),
+  );
+});
+
+test("归档：hasArchivedRecord 看的是压缩档在不在", () => {
+  const { storage } = freshStorage();
+  assert.equal(storage.hasArchivedRecord("a"), false, "还没归档");
+  storage.persistRecord(record("a"));
+  storage.archiveOne(record("a"));
+  assert.equal(storage.hasArchivedRecord("a"), true, "归档了");
+  assert.equal(storage.hasArchivedRecord("b"), false);
+  assert.equal(storage.hasArchivedRecord("../evil"), false, "编号不安全时不碰盘");
+});
+
+test("归档：listArchivedIds 列出归档里的编号", () => {
+  const { storage } = freshStorage();
+  assert.deepEqual(storage.listArchivedIds(), []);
+  storage.persistRecord(record("a"));
+  storage.persistOutput("a", "x");
+  storage.archiveOne(record("a"));
+  storage.persistRecord(record("b"));
+  storage.archiveOne(record("b"));
+  assert.deepEqual(storage.listArchivedIds().sort(), ["a", "b"]);
+});
+
+test("留痕：projectRoot 拿得回当初那个根", () => {
+  const { project, storage } = freshStorage();
+  assert.equal(storage.projectRoot, project);
+});

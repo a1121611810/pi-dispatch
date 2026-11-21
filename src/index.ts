@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { CHILD_REPORT_SCHEMA, CHILD_REPORT_TOOL_NAME, parseChildStream } from "./core/child.ts";
 import { TaskEngine } from "./core/engine.ts";
@@ -176,6 +177,12 @@ const DISPATCH_TASK_SCHEMA = {
       description:
         "true = 这个子代理能写脚本批量调工具：脚本里可以循环、并行调工具，只有脚本的输出回到模型（中间结果不进上下文）。适合「同形态调用很多次」的机械活——批量读文件、批量改、批量查。代价两条：① 子代理的输入会多一份工具声明（吃 token）；② 它不保证子代理真的会写脚本——要它写，就在任务里明说「用写脚本的方式」。不传 = 用会话的默认值。",
     },
+    isolation: {
+      type: "string",
+      enum: ["worktree"],
+      description:
+        "隔离模式：把子代理放进独立的 git worktree（干净检出），改动不踩父方的工作区。代价三条：① 干净检出里没有 node_modules，要跑测试得自己装依赖；② 交付前子代理必须自己 commit（父方不代提交、不自动 merge）；③ merge 归父方——父方 review 完自己合。非 git 仓库里会被拒。",
+    },
   },
   required: ["taskDescription"],
 } as const;
@@ -217,17 +224,23 @@ function startSession(
   ctx: Parameters<Parameters<ExtensionAPI["on"]>[1]>[1],
 ): { engine: TaskEngine; cleanup: () => void } {
   const notifications = new NotificationCenter();
+  const projectRoot = findProjectRoot(ctx.cwd);
   const storage = new Storage(
     // 外壳注入存储根：~/.pi/dispatch（核心不知道默认该落哪）
     (process.env.HOME ?? "~") + "/.pi/dispatch",
-    findProjectRoot(ctx.cwd),
+    projectRoot,
   );
+  // git 根：projectRoot 认 .git 或 .pi，可能不是 git 根 ⇒ 真问一次 git。
+  // 问不出来（非 git 仓）⇒ 隔离能力关闭（安检 9 会拒 isolation=worktree）。
+  const repoRoot = resolveRepoRoot(projectRoot);
   const engine = new TaskEngine({
     registry: new TaskRegistry(),
     storage,
     hostMode: toHostMode(ctx.mode),
     piVersion: safe(() => PI_VERSION),
     childExtensionPath: fileURLToPath(import.meta.url),
+    repoRoot,
+    isGitRepo: () => isGitRepoAt(repoRoot),
     sessionModel: () => {
       try {
         return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
@@ -255,6 +268,42 @@ function startSession(
       detachTui?.();
     },
   };
+}
+
+/**
+ * 真 git 根：git rev-parse --show-toplevel。
+ * projectRoot 认 .git 或 .pi，可能不是 git 根 ⇒ 不能直接拿它当 repoRoot。
+ * 不是 git 仓 ⇒ undefined（隔离能力关闭）。
+ */
+export function resolveRepoRoot(cwd: string): string | undefined {
+  try {
+    const out = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return out === "" ? undefined : out;
+  } catch {
+    return undefined;
+  }
+}
+
+/** 有可用的 git 仓吗：--is-inside-work-tree 与 --verify HEAD 都成功才算。 */
+export function isGitRepoAt(repoRoot: string | undefined): boolean {
+  if (!repoRoot) return false;
+  try {
+    execFileSync("git", ["rev-parse", "--is-inside-work-tree"], {
+      cwd: repoRoot,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    execFileSync("git", ["rev-parse", "--verify", "HEAD"], {
+      cwd: repoRoot,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** 把待投递的通知按批发出。best-effort：失败不阻塞 turn。 */
@@ -297,6 +346,7 @@ function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
         timeoutMs?: number;
         projectContext?: "auto" | "none";
         allowScripts?: boolean;
+        isolation?: "worktree";
       };
       const input: DispatchInput = {
         task: a.taskDescription,
@@ -307,6 +357,7 @@ function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
         timeoutMs: a.timeoutMs,
         projectContext: a.projectContext,
         allowScripts: a.allowScripts,
+        isolation: a.isolation,
       };
       const outcome = await current().dispatch(input);
       return textResult("text" in outcome ? excerptDeliverable(outcome) : outcome);
@@ -335,6 +386,8 @@ function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
           assessmentVacuous: r.assessmentVacuous,
           outputPath: r.outputPath,
           outputTruncated: r.outputTruncated,
+          isolation: r.isolation,
+          worktree: r.worktree,
         }));
       return textResult({ total: records.length, records });
     },

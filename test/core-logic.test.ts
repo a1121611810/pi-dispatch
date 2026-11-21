@@ -460,3 +460,63 @@ test("状态机：订阅者收到每次变迁", async () => {
   await reg.submit({ kind: "resolve-exit", id: "a", exitCode: 0 });
   assert.deepEqual(seen, ["queued", "running", "succeeded"]);
 });
+
+// ── worktree 回执与 notStarted ────────────────────────────────────────────
+
+test("状态机：attach-worktree 只写元数据，不改 status", async () => {
+  const reg = new TaskRegistry();
+  await reg.submit({ kind: "spawn", record: record("wt") });
+  await reg.submit({ kind: "transition", id: "wt", to: "running" });
+  const before = reg.get("wt")!;
+  const result = await reg.submit({
+    kind: "attach-worktree",
+    id: "wt",
+    worktree: { path: "/wt/wt", branch: "pi-dispatch/wt", baseCommit: "abc" },
+  });
+  assert.equal(result.changed, true, "写了元数据");
+  assert.equal(result.record.status, "running", "不改 status");
+  assert.equal(result.record.worktree?.branch, "pi-dispatch/wt");
+  assert.equal(before.worktree, undefined, "旧记录不受影响（不可变）");
+});
+
+test("状态机：attach-worktree 在终态上也照写（崩溃恢复对账）", async () => {
+  const reg = new TaskRegistry();
+  await reg.submit({ kind: "spawn", record: record("wt") });
+  await reg.submit({ kind: "transition", id: "wt", to: "running" });
+  await reg.submit({ kind: "resolve-exit", id: "wt", exitCode: 0 });
+  assert.equal(reg.get("wt")?.status, "succeeded");
+  const result = await reg.submit({
+    kind: "attach-worktree",
+    id: "wt",
+    worktree: { path: "/wt/wt", branch: "pi-dispatch/wt", baseCommit: "abc", dirty: 2 },
+  });
+  assert.equal(result.changed, true, "终态也写");
+  assert.equal(result.record.status, "succeeded", "还是那个终态");
+  assert.equal(result.record.worktree?.dirty, 2);
+});
+
+test("状态机：notStarted 的 resolve-exit ⇒ started:false、duration 0", async () => {
+  const reg = new TaskRegistry();
+  await reg.submit({ kind: "spawn", record: record("ns") });
+  await reg.submit({ kind: "transition", id: "ns", to: "running" });
+  assert.ok(reg.get("ns")?.startedAt, "进 running 时盖了 startedAt");
+  const result = await reg.submit({
+    kind: "resolve-exit",
+    id: "ns",
+    exitCode: -1,
+    notStarted: true,
+    detail: "worktree 创建失败：boom",
+  });
+  assert.equal(result.record.status, "failed");
+  assert.equal(result.record.startedAt, undefined, "孩子压根没起 ⇒ startedAt 要清");
+  assert.equal(result.record.exitCode, -1);
+  assert.match(result.record.stopReason ?? "", /worktree/);
+});
+
+test("状态机：普通的 resolve-exit 保留 startedAt", async () => {
+  const reg = new TaskRegistry();
+  await reg.submit({ kind: "spawn", record: record("ok") });
+  await reg.submit({ kind: "transition", id: "ok", to: "running" });
+  const result = await reg.submit({ kind: "resolve-exit", id: "ok", exitCode: 0 });
+  assert.ok(result.record.startedAt, "孩子真起过 ⇒ startedAt 留着");
+});

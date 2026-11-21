@@ -15,7 +15,7 @@
 //   （记录只在终态后才被挤掉），get 不会返回 undefined ⇒ 等价。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readdirSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskEngine } from "../src/core/engine.ts";
@@ -24,6 +24,7 @@ import { batchBySize, NotificationCenter } from "../src/core/notifications.ts";
 import { Storage } from "../src/core/storage.ts";
 import type { MachineReader, MachineSpec } from "../src/core/pool.ts";
 import type { ChildHandle } from "../src/core/child.ts";
+import type { GitRunner } from "../src/core/worktree.ts";
 
 const GiB = 1024 * 1024 * 1024;
 const MiB = 1024 * 1024;
@@ -78,6 +79,9 @@ function freshEngine(
     whyEnabled?: () => boolean;
     allowScriptsDefault?: () => boolean;
     dispatchEnabled?: () => boolean;
+    git?: GitRunner;
+    repoRoot?: string;
+    isGitRepo?: () => boolean;
   } = {},
 ) {
   const registry = new TaskRegistry();
@@ -91,8 +95,48 @@ function freshEngine(
     whyEnabled: opts.whyEnabled,
     allowScriptsDefault: opts.allowScriptsDefault,
     dispatchEnabled: opts.dispatchEnabled,
+    git: opts.git,
+    repoRoot: opts.repoRoot,
+    isGitRepo: opts.isGitRepo,
   });
   return { registry, engine };
+}
+
+/** 假 git：记调用，按「子命令 + 参数」喂结果。 */
+function fakeGit(
+  handlers: { [key: string]: { code: number; stdout?: string; stderr?: string } } = {},
+): { runner: GitRunner; calls: string[][] } {
+  const calls: string[][] = [];
+  const runner: GitRunner = async (args) => {
+    calls.push(args);
+    // 建 worktree 时把目录建出来——不然观测那步会当成「目录不在」
+    if (args[0] === "worktree" && args[1] === "add") mkdirSync(args[4]!, { recursive: true });
+    for (const [key, result] of Object.entries(handlers)) {
+      const [cmd, sub] = key.split(" ");
+      if (args[0] === cmd && args[1] === sub) {
+        return { code: result.code, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+      }
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  return { runner, calls };
+}
+
+/** 假 spawn（记参数）：立刻退出 0。 */
+function recordingSpawn(seen: unknown[][]): (...args: unknown[]) => ChildHandle {
+  return (...args: unknown[]) => {
+    seen.push(args);
+    const exits: Array<(code: number) => void> = [];
+    setTimeout(() => {
+      for (const l of exits) l(0);
+    }, 5);
+    return {
+      pid: 1,
+      onOutput: () => {},
+      onExit: (cb: (code: number) => void) => exits.push(cb),
+      kill: () => {},
+    };
+  };
 }
 
 /** 等 registry 里某任务到终态。 */
@@ -1557,4 +1601,296 @@ test("引擎：错峰——一个结束后，排队的要立刻起（座位不�
   assert.equal(spawnedAt.length, 3, `第三个该在 A 结束后就起；实际起了 ${spawnedAt.length} 个`);
   assert.ok(spawnedAt[2]! < 1200, `第三个起于 ${spawnedAt[2]}ms，应远早于 B 结束（2500ms）`);
   await engine.shutdown();
+});
+
+// ── 引擎：worktree 隔离 ──────────────────────────────────────────────────
+
+/** 隔离用例的桶（真目录：worktree 路径要落在这儿）。 */
+function isolationStorage(): { root: string; project: string; storage: Storage } {
+  const root = mkdtempSync(join(tmpdir(), "dispatch-iso-"));
+  const project = join(root, "proj");
+  mkdirSync(join(project, ".git"), { recursive: true });
+  return { root, project, storage: new Storage(join(root, "dispatch"), project) };
+}
+
+test("golden：默认关——spawn 无第三参", async () => {
+  const seen: unknown[][] = [];
+  const { engine } = freshEngine({
+    spawn: recordingSpawn(seen) as never,
+    hostMode: "one-shot",
+  });
+  await engine.dispatch({ task: "干活" });
+  assert.equal(seen.length, 1, "起了一个孩子");
+  assert.equal(seen[0]!.length, 2, "默认关：只有 argv 与 env，第三参连键都不出现");
+});
+
+test("golden：默认关——git runner 零调用（含 boot）", async () => {
+  const { project, storage } = isolationStorage();
+  const { runner, calls } = fakeGit();
+  const { engine } = freshEngine({
+    storage,
+    git: runner,
+    repoRoot: project,
+    hostMode: "one-shot",
+  });
+  await engine.ready;
+  await engine.dispatch({ task: "干活" });
+  assert.equal(calls.length, 0, `git 被调了 ${calls.length} 次（默认关时不该碰 git）`);
+});
+
+test("golden：默认关——记录与结果里都没有隔离的键", async () => {
+  const { registry, engine } = freshEngine({ hostMode: "one-shot" });
+  const outcome = await engine.dispatch({ task: "干活" });
+  const taskId = (outcome as { taskId: string }).taskId;
+  const keys = Object.keys(registry.get(taskId) ?? {});
+  assert.ok(!keys.includes("isolation"), "记录里没有 isolation");
+  assert.ok(!keys.includes("worktree"), "记录里没有 worktree");
+  const result = outcome as Record<string, unknown>;
+  assert.ok(!("isolation" in result), "结果里没有 isolation");
+  assert.ok(!("worktree" in result), "结果里没有 worktree");
+});
+
+test("引擎：不是 git 仓 ⇒ 隔离被退回，不留记录", async () => {
+  const { registry, engine } = freshEngine({
+    isGitRepo: () => false,
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活", isolation: "worktree" });
+  assert.equal((outcome as { status: string }).status, "rejected");
+  assert.equal(registry.list().length, 0, "被退回不留记录");
+});
+
+test("引擎：钉不住 base ⇒ 退回，不留记录", async () => {
+  const { storage } = isolationStorage();
+  const { registry, engine } = freshEngine({
+    storage,
+    // 没注入 repoRoot ⇒ 不知道 git 根 ⇒ 钉不住 base
+    isGitRepo: () => true,
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活", isolation: "worktree" });
+  assert.equal((outcome as { status: string }).status, "rejected");
+  assert.equal(registry.list().length, 0);
+});
+
+test("引擎：没有留痕目录 ⇒ 隔离被退回", async () => {
+  const { registry, engine } = freshEngine({
+    // 没有 storage
+    isGitRepo: () => true,
+    repoRoot: "/repo",
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活", isolation: "worktree" });
+  assert.equal((outcome as { status: string }).status, "rejected");
+  assert.equal(registry.list().length, 0);
+});
+
+test("引擎：开隔离 ⇒ 记录带 isolation 与 worktree 三件套", async () => {
+  const { project, storage } = isolationStorage();
+  const { runner } = fakeGit({ "rev-parse --verify": { code: 0, stdout: "base123\n" } });
+  const { registry, engine } = freshEngine({
+    storage,
+    git: runner,
+    repoRoot: project,
+    isGitRepo: () => true,
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活", isolation: "worktree" });
+  const taskId = (outcome as { taskId: string }).taskId;
+  const record = registry.get(taskId);
+  assert.equal(record?.isolation, "worktree");
+  assert.equal(record?.worktree?.baseCommit, "base123", "base 在受理时钉死");
+  assert.equal(record?.worktree?.branch, `pi-dispatch/${taskId}`);
+  assert.ok(record?.worktree?.path.endsWith(taskId), "worktree 落在受管根下");
+});
+
+test("引擎：受理时钉 base，排队期间 HEAD 前进不漂移", async () => {
+  const { project, storage } = isolationStorage();
+  let heads = 0;
+  const calls: string[][] = [];
+  const runner: GitRunner = async (args) => {
+    calls.push(args);
+    if (args[0] === "rev-parse" && args[1] === "--verify") {
+      heads++;
+      return { code: 0, stdout: heads === 1 ? "commit-1\n" : "commit-2\n", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const { registry, engine } = freshEngine({
+    storage,
+    git: runner,
+    repoRoot: project,
+    isGitRepo: () => true,
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活", isolation: "worktree" });
+  const taskId = (outcome as { taskId: string }).taskId;
+  assert.equal(
+    registry.get(taskId)?.worktree?.baseCommit,
+    "commit-1",
+    "受理时钉的那个，不因后来 HEAD 前进而变",
+  );
+  const add = calls.find((c) => c[0] === "worktree" && c[1] === "add");
+  assert.ok(add, "建了 worktree");
+  assert.equal(add!.at(-1), "commit-1", "建在钉死的 base 上");
+});
+
+test("引擎：isolation 的 spawn 收到 cwd=worktree 路径", async () => {
+  const { project, storage } = isolationStorage();
+  const { runner } = fakeGit({ "rev-parse --verify": { code: 0, stdout: "base123\n" } });
+  const seen: unknown[][] = [];
+  const { registry, engine } = freshEngine({
+    storage,
+    git: runner,
+    repoRoot: project,
+    isGitRepo: () => true,
+    spawn: recordingSpawn(seen) as never,
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活", isolation: "worktree" });
+  const taskId = (outcome as { taskId: string }).taskId;
+  const options = seen[0]![2] as { cwd?: string } | undefined;
+  assert.equal(options?.cwd, registry.get(taskId)?.worktree?.path, "cwd 落在 worktree 上");
+});
+
+test("引擎：创建失败 ⇒ failed 且不 spawn（绝不回共享 cwd）", async () => {
+  const { project, storage } = isolationStorage();
+  const { runner } = fakeGit({
+    "rev-parse --verify": { code: 0, stdout: "base123\n" },
+    "worktree add": { code: 128, stderr: "fatal: could not create work tree dir" },
+  });
+  const seen: unknown[][] = [];
+  const { registry, engine } = freshEngine({
+    storage,
+    git: runner,
+    repoRoot: project,
+    isGitRepo: () => true,
+    spawn: recordingSpawn(seen) as never,
+    hostMode: "one-shot",
+  });
+  const outcome = (await engine.dispatch({ task: "干活", isolation: "worktree" })) as {
+    status: string;
+    started: boolean;
+    durationMs: number;
+    errorMessage?: string;
+  };
+  assert.equal(outcome.status, "failed");
+  assert.equal(outcome.started, false, "孩子压根没起");
+  assert.equal(outcome.durationMs, 0);
+  assert.match(outcome.errorMessage ?? "", /worktree/);
+  assert.equal(seen.length, 0, "绝不 spawn");
+  const taskId = (outcome as unknown as { taskId: string }).taskId;
+  assert.equal(registry.get(taskId)?.startedAt, undefined, "startedAt 要清");
+});
+
+test("引擎：孩子 close 后观测 worktree 并入记录", async () => {
+  const { project, storage } = isolationStorage();
+  const runner: GitRunner = async (args) => {
+    if (args[0] === "worktree" && args[1] === "add") mkdirSync(args[4]!, { recursive: true });
+    if (args[0] === "rev-parse" && args[1] === "--verify") {
+      return { code: 0, stdout: "base123\n", stderr: "" };
+    }
+    if (args[0] === "status") return { code: 0, stdout: " M a.txt\n", stderr: "" };
+    if (args[0] === "rev-parse" && args[1] === "--abbrev-ref") {
+      return { code: 0, stdout: "pi-dispatch/x\n", stderr: "" };
+    }
+    if (args[0] === "rev-list") return { code: 0, stdout: "3\n", stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const { registry, engine } = freshEngine({
+    storage,
+    git: runner,
+    repoRoot: project,
+    isGitRepo: () => true,
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活", isolation: "worktree" });
+  const taskId = (outcome as { taskId: string }).taskId;
+  const worktree = registry.get(taskId)?.worktree;
+  assert.equal(worktree?.dirty, 1, "观测到的脏文件数入账");
+  assert.equal(worktree?.commitsAhead, 3);
+  assert.equal(worktree?.headCommit, "base123");
+});
+
+test("引擎：观测失败时 dirty 留空（不填 0）", async () => {
+  const { project, storage } = isolationStorage();
+  const runner: GitRunner = async (args, cwd) => {
+    if (args[0] === "worktree" && args[1] === "add") {
+      mkdirSync(args[4]!, { recursive: true });
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (cwd === project) return { code: 0, stdout: "base123\n", stderr: "" };
+    throw new Error("git 炸了");
+  };
+  const { registry, engine } = freshEngine({
+    storage,
+    git: runner,
+    repoRoot: project,
+    isGitRepo: () => true,
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活", isolation: "worktree" });
+  const taskId = (outcome as { taskId: string }).taskId;
+  const record = registry.get(taskId);
+  assert.equal(record?.status, "succeeded", "观测失败不改终态");
+  assert.equal(record?.worktree?.dirty, undefined, "观测不到 ≠ 干净：不能填 0");
+  assert.equal(record?.worktree?.captureError, "git 炸了", "只记 captureError");
+});
+
+test("引擎：开隔离 ⇒ argv 里带 worktree 契约块", async () => {
+  const { project, storage } = isolationStorage();
+  const { runner } = fakeGit({ "rev-parse --verify": { code: 0, stdout: "base123\n" } });
+  const seen: unknown[][] = [];
+  const { engine } = freshEngine({
+    storage,
+    git: runner,
+    repoRoot: project,
+    isGitRepo: () => true,
+    spawn: recordingSpawn(seen) as never,
+    hostMode: "one-shot",
+  });
+  await engine.dispatch({ task: "干活", isolation: "worktree" });
+  const argv = seen[0]![0] as string[];
+  assert.ok(argv.join("\n").includes("pi-dispatch-worktree"), "提示块里要交代 worktree 契约");
+});
+
+test("引擎：boot 清扫——归档里的 worktree 也受保护", async () => {
+  const { project, storage } = isolationStorage();
+  const worktreesDir = storage.worktreesDir;
+  mkdirSync(worktreesDir, { recursive: true });
+  const archived = join(worktreesDir, "archived-task");
+  mkdirSync(archived, { recursive: true });
+  const orphan = join(worktreesDir, "orphan-task");
+  mkdirSync(orphan, { recursive: true });
+  const past = new Date(Date.now() - 31 * 86_400_000);
+  utimesSync(archived, past, past);
+  utimesSync(orphan, past, past);
+  // 归档里有一条 archived-task 的记录（热记录没有）
+  storage.persistRecord({ id: "archived-task", status: "succeeded", task: "t" });
+  storage.archiveOne({ id: "archived-task", status: "succeeded", task: "t" });
+  const porcelain = [
+    `worktree ${archived}`,
+    "HEAD abc",
+    "branch refs/heads/pi-dispatch/archived-task",
+    "",
+    `worktree ${orphan}`,
+    "HEAD abc",
+    "branch refs/heads/pi-dispatch/orphan-task",
+    "",
+  ].join("\n");
+  const { runner, calls } = fakeGit({ "worktree list": { code: 0, stdout: porcelain } });
+  const registry = new TaskRegistry();
+  const engine = new TaskEngine({
+    registry,
+    machineReader: machineReader(),
+    spawnChild: fakeSpawn({}),
+    storage,
+    git: runner,
+    repoRoot: project,
+    hostMode: "one-shot",
+  });
+  await engine.ready;
+  const removed = calls.filter((c) => c[0] === "worktree" && c[1] === "remove").map((c) => c[2]);
+  assert.ok(!removed.includes(archived), "归档里的 ⇒ 保护");
+  assert.ok(removed.includes(orphan), "没账本的 ⇒ 清");
 });

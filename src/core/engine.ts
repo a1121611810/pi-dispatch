@@ -24,6 +24,15 @@ import {
   type MachineSpec,
 } from "./pool.ts";
 import { Storage, isPidAlive, processStartMs } from "./storage.ts";
+import {
+  branchNameFor,
+  createWorktree,
+  execFileGit,
+  observeWorktree,
+  resolveHead,
+  sweepWorktrees,
+  type GitRunner,
+} from "./worktree.ts";
 import type { TaskRegistry } from "./registry.ts";
 import type {
   DispatchInput,
@@ -31,6 +40,7 @@ import type {
   DispatchResult,
   HostMode,
   TaskRecord,
+  WorktreeInfo,
 } from "./types.ts";
 import { isTerminal } from "./types.ts";
 
@@ -78,6 +88,12 @@ export interface EngineDeps {
   childExtensionPath?: string;
   /** 时钟（测试注入假时钟） */
   now?: () => number;
+  /** 跑 git（测试注入假 runner；缺省真跑 git） */
+  git?: GitRunner;
+  /** git 仓库根（适配层问 git 拿的；缺省 = 隔离不可用） */
+  repoRoot?: string;
+  /** 是不是可用的 git 仓（喂安检 9；缺省 = 否 ⇒ 不许开隔离） */
+  isGitRepo?: () => boolean;
 }
 
 const DEFAULT_STOP_GRACE_MS = 5_000;
@@ -128,6 +144,8 @@ export class TaskEngine {
   readonly #piPath?: string;
   readonly #childExtensionPath?: string;
   readonly #now: () => number;
+  readonly #git: GitRunner;
+  readonly #repoRoot?: string;
   readonly #owner: { pid: number; startMs: number };
   readonly #ready: Promise<void>;
   /** 在跑的孩子（占用座位） */
@@ -166,6 +184,8 @@ export class TaskEngine {
     this.#piPath = deps.piPath;
     this.#childExtensionPath = deps.childExtensionPath;
     this.#now = cfg.now;
+    this.#git = deps.git ?? execFileGit;
+    this.#repoRoot = deps.repoRoot;
     this.#spec = this.#machine.readSpec();
     this.#launchLimit = maxConcurrentStarts(this.#spec.cpus);
     // 座位上限：启动那一刻的可用 − 预留，÷ 每座份额
@@ -181,6 +201,8 @@ export class TaskEngine {
           isEnding: () => this.#ending,
           depth: () => Number(process.env.PI_DISPATCH_DEPTH ?? 0),
           maxDepth: this.#maxDepth,
+          // 没注入就当不是 git 仓 ⇒ 不许开隔离（缺省配置不许做没把握的事）
+          isGitRepo: deps.isGitRepo ?? (() => false),
         })),
     ];
     this.#ready = this.#storage ? this.#restore() : Promise.resolve();
@@ -263,6 +285,19 @@ export class TaskEngine {
       why: whyEnabled ? rawInput.why : undefined,
       allowScripts: rawInput.allowScripts ?? this.#allowScriptsDefault(),
     };
+    // 闸后、铸 id 前：钉死 base（受理时的 HEAD）——排队期间父仓 HEAD 前进也不漂移。
+    // 钉不住就退回：闸在铸 id 前，不留记录不占座位。
+    let probe: { headCommit: string } | undefined;
+    if (input.isolation === "worktree") {
+      if (!this.#storage) {
+        return rejection("isolation=worktree 需要留痕目录（storage 未配置）");
+      }
+      const head = await this.#pinBase();
+      if (!head.ok) {
+        return rejection(`isolation=worktree：钉不住 base commit —— ${head.error}`);
+      }
+      probe = { headCommit: head.headCommit };
+    }
     const taskId = randomUUID();
     const record: TaskRecord = {
       id: taskId,
@@ -271,6 +306,17 @@ export class TaskEngine {
       whySuppressed,
       ownerPid: this.#owner.pid,
       ownerStartMs: this.#owner.startMs,
+      // 隔离的键只在开启时出现（默认关时 Object.keys 不变）
+      ...(probe
+        ? {
+            isolation: "worktree" as const,
+            worktree: {
+              path: this.#worktreePath(taskId),
+              branch: branchNameFor(taskId),
+              baseCommit: probe.headCommit,
+            },
+          }
+        : {}),
     };
     await this.#registry.submit({ kind: "spawn", record });
     this.#inputs.set(taskId, input);
@@ -342,12 +388,95 @@ export class TaskEngine {
         this.#releaseLaunchSlot();
         return this.#notStartedResult(taskId, input, "等启动名额时被叫停", "canceled");
       }
-      child = this.#spawn(this.#buildArgv(input), this.#childEnv(taskId));
+      // 启动名额内建 worktree：建不出来 ⇒ 失败。
+      // 绝不降级共享 cwd、绝不 spawn（孩子在共享目录里干活比失败更糟）。
+      const prepared = await this.#prepareWorktree(taskId, input);
+      if (!prepared.ok) {
+        const r = await this.#registry
+          .submit({
+            kind: "resolve-exit",
+            id: taskId,
+            exitCode: -1,
+            notStarted: true,
+            detail: `worktree 创建失败：${prepared.error}`,
+          })
+          .catch(() => undefined);
+        if (r) this.#notifyTerminal(r.record);
+        return this.#notStartedResult(
+          taskId,
+          input,
+          `worktree 创建失败：${prepared.error}`,
+          "failed",
+        );
+      }
+      child = this.#spawnChild(input, taskId, prepared.worktree);
       this.#children.set(taskId, child);
     } finally {
       this.#releaseLaunchSlot(); // 起了（或抛错）就交还名额，别占整个运行期
     }
     return this.#pump(taskId, input, child);
+  }
+
+  /** 受理时钉 base：读仓库当前的 HEAD。读不到就返回失败（引擎据此退回，不留痕）。 */
+  async #pinBase(): Promise<{ ok: true; headCommit: string } | { ok: false; error: string }> {
+    if (!this.#repoRoot) return { ok: false, error: "不知道 git 仓库根（repoRoot 未注入）" };
+    try {
+      const headCommit = await resolveHead(this.#git, this.#repoRoot);
+      return { ok: true, headCommit };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  /**
+   * 启动名额内建 worktree。
+   * 失败 ⇒ 返回错误（绝不降级共享 cwd、绝不 spawn）。
+   * 非隔离任务 ⇒ 直接放行（没有 worktree 要建）。
+   */
+  async #prepareWorktree(
+    taskId: string,
+    input: DispatchInput,
+  ): Promise<
+    | { ok: true; worktree?: { path: string; branch: string; baseCommit: string } }
+    | { ok: false; error: string }
+  > {
+    if (input.isolation !== "worktree") return { ok: true };
+    const base = this.#registry.get(taskId)?.worktree;
+    if (!base) return { ok: false, error: "记录里没有 worktree 基线" };
+    const created = await createWorktree(this.#git, {
+      repoRoot: this.#repoRoot ?? "",
+      path: base.path,
+      branch: base.branch,
+      baseCommit: base.baseCommit,
+    });
+    if (!created.ok) {
+      return { ok: false, error: created.error ?? "worktree 创建失败" };
+    }
+    return {
+      ok: true,
+      worktree: { path: base.path, branch: base.branch, baseCommit: base.baseCommit },
+    };
+  }
+
+  /** 受管 worktree 的落点（隔离任务的 cwd）。 */
+  #worktreePath(taskId: string): string {
+    return this.#storage!.worktreePath(taskId);
+  }
+
+  /**
+   * 起孩子：隔离时把 cwd 指到 worktree；默认关不传第三参（连键都不出现）。
+   */
+  #spawnChild(
+    input: DispatchInput,
+    taskId: string,
+    worktree: { path: string } | undefined,
+  ): ChildHandle {
+    const argv = this.#buildArgv(input);
+    const env = this.#childEnv(taskId);
+    if (!worktree) {
+      return this.#spawn(argv, env);
+    }
+    return this.#spawn(argv, env, { cwd: worktree.path });
   }
 
   #buildArgv(input: DispatchInput): string[] {
@@ -359,6 +488,7 @@ export class TaskEngine {
       readOnly: input.readOnly,
       projectContext: input.projectContext,
       allowScripts: input.allowScripts,
+      isolation: input.isolation,
       sessionModel: this.#sessionModel?.(),
       piVersion: this.#piVersion,
       piPath: this.#piPath,
@@ -445,6 +575,29 @@ export class TaskEngine {
     }
     const unverified = deliveryUnverified(report, parsed.delivery);
     const verifyFailed = verifyUnverified(report, parsed.delivery);
+    // 观测 worktree：孩子跑完了，留下什么看磁盘。
+    // 观测失败只记 captureError，不回改终态（终态是既成事实）。
+    const base = this.#registry.get(taskId)?.worktree;
+    if (base) {
+      const probe = await observeWorktree(this.#git, {
+        path: base.path,
+        branch: base.branch,
+        baseCommit: base.baseCommit,
+      });
+      const receipt: WorktreeInfo = {
+        path: probe.path,
+        branch: probe.branch,
+        baseCommit: probe.baseCommit,
+        headCommit: probe.headCommit,
+        // 观测不到 ≠ 干净：观测不到就留空，绝不兜 0
+        dirty: probe.dirty,
+        onExpectedBranch: probe.onExpectedBranch,
+        commitsAhead: probe.commitsAhead,
+        missing: probe.missing,
+        captureError: probe.captureError,
+      };
+      await this.#registry.submit({ kind: "attach-worktree", id: taskId, worktree: receipt });
+    }
     await this.#registry.submit({
       kind: "attach-report",
       id: taskId,
@@ -515,6 +668,9 @@ export class TaskEngine {
       verifyUnverified: record.verifyUnverified,
       assessmentVacuous: record.assessmentVacuous,
       outputTruncated: record.outputTruncated ?? false,
+      // 隔离的键只在开启时出现（默认关时 Object.keys 不变）
+      ...(record.isolation ? { isolation: record.isolation } : {}),
+      ...(record.worktree ? { worktree: record.worktree } : {}),
     };
   }
 
@@ -524,6 +680,7 @@ export class TaskEngine {
     errorMessage: string,
     status: "canceled" | "failed",
   ): DispatchResult {
+    const record = this.#registry.get(taskId);
     return {
       status,
       taskId,
@@ -537,6 +694,9 @@ export class TaskEngine {
       whySuppressed: input.why ? !this.#whyEnabled() : undefined,
       reportChannel: "none",
       outputTruncated: false,
+      // 隔离的键只在开启时出现（默认关时 Object.keys 不变）
+      ...(input.isolation ? { isolation: input.isolation } : {}),
+      ...(record?.worktree ? { worktree: record.worktree } : {}),
     };
   }
 
@@ -623,6 +783,25 @@ export class TaskEngine {
     // 启动即剪历史债务（boot 模式 = 直接删除）+ 归档 TTL 清理
     this.#evictAndPurge("boot");
     storage.purgeExpiredArchive(this.#archiveTtlDays);
+    // 清扫受管 worktree：有账本（热记录或归档）⇒ 保护；无账本且过期 ⇒ 非强制地清
+    await this.#sweepWorktrees();
+  }
+
+  /**
+   * 清扫受管 worktree。
+   * 规则：有账本 ⇒ 保护（不看 mtime）；无账本且 mtime 过了 TTL ⇒ 非强制地清
+   * （worktree remove → branch -d；脏的、未合并的 git 自己会拒 ⇒ 留下）。
+   */
+  async #sweepWorktrees(): Promise<void> {
+    const storage = this.#storage;
+    if (!storage || !this.#repoRoot) return;
+    await sweepWorktrees({
+      git: this.#git,
+      repoRoot: this.#repoRoot,
+      worktreesDir: storage.worktreesDir,
+      ttlMs: this.#archiveTtlDays * 86_400_000,
+      hasLedger: (id) => this.#registry.get(id) !== undefined || storage.hasArchivedRecord(id),
+    }).catch(() => undefined);
   }
 
   #evictAndPurge(mode: "runtime" | "boot"): void {

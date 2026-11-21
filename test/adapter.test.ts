@@ -12,14 +12,17 @@
 //   注册之前已赋值 ⇒ 这条分支到不了 ⇒ 等价。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import entry, {
   anchoredRead,
   deliver,
   excerptDeliverable,
+  isGitRepoAt,
   lineHash,
+  resolveRepoRoot,
   textResult,
   toHostMode,
 } from "../src/index.ts";
@@ -498,4 +501,47 @@ test("适配层：dispatch_read 把原始 JSONL 散文化并带行锚", async ()
     if (oldHome === undefined) delete process.env.HOME;
     else process.env.HOME = oldHome;
   }
+});
+
+// ── git 根探测（隔离能力的前置） ──────────────────────────────────────────
+
+/** 真的 git 仓（git init 出来的）——rev-parse 只认真仓。 */
+function makeGitRepo(withCommit: boolean): string {
+  const dir = mkdtempSync(join(tmpdir(), "dispatch-adapter-git-"));
+  const env = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" };
+  const git = (args: string[]): string =>
+    execFileSync("git", args, { cwd: dir, env, encoding: "utf8" });
+  try {
+    git(["init", "-b", "main"]);
+  } catch {
+    git(["init"]);
+    git(["checkout", "-b", "main"]);
+  }
+  git(["config", "user.email", "verify@example.invalid"]);
+  git(["config", "user.name", "verify"]);
+  git(["config", "commit.gpgsign", "false"]);
+  git(["config", "core.hooksPath", join(dir, ".no-hooks")]);
+  if (withCommit) git(["commit", "--allow-empty", "-m", "base"]);
+  return dir;
+}
+
+test("适配层：非 git 目录 ⇒ 没有 git 根，隔离能力关着", () => {
+  const plain = mkdtempSync(join(tmpdir(), "dispatch-adapter-plain-"));
+  assert.equal(resolveRepoRoot(plain), undefined);
+  assert.equal(isGitRepoAt(undefined), false, "没有 git 根 ⇒ 不是 git 仓");
+});
+
+test("适配层：真 git 仓 ⇒ git 根就是仓根，isGitRepoAt 为真", () => {
+  const repo = makeGitRepo(true);
+  const root = resolveRepoRoot(repo);
+  assert.ok(root !== undefined, "真 git 仓问得出根");
+  assert.equal(realpathSync(root), realpathSync(repo));
+  assert.equal(isGitRepoAt(root), true);
+});
+
+test("适配层：空仓（还没提交）⇒ HEAD 不存在，不算可用 git 仓", () => {
+  const empty = makeGitRepo(false);
+  const root = resolveRepoRoot(empty);
+  assert.ok(root !== undefined, "空仓也问得出根");
+  assert.equal(isGitRepoAt(root), false, "钉不住 base ⇒ 隔离能力关着");
 });

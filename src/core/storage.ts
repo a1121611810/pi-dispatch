@@ -49,24 +49,45 @@ export interface StoragePaths {
   recordsDir: string;
   tasksDir: string;
   archiveDir: string;
+  /** 受管 worktree 的根目录。默认不建（隔离没开就不该有这个目录）。 */
+  worktreesDir: string;
 }
 
 export class Storage {
   readonly #bucket: string;
+  readonly #projectRoot: string;
   #paths: StoragePaths;
 
   constructor(rootDir: string, projectRoot: string) {
     this.#bucket = encodeBucket(projectRoot);
+    this.#projectRoot = projectRoot;
     const base = join(rootDir, this.#bucket);
     this.#paths = {
       recordsDir: join(base, "records"),
       tasksDir: join(base, "tasks"),
       archiveDir: join(base, "archive"),
+      worktreesDir: join(base, "worktrees"),
     };
   }
 
   get bucket(): string {
     return this.#bucket;
+  }
+
+  /** 项目根（当初找 .git 或 .pi 找出来的那个）。 */
+  get projectRoot(): string {
+    return this.#projectRoot;
+  }
+
+  /** 受管 worktree 的根目录。 */
+  get worktreesDir(): string {
+    return this.#paths.worktreesDir;
+  }
+
+  /** 受管 worktree 的落点：<桶>/worktrees/<taskId>。目录默认不建（用时由 git 建）。 */
+  worktreePath(taskId: string): string {
+    if (!isSafeTaskId(taskId)) throw new Error(`invalid task id: ${taskId}`);
+    return join(this.#paths.worktreesDir, taskId);
   }
 
   #ensureDirs(): void {
@@ -188,6 +209,23 @@ export class Storage {
     } catch {
       return undefined;
     }
+  }
+
+  /** 归档里有这个编号吗（清扫时当「有账本」——归档也是账）。 */
+  hasArchivedRecord(taskId: string): boolean {
+    if (!isSafeTaskId(taskId)) return false;
+    return existsSync(join(this.#paths.archiveDir, `${taskId}.json.gz`));
+  }
+
+  /** 归档里的所有编号（.output.gz 不算——它跟着 .json.gz 走）。 */
+  listArchivedIds(): string[] {
+    if (!existsSync(this.#paths.archiveDir)) return [];
+    const ids: string[] = [];
+    for (const file of readdirSync(this.#paths.archiveDir)) {
+      if (!file.endsWith(".json.gz")) continue;
+      ids.push(file.slice(0, -".json.gz".length));
+    }
+    return ids;
   }
 
   /** 归档 TTL 清理：归档文件写成就不改写，mtime 即归档时刻。
