@@ -30,6 +30,11 @@ export const BLACKBOARD_WRITE = "blackboard_write";
 export const TRUST = "unverified" as const;
 /** 单条笔记的上限（字节）。 */
 export const NOTE_MAX_BYTES = 8 * 1024;
+/**
+ * 单次读的字节预算（正文累计）：一次读最多把这些字节装进父方上下文。
+ * 写侧限 8KiB/条，但兄弟可以用 bash 直接写巨型文件绕过写侧——读侧自己再守一道。
+ */
+export const READ_BYTE_BUDGET = 32 * 1024;
 /** 单次读的上限（条）。 */
 export const READ_MAX = 100;
 /** 单次读的缺省条数。 */
@@ -72,12 +77,21 @@ function writeJsonAtomic(final: string, value: unknown): void {
   renameSync(tmp, final);
 }
 
-/** 读一个笔记文件；坏文件（含形状不对）返回 undefined——计入 errors 跳过。 */
+/**
+ * 读一个笔记文件；坏文件（含形状不对、正文超 8KiB）返回 undefined——计入 errors 跳过。
+ * 先 stat：大到怎么也不止 8KiB 正文的（手写巨型文件）连读都不读。
+ * 阈值按 JSON 转义的最坏情况留量（控制字符转义成 \uXXXX = 6 字节）：写侧收下的 8KiB 正文
+ * 落盘可能近 48KiB——拿 32KiB 读预算当阈值，会把写侧合法写入的笔记误判成坏文件。
+ * 大小只挡「装不进任何一次读」的；单条上限按解析出的正文再判。
+ */
 function readNoteFile(path: string): BlackboardNote | undefined {
   try {
+    if (statSync(path).size > NOTE_MAX_BYTES * 6 + 1024) return undefined;
     const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<BlackboardNote>;
     if (typeof parsed.noteId !== "string" || typeof parsed.author !== "string") return undefined;
     if (typeof parsed.createdAt !== "number" || typeof parsed.text !== "string") return undefined;
+    // 写侧拒超 8KiB；读侧也拒——手写/旁路写进来的巨型 note 不进父方上下文
+    if (Buffer.byteLength(parsed.text, "utf8") > NOTE_MAX_BYTES) return undefined;
     // 多余的键（自报的 trust 之类）一律不认——只取这四个字段
     return {
       noteId: parsed.noteId,
@@ -213,6 +227,7 @@ export class BlackboardStore {
   /**
    * 读板。文件名序（=时间序）；坏文件与 .tmp 计入 errors 跳过——不毒化整次读。
    * after 是 noteId 游标（严格之后）；limit 缺省 50、>100 夹到 100、0/负数/非整数拒。
+   * 正文按文件名序累计，超 READ_BYTE_BUDGET 就截断：已读部分照给，nextAfter 接着读。
    * trust 恒为常量——文件自报的 trust 不作数。
    */
   read(o: { after?: string; limit?: number } = {}): BlackboardRead {
@@ -233,7 +248,16 @@ export class BlackboardStore {
       notes.push(note);
     }
     const start = o.after === undefined ? 0 : indexAfter(notes, o.after);
-    const window = notes.slice(start, start + limit);
+    // 条数上限与字节预算两道闸：先到哪道就在哪道截断，nextAfter 续读
+    const window: BlackboardNote[] = [];
+    let bytes = 0;
+    for (let i = start; i < notes.length && window.length < limit; i++) {
+      const note = notes[i]!;
+      const cost = Buffer.byteLength(note.text, "utf8");
+      if (bytes + cost > READ_BYTE_BUDGET) break;
+      bytes += cost;
+      window.push(note);
+    }
     const hasMore = notes.length > start + window.length;
     return {
       boardId: this.#boardId,
@@ -245,40 +269,59 @@ export class BlackboardStore {
   }
 
   /**
-   * 清扫：活跃板整板跳过（有人在用）；非活跃板按笔记 mtime 清过期，清空了的板把目录删掉。
-   * 单条失败跳过——下轮再收。
+   * 清扫：活跃板整板跳过（有人在用）；owner 读不到/坏的板也跳过（判不了活 ⇒ 可能活着，
+   * 计入 skippedUnknown）；只有 owner 可读且被证死（closedAt，或 pid 双条件判死）才动。
+   * 死板按笔记 mtime 清过期；空板（无笔记残留）才删目录。
+   * stat 失败的笔记算「没清」（left 加一笔）——全失败时目录绝不因为计数归零被删。
    */
-  purgeExpired(o: { ttlMs: number; isActive: (boardId: string) => boolean }): {
+  purgeExpired(o: {
+    ttlMs: number;
+    isActive: (boardId: string) => boolean;
+    isOwnerDead: (owner: BlackboardOwner) => boolean;
+  }): {
     notes: number;
     boards: number;
+    skippedUnknown: number;
   } {
-    const { ttlMs, isActive } = o;
+    const { ttlMs, isActive, isOwnerDead } = o;
     const now = this.#now();
     let notes = 0;
     let boards = 0;
-    if (!existsSync(this.#root)) return { notes, boards };
+    let skippedUnknown = 0;
+    if (!existsSync(this.#root)) return { notes, boards, skippedUnknown };
     for (const entry of readdirSync(this.#root, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const boardId = entry.name;
       if (isActive(boardId)) continue;
+      // 判活 fail-safe：owner 读不到/坏 ⇒ 视为「可能活跃」，整板跳过（只记一笔待查）
+      const owner = readOwnerFile(join(this.#root, boardId, "owner.json"));
+      if (!owner) {
+        skippedUnknown += 1;
+        continue;
+      }
+      // 活着但证不死（pid 活、启动时刻读不到）⇒ 也不动
+      if (!isOwnerDead(owner)) continue;
       const notesDir = join(this.#root, boardId, "notes");
-      if (!existsSync(notesDir)) continue;
       let left = 0;
-      for (const file of readdirSync(notesDir)) {
-        const path = join(notesDir, file);
-        try {
-          const mtimeMs = statSync(path).mtimeMs;
-          if (now - mtimeMs > ttlMs) {
-            rmSync(path);
-            notes += 1;
+      if (existsSync(notesDir)) {
+        for (const file of readdirSync(notesDir)) {
+          const path = join(notesDir, file);
+          try {
+            const mtimeMs = statSync(path).mtimeMs;
+            if (now - mtimeMs > ttlMs) {
+              rmSync(path);
+              notes += 1;
+              continue;
+            }
+          } catch {
+            // 单条失败跳过，下轮再收；但算「没清」——不许因此把目录删掉
+            left += 1;
             continue;
           }
-        } catch {
-          // 单条失败跳过，下轮再收
-          continue;
+          left += 1;
         }
-        left += 1;
       }
+      // 空板删目录的前提：owner 可读 && 判死 && 无笔记残留（left 计数把 stat 失败也算未清）
       if (left === 0) {
         try {
           rmSync(join(this.#root, boardId), { recursive: true, force: true });
@@ -288,6 +331,6 @@ export class BlackboardStore {
         }
       }
     }
-    return { notes, boards };
+    return { notes, boards, skippedUnknown };
   }
 }

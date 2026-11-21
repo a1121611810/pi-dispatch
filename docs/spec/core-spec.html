@@ -2299,8 +2299,10 @@
           <tr>
             <td><b>收</b></td>
             <td>
-              观测 HEAD / 分支 / <code>status --porcelain</code> 的非空行数 / 相对 base
-              的提交数，写进 记录（<code>attach-worktree</code> 只写元数据，<b>不改状态</b>）。
+              观测 HEAD / 分支 /
+              <code>status --porcelain --untracked-files=all</code>
+              的非空行数（数<b>文件</b>，未跟踪目录不折叠成一行）/ 相对 base 的提交数，写进
+              记录（<code>attach-worktree</code> 只写元数据，<b>不改状态</b>）。
             </td>
             <td>
               <b>观测永不抛</b>：失败只记 <code>captureError</code>，不回改终态。<b
@@ -2318,6 +2320,7 @@
             <td>
               有账本（热记录或归档）⇒ 保护，不看 mtime；无账本且过了 TTL ⇒ 非强制
               <code>worktree remove</code> → 非强制 <code>branch -d</code>。
+              分支认不出（孩子换过分支 / detached）⇒ <b>目录照样回收</b>，只跳过删分支。
             </td>
             <td>
               <b>宁可留垃圾，不可删证据</b>：脏的、未合并的 git 自己会拒 ⇒ 留下。严禁全局
@@ -2385,7 +2388,9 @@
             <td><code>noteId / author / createdAt / text</code>；单条 ≤8KiB，空白拒。</td>
             <td>
               先写 <code>.tmp</code> 再 rename——崩了最多留一个没用的 .tmp，不留半个 JSON；读只认
-              .json，坏文件计入 <code>errors</code> 跳过。
+              .json，坏文件计入 <code>errors</code> 跳过。读侧也守写侧的线：单条正文超 8KiB （兄弟用
+              bash 绕过写工具）计入 <code>errors</code>；一次读正文累计 ≤32KiB， 超了截断并给
+              <code>nextAfter</code> 续读。
             </td>
           </tr>
           <tr>
@@ -2407,8 +2412,11 @@
           <tr>
             <td><b>TTL</b></td>
             <td>
-              活跃板（有非终态记录引用，或 owner 双条件判活且未关板）整板跳过；死板按笔记 mtime 过
-              TTL 清，清空后删板目录。
+              活跃板（有非终态记录引用，或 owner 双条件判活且未关板）整板跳过；<b
+                >owner 读不到/坏 ⇒ 也跳过</b
+              >（判不了活 ⇒ 可能活着，计入 <code>skippedUnknown</code>）；只有 owner 可读且被证死
+              （有 <code>closedAt</code>，或 pid 双条件证死）才按笔记 mtime 过 TTL
+              清。空板删目录的前提： owner 可读 && 证死 && 无笔记残留；stat 失败的笔记算「未清」。
             </td>
             <td>有人正在用的板一条都不清；死板的垃圾才会被收走。</td>
           </tr>

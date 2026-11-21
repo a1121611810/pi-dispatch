@@ -50,7 +50,7 @@ export interface WorktreeInfo {
   baseCommit: string;
   /** 观测到的 HEAD（观测不到就没有） */
   headCommit?: string;
-  /** git status --porcelain 的非空行数 */
+  /** git status --porcelain --untracked-files=all 的非空行数（= 脏文件数） */
   dirty?: number;
   /** 是不是在预期分支上 */
   onExpectedBranch?: boolean;

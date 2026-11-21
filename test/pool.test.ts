@@ -6,6 +6,7 @@
 //   src/core/pool.ts 的三处 `?? 兜底` → `|| 兜底`（页大小 / MemAvailable / MemTotal）。
 //   正则 `(\d+)` 的捕获组要么 undefined、要么至少一位数字的非空串 ——
 //   空串（唯一会让 ?? 与 || 分歧的输入）不可达 ⇒ 三个变异在本仓可达输入上等价。
+//   （连 "0" 也是非空串、真值：`"0" || 16384` 仍得 "0"，Number 后仍得 0。）
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {

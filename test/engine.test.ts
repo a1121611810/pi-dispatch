@@ -19,6 +19,8 @@
 //     "" 两向都取 0（Number("")）⇒ 可达输入上等价。
 //     构造器里 `process.env.PI_DISPATCH_DEPTH ?? 0` → `||` 同理。
 //     构造器里 `deps.isGitRepo ?? (() => false)` → `||`——函数恒真，两向给同一个谓词 ⇒ 等价。
+//     构造器里 `processStartMs(process.pid) ?? this.#now()` → `||`——分歧只在启动时刻为 0
+//     （1970 年）时，活着的进程不可能；可达输入上等价。
 //     （默认谓词 `() => false` → `true` 不等价，已由「没注入 isGitRepo ⇒ 默认不许开隔离」杀掉。）
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -38,6 +40,8 @@ import {
   boardIsActive,
   childEnvFor,
   openBoardState,
+  ownerIsActive,
+  ownerProvenDead,
   pinBaseCommit,
 } from "../src/core/engine.ts";
 import { BlackboardStore } from "../src/core/blackboard.ts";
@@ -2130,6 +2134,27 @@ test("引擎：没有黑板时父方视图报错", async () => {
   assert.match(other.error ?? "", /本会话没有该黑板/, "别家会话的板不认");
 });
 
+test("引擎：父方视图——缺省/显式给当前板号都照读，别家板号仍报错", async () => {
+  const { storage } = isolationStorage();
+  const { engine } = freshEngine({
+    storage,
+    spawn: recordingSpawn([]) as never,
+    hostMode: "one-shot",
+  });
+  await engine.dispatch({ task: "干活", blackboard: true });
+  const boardId = readdirSync(storage.blackboardsDir)[0]!;
+  const implicit = engine.blackboardView() as { error?: string; boardId?: string };
+  assert.equal(implicit.error, undefined, "不给板号 ⇒ 缺省读当前板");
+  assert.equal(implicit.boardId, boardId);
+  const mine = engine.blackboardView({ boardId }) as { error?: string; boardId?: string };
+  assert.equal(mine.error, undefined, "显式给当前板号 ⇒ 照读，不该报错");
+  assert.equal(mine.boardId, boardId);
+  const other = engine.blackboardView({
+    boardId: "11111111-2222-4333-8444-555555555555",
+  }) as { error?: string };
+  assert.match(other.error ?? "", /本会话没有该黑板/, "别家板号仍报错");
+});
+
 test("引擎：shutdown 给板补 closedAt", async () => {
   const { storage } = isolationStorage();
   const { engine } = freshEngine({
@@ -2249,6 +2274,59 @@ test("引擎：boardIsActive——owner 双条件判活、关板/无 owner 判�
   assert.equal(boardIsActive([record], store, boardId), true, "非终态引用 ⇒ 活板");
   const otherBoard = { ...record, blackboard: { boardId: "other", path: "/y" } };
   assert.equal(boardIsActive([otherBoard], store, boardId), false, "别的板不算");
+});
+
+test("引擎：boardIsActive——终态引用不算活板（owner 死了就是死板）", () => {
+  const { storage } = isolationStorage();
+  const boardId = "cccccccc-2222-4333-8444-555555555555";
+  const store = new BlackboardStore({ root: storage.blackboardsDir, boardId });
+  store.ensureOwner({ pid: 424242, startMs: 7 });
+  const dead = { alive: () => false, startMs: () => 7 };
+  const terminal = {
+    id: "done",
+    status: "succeeded" as const,
+    task: "t",
+    blackboard: { boardId, path: "/x" },
+  };
+  assert.equal(
+    boardIsActive([terminal], store, boardId, dead),
+    false,
+    "记录全终态 + owner 已死 ⇒ 死板（终态引用不续命）",
+  );
+  const running = { ...terminal, status: "running" as const };
+  assert.equal(
+    boardIsActive([running], store, boardId, dead),
+    true,
+    "同一条记录在跑（非终态）⇒ 活板（终态才不算）",
+  );
+});
+
+test("引擎：boardIsActive——pid 活但启动时刻读不到 ⇒ 按活（fail-safe）", () => {
+  const { storage } = isolationStorage();
+  const boardId = "bbbbbbbb-2222-4333-8444-555555555555";
+  const store = new BlackboardStore({ root: storage.blackboardsDir, boardId });
+  store.ensureOwner({ pid: 424242, startMs: 7 });
+  const unknowable = { alive: () => true, startMs: () => undefined };
+  assert.equal(
+    boardIsActive([], store, boardId, unknowable),
+    true,
+    "读不到启动时刻 ⇒ 证不死 ⇒ 活板（宁留垃圾，不删证据）",
+  );
+  assert.equal(ownerIsActive(store.ownerInfo()!, unknowable), true);
+  assert.equal(ownerProvenDead(store.ownerInfo()!, unknowable), false, "证不死就不许算死");
+  // 启动时刻读得到且对不上 ⇒ 证死（光看 pid 会认错人）
+  const mismatched = { alive: () => true, startMs: () => 8 };
+  assert.equal(boardIsActive([], store, boardId, mismatched), false);
+  assert.equal(ownerProvenDead(store.ownerInfo()!, mismatched), true);
+  // pid 已死 ⇒ 证死
+  const deadPid = { alive: () => false, startMs: () => 7 };
+  assert.equal(ownerProvenDead(store.ownerInfo()!, deadPid), true);
+  assert.equal(ownerIsActive(store.ownerInfo()!, deadPid), false);
+  // 关板 ⇒ 证死（closedAt 优先于 pid / 启动时刻）
+  store.close(11);
+  const matching = { alive: () => true, startMs: () => 7 };
+  assert.equal(ownerProvenDead(store.ownerInfo()!, matching), true, "有 closedAt ⇒ 证死");
+  assert.equal(ownerIsActive(store.ownerInfo()!, matching), false, "有 closedAt ⇒ 不算活");
 });
 
 test("引擎：没注入 isGitRepo ⇒ 默认不许开隔离（缺省配置不做没把握的事）", async () => {

@@ -14,6 +14,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -24,6 +25,7 @@ import {
   BLACKBOARD_WRITE,
   BlackboardStore,
   NOTE_MAX_BYTES,
+  READ_BYTE_BUDGET,
   READ_MAX,
   TRUST,
 } from "../src/core/blackboard.ts";
@@ -194,6 +196,77 @@ test("黑板：文件自报的 trust 与多余字段不作数", () => {
   });
 });
 
+test("黑板：读侧字节预算——超预算截断，nextAfter 可续读", () => {
+  let tick = 1700000000000;
+  withBoard(
+    (store, root, boardId) => {
+      store.ensureOwner({ pid: 1, startMs: 2 });
+      // 若干条 × 8KiB 正文 = 恰好 READ_BYTE_BUDGET，再来 1 字节就越界
+      const full = Math.floor(READ_BYTE_BUDGET / NOTE_MAX_BYTES);
+      for (let i = 0; i < full; i++) store.append("c", "a".repeat(NOTE_MAX_BYTES));
+      store.append("c", "b");
+      const first = store.read({ limit: READ_MAX });
+      assert.equal(first.notes.length, full, "恰等于预算的都读（边界内侧）");
+      assert.ok(first.nextAfter !== undefined, "截断了 ⇒ 有续读游标");
+      const rest = store.read({ after: first.nextAfter, limit: READ_MAX });
+      assert.deepEqual(
+        rest.notes.map((n) => n.text),
+        ["b"],
+        "照游标续读剩下的",
+      );
+      assert.equal(rest.nextAfter, undefined, "续读完就没有游标了");
+      assert.equal(existsSync(join(root, boardId)), true);
+    },
+    { now: () => tick++ },
+  );
+});
+
+test("黑板：手写的 9KiB 笔记绕过写侧 ⇒ 读侧跳过并计入 errors", () => {
+  withBoard((store, root, boardId) => {
+    store.ensureOwner({ pid: 1, startMs: 2 });
+    store.append("c", "好的那条");
+    const notesDir = join(root, boardId, "notes");
+    writeFileSync(
+      join(notesDir, "0000000000002-big.json"),
+      JSON.stringify({
+        noteId: "big",
+        author: "c",
+        createdAt: 2,
+        text: "a".repeat(NOTE_MAX_BYTES + 1024),
+      }),
+      "utf8",
+    );
+    const read = store.read();
+    assert.equal(read.errors, 1, "超单条上限 ⇒ 记一笔错");
+    assert.equal(read.notes.length, 1, "其余照读");
+    assert.equal(read.notes[0]!.text, "好的那条");
+  });
+});
+
+test("黑板：写侧收的控制字符正文（JSON 转义 6 倍）⇒ 读侧照样读得到", () => {
+  withBoard((store) => {
+    store.ensureOwner({ pid: 1, startMs: 2 });
+    // ESC 是控制字符：JSON.stringify 转义成 \u001b（6 字节），8KiB 正文落盘近 48KiB
+    const text = "\u001b".repeat(NOTE_MAX_BYTES);
+    store.append("c", text);
+    const read = store.read();
+    assert.equal(read.errors, 0, "写侧收的正文不该被读侧当坏文件");
+    assert.equal(read.notes.length, 1);
+    assert.equal(read.notes[0]!.text, text, "正文一字不差");
+  });
+});
+
+test("黑板：预算内的多条照常读（不误伤）", () => {
+  withBoard((store) => {
+    store.ensureOwner({ pid: 1, startMs: 2 });
+    store.append("c", "一");
+    store.append("c", "二");
+    const read = store.read();
+    assert.equal(read.notes.length, 2, "小笔记不受预算影响");
+    assert.equal(read.nextAfter, undefined);
+  });
+});
+
 test("黑板：板编号过不了 UUID 字符集就拒（防路径拼接）", () => {
   const root = mkdtempSync(join(tmpdir(), "dispatch-store-"));
   const storage = new Storage(join(root, "dispatch"), join(root, "proj"));
@@ -263,6 +336,7 @@ test("黑板：TTL 边界——正好到期留着，过了 1ms 就清", () => {
   const root = mkdtempSync(join(tmpdir(), "dispatch-board-"));
   const boardId = "22222222-2222-4333-8444-555555555555";
   const store = new BlackboardStore({ root, boardId, now: () => now });
+  store.ensureOwner({ pid: 111, startMs: 222 });
   store.append("c", "第一条");
   store.append("c", "第二条");
   const notesDir = join(root, boardId, "notes");
@@ -271,38 +345,45 @@ test("黑板：TTL 边界——正好到期留着，过了 1ms 就清", () => {
   // 第一条：正好 now - ttl（没过期）；第二条：再多过 1ms（过期）
   utimesSync(join(notesDir, files[0]!), new Date(now - ttl), new Date(now - ttl));
   utimesSync(join(notesDir, files[1]!), new Date(now - ttl - 1), new Date(now - ttl - 1));
-  const result = store.purgeExpired({ ttlMs: ttl, isActive: () => false });
+  const result = store.purgeExpired({ ttlMs: ttl, isActive: () => false, isOwnerDead: () => true });
   assert.equal(result.notes, 1, "过了 1ms 的那条被清");
   assert.equal(readdirSync(notesDir).length, 1, "正好到期的留着");
   assert.equal(result.boards, 0, "还有笔记 ⇒ 板目录不删");
+  assert.equal(result.skippedUnknown, 0);
 });
 
 test("黑板：活跃板一条笔记都不清", () => {
   const root = mkdtempSync(join(tmpdir(), "dispatch-board-"));
   const boardId = "33333333-2222-4333-8444-555555555555";
   const store = new BlackboardStore({ root, boardId });
+  store.ensureOwner({ pid: 111, startMs: 222 });
   store.append("c", "第一条");
   store.append("c", "第二条");
   // 两条都老到过期了（不设 mtime 的话它们本该被清）
   const notesDir = join(root, boardId, "notes");
   const past = new Date(Date.now() - 3600_000);
   for (const file of readdirSync(notesDir)) utimesSync(join(notesDir, file), past, past);
-  const result = store.purgeExpired({ ttlMs: 0, isActive: (id) => id === boardId });
+  const result = store.purgeExpired({
+    ttlMs: 0,
+    isActive: (id) => id === boardId,
+    isOwnerDead: () => true,
+  });
   assert.equal(result.notes, 0);
   assert.equal(result.boards, 0);
   assert.equal(readdirSync(notesDir).length, 2, "活跃板一条都不清");
 });
 
-test("黑板：清空了的板把目录删掉", () => {
+test("黑板：清空了的板把目录删掉（owner 可读且证死）", () => {
   const root = mkdtempSync(join(tmpdir(), "dispatch-board-"));
   const boardId = "44444444-2222-4333-8444-555555555555";
   const store = new BlackboardStore({ root, boardId });
+  store.ensureOwner({ pid: 111, startMs: 222 });
   store.append("c", "唯一一条");
   const notesDir = join(root, boardId, "notes");
   const file = join(notesDir, readdirSync(notesDir)[0]!);
   const past = new Date(Date.now() - 3600_000);
   utimesSync(file, past, past);
-  const result = store.purgeExpired({ ttlMs: 0, isActive: () => false });
+  const result = store.purgeExpired({ ttlMs: 0, isActive: () => false, isOwnerDead: () => true });
   assert.equal(result.notes, 1);
   assert.equal(result.boards, 1, "清空了的板把目录删掉");
   assert.equal(existsSync(join(root, boardId)), false);
@@ -311,9 +392,77 @@ test("黑板：清空了的板把目录删掉", () => {
 test("黑板：没有黑板根目录 ⇒ 清扫零动作", () => {
   const root = join(mkdtempSync(join(tmpdir(), "dispatch-board-")), "never-created");
   const store = new BlackboardStore({ root, boardId: BOARD_ID });
-  const result = store.purgeExpired({ ttlMs: 0, isActive: () => false });
+  const result = store.purgeExpired({
+    ttlMs: 0,
+    isActive: () => false,
+    isOwnerDead: () => true,
+  });
   assert.equal(result.notes, 0);
   assert.equal(result.boards, 0);
+  assert.equal(result.skippedUnknown, 0);
+});
+
+test("黑板：owner.json 坏了 ⇒ 整板跳过（skippedUnknown），笔记与目录不动", () => {
+  const root = mkdtempSync(join(tmpdir(), "dispatch-board-"));
+  const boardId = "55555555-2222-4333-8444-555555555555";
+  const store = new BlackboardStore({ root, boardId });
+  store.ensureOwner({ pid: 111, startMs: 222 });
+  store.append("c", "证据");
+  const notesDir = join(root, boardId, "notes");
+  const file = join(notesDir, readdirSync(notesDir)[0]!);
+  const past = new Date(Date.now() - 3600_000);
+  utimesSync(file, past, past);
+  writeFileSync(join(root, boardId, "owner.json"), "{ 坏掉的 json", "utf8");
+  const result = store.purgeExpired({ ttlMs: 0, isActive: () => false, isOwnerDead: () => true });
+  assert.equal(result.notes, 0, "判不了活 ⇒ 一条笔记都不清");
+  assert.equal(result.boards, 0, "目录也不删");
+  assert.equal(result.skippedUnknown, 1, "记一笔「判不了活」");
+  assert.equal(existsSync(join(root, boardId, "owner.json")), true, "owner 文件不动");
+  assert.equal(readdirSync(notesDir).length, 1, "笔记不动");
+});
+
+test("黑板：空板 + 坏 owner ⇒ 目录保留", () => {
+  const root = mkdtempSync(join(tmpdir(), "dispatch-board-"));
+  const boardId = "66666666-2222-4333-8444-555555555555";
+  const dir = join(root, boardId);
+  mkdirSync(join(dir, "notes"), { recursive: true });
+  writeFileSync(join(dir, "owner.json"), "不是 json", "utf8");
+  const store = new BlackboardStore({ root, boardId });
+  const result = store.purgeExpired({ ttlMs: 0, isActive: () => false, isOwnerDead: () => true });
+  assert.equal(result.boards, 0);
+  assert.equal(result.skippedUnknown, 1);
+  assert.equal(existsSync(dir), true, "owner 判不了活 ⇒ 空板目录也不删");
+});
+
+test("黑板：owner 可读但证不死 ⇒ 不清", () => {
+  const root = mkdtempSync(join(tmpdir(), "dispatch-board-"));
+  const boardId = "77777777-2222-4333-8444-555555555555";
+  const store = new BlackboardStore({ root, boardId });
+  store.ensureOwner({ pid: 111, startMs: 222 });
+  store.append("c", "老笔记");
+  const notesDir = join(root, boardId, "notes");
+  const file = join(notesDir, readdirSync(notesDir)[0]!);
+  const past = new Date(Date.now() - 3600_000);
+  utimesSync(file, past, past);
+  const result = store.purgeExpired({ ttlMs: 0, isActive: () => false, isOwnerDead: () => false });
+  assert.equal(result.notes, 0, "证不死就不清");
+  assert.equal(result.boards, 0);
+  assert.equal(readdirSync(notesDir).length, 1);
+});
+
+test("黑板：stat 失败的笔记算未清 ⇒ 目录保留", () => {
+  const root = mkdtempSync(join(tmpdir(), "dispatch-board-"));
+  const boardId = "88888888-2222-4333-8444-555555555555";
+  const store = new BlackboardStore({ root, boardId });
+  store.ensureOwner({ pid: 111, startMs: 222 });
+  const notesDir = join(root, boardId, "notes");
+  mkdirSync(notesDir, { recursive: true });
+  // 悬空软链：readdir 看得到，stat 必失败（确定性）
+  symlinkSync(join(root, "没有这个目标"), join(notesDir, "0000000000001-link.json"));
+  const result = store.purgeExpired({ ttlMs: 0, isActive: () => false, isOwnerDead: () => true });
+  assert.equal(result.notes, 0, "stat 失败的不清");
+  assert.equal(result.boards, 0, "有未清的残留 ⇒ 目录不删");
+  assert.equal(existsSync(join(root, boardId)), true);
 });
 
 // ── 工具名 ────────────────────────────────────────────────────────────────

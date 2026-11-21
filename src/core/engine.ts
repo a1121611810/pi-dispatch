@@ -13,7 +13,7 @@ import {
   type SpawnChild,
 } from "./child.ts";
 import { defaultGates, type Gate, rejection } from "./gates.ts";
-import { BlackboardStore, type BlackboardRead } from "./blackboard.ts";
+import { BlackboardStore, type BlackboardOwner, type BlackboardRead } from "./blackboard.ts";
 import {
   canOpenAnother,
   maxConcurrentStarts,
@@ -238,6 +238,40 @@ export async function captureWorktreeFor(
   };
 }
 
+/** 判活要问系统的两件事（测试注入假实现；生产用缺省）。 */
+export interface OwnerProbes {
+  alive: (pid: number) => boolean;
+  startMs: (pid: number) => number | undefined;
+}
+
+const DEFAULT_OWNER_PROBES: OwnerProbes = { alive: isPidAlive, startMs: processStartMs };
+
+/**
+ * owner 还活着吗？
+ * 判活 fail-safe：pid 活着但启动时刻读不到（权限/ps 失败）⇒ 证不死 ⇒ 按活处理（宁留垃圾，不删证据）。
+ */
+export function ownerIsActive(
+  owner: BlackboardOwner,
+  probes: OwnerProbes = DEFAULT_OWNER_PROBES,
+): boolean {
+  if (owner.closedAt !== undefined) return false;
+  if (!probes.alive(owner.pid)) return false;
+  const start = probes.startMs(owner.pid);
+  if (start === undefined) return true;
+  return start === owner.startMs;
+}
+
+/** owner 被证死了吗？板已关，或 pid 已死，或启动时刻读得到且对不上。读不到启动时刻 ⇒ 证不死。 */
+export function ownerProvenDead(
+  owner: BlackboardOwner,
+  probes: OwnerProbes = DEFAULT_OWNER_PROBES,
+): boolean {
+  if (owner.closedAt !== undefined) return true;
+  if (!probes.alive(owner.pid)) return true;
+  const start = probes.startMs(owner.pid);
+  return start !== undefined && start !== owner.startMs;
+}
+
 /**
  * 这块板还活着吗？
  * 两条判据：① 有非终态的记录还引用它（有人在跑）；② 它的 owner 还活着（pid + 启动时刻两个都对）且板没关。
@@ -246,15 +280,15 @@ export function boardIsActive(
   records: readonly TaskRecord[],
   store: BlackboardStore,
   boardId: string,
+  probes: OwnerProbes = DEFAULT_OWNER_PROBES,
 ): boolean {
   for (const record of records) {
     if (record.blackboard?.boardId !== boardId) continue;
     if (!isTerminal(record.status)) return true;
   }
   const owner = store.ownerInfo(boardId);
-  if (!owner || owner.closedAt !== undefined) return false;
-  // owner 双条件判活：进程号 + 启动时刻两个都对（光看进程号会认错人）
-  return owner.startMs === processStartMs(owner.pid) && isPidAlive(owner.pid);
+  if (!owner) return false;
+  return ownerIsActive(owner, probes);
 }
 
 export class TaskEngine {
@@ -956,6 +990,8 @@ export class TaskEngine {
       store.purgeExpired({
         ttlMs: this.#archiveTtlDays * 86_400_000,
         isActive: (boardId) => this.#boardActive(store, boardId),
+        // 判死才清：读不到启动时刻 / pid 还活着但证不死 ⇒ 不动（purge 自己还会再查 owner 可读）
+        isOwnerDead: (owner) => ownerProvenDead(owner),
       });
     } catch {
       // 清扫失败不拖垮启动——下轮再收

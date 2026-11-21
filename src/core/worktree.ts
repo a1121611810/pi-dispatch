@@ -119,6 +119,7 @@ export function countDirtyLines(porcelain: string): number {
  * 观测一个 worktree：孩子跑完后留下了什么。
  * 永不抛——观测失败只记 captureError（终态是既成事实，不能被观测改掉）。
  * 观测不到的字段留 undefined：不填 0、不填 false（填了就成了「干净」的谎报）。
+ * `--untracked-files=all`：未跟踪目录按文件逐个报，不然 3 个文件折叠成 1 行 = 谎报 1。
  */
 export async function observeWorktree(
   git: GitRunner,
@@ -129,7 +130,7 @@ export async function observeWorktree(
     if (!existsSync(o.path)) return { ...fallback, missing: true };
     const head = await git(["rev-parse", "--verify", "HEAD"], o.path);
     const branchName = await git(["rev-parse", "--abbrev-ref", "HEAD"], o.path);
-    const status = await git(["status", "--porcelain"], o.path);
+    const status = await git(["status", "--porcelain", "--untracked-files=all"], o.path);
     const ahead = await git(["rev-list", "--count", `${o.baseCommit}..HEAD`], o.path);
     return {
       ...fallback,
@@ -213,19 +214,21 @@ function mtimeOf(path: string): number | undefined {
 
 /**
  * 清一个工作区：非强制 remove → 非强制删分支。
+ * branch 未知（孩子换过分支 / detached）⇒ 目录照样回收，只跳过删分支。
  * 也供引擎回收「建好但没来得及 spawn」的盘用——非强制，脏了就留给清扫。
  */
 export async function removeWorktree(
   git: GitRunner,
   repoRoot: string,
   path: string,
-  branch: string,
+  branch?: string,
 ): Promise<{ removed: number; pruned: number }> {
   // 目录本来在不在：我们只把自己删掉的算进 removed（手工删过的不算）
   const existed = existsSync(path);
   // 非强制 remove：脏的工作区 git 自己会拒（退出 128）⇒ 留下，不强删
   const result = await git(["worktree", "remove", path], repoRoot);
   if (result.code !== 0) return { removed: 0, pruned: 0 };
+  if (branch === undefined) return { removed: existed ? 1 : 0, pruned: 0 };
   // 非强制删分支：未合并的 git 会拒（退出 1）⇒ 分支留下（证据不丢）
   const branchResult = await git(["branch", "-d", branch], repoRoot);
   return { removed: existed ? 1 : 0, pruned: branchResult.code === 0 ? 1 : 0 };
@@ -257,6 +260,7 @@ export interface SweepResult {
  * 清扫受管工作区：
  *   有账本（热记录或归档）⇒ 保护，不看 mtime；
  *   无账本且 mtime 过了 TTL ⇒ 非强制地清（worktree remove → branch -d）；
+ *   分支认不出（孩子换过分支 / detached）⇒ 目录照样回收，只跳过删分支；
  *   单条失败跳过，下轮再收；只碰受管根下的，用户自己的 worktree 不动。
  * 严禁 git worktree prune（全局清理）——那会动到用户自己的 worktree。
  */
@@ -278,8 +282,8 @@ export async function sweepWorktrees(options: SweepOptions): Promise<SweepResult
     const taskId = basename(entry.path);
     // 有账本（热记录或归档）⇒ 保护，不看 mtime
     if (hasLedger(taskId)) continue;
+    // 分支认不出 ⇒ undefined：目录照收，只是不碰分支（别让换过分支的目录永远留成孤儿）
     const branch = managedBranch(entry.branch);
-    if (branch === undefined) continue;
     const mtime = mtimeOf(entry.path);
     // 没到期 ⇒ 留（目录不在了 ⇒ 没有 mtime 可判 ⇒ 当过期：只剩元数据要清，没有工作数据会丢）
     if (mtime !== undefined && now - mtime <= ttlMs) continue;

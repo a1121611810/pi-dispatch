@@ -184,6 +184,26 @@ test("观测：有未提交改动 ⇒ dirty 1", async () => {
   });
 });
 
+test("观测：未跟踪目录里的 3 个文件 ⇒ dirty 3（不折叠成目录一行）", async () => {
+  await withGitProject(async (dir, base) => {
+    const path = join(dir, "wt", "task-1");
+    await createWorktree(execFileGit, {
+      repoRoot: dir,
+      path,
+      branch: branchNameFor("task-1"),
+      baseCommit: base,
+    });
+    mkdirSync(join(path, "newdir"));
+    for (const name of ["a", "b", "c"]) writeFileSync(join(path, "newdir", `${name}.txt`), "x\n");
+    const info = await observeWorktree(execFileGit, {
+      path,
+      branch: branchNameFor("task-1"),
+      baseCommit: base,
+    });
+    assert.equal(info.dirty, 3, "数文件不数目录：3 个未跟踪文件就是 3");
+  });
+});
+
 test("观测：孩子自己提交了 ⇒ commitsAhead 1、dirty 0", async () => {
   await withGitProject(async (dir, base) => {
     const path = join(dir, "wt", "task-1");
@@ -455,6 +475,68 @@ test("清扫：未合并分支不强删", async () => {
   });
 });
 
+test("清扫：孩子换过分支的受管目录照收（目录删、分支保留）", async () => {
+  await withGitProject(async (dir, base) => {
+    const worktreesDir = join(dir, "bucket", "worktrees");
+    const path = join(worktreesDir, "task-1");
+    await createWorktree(execFileGit, {
+      repoRoot: dir,
+      path,
+      branch: branchNameFor("task-1"),
+      baseCommit: base,
+    });
+    // 孩子自己换了分支：worktree list 里那条的 branch 不再是 pi-dispatch/* ⇒ 分支认不出
+    gitIn(path, ["checkout", "-b", "wip"]);
+    const past = new Date(Date.now() - 31 * 86_400_000);
+    utimesSync(path, past, past);
+    const result = await sweepWorktrees({
+      git: execFileGit,
+      repoRoot: dir,
+      worktreesDir,
+      ttlMs: 30 * 86_400_000,
+      hasLedger: () => false,
+    });
+    assert.equal(result.removed, 1, "分支认不出也回收目录（不然永远留成孤儿）");
+    assert.equal(existsSync(path), false);
+    assert.equal(result.pruned, 0, "分支未知 ⇒ 不碰分支");
+    assert.ok(
+      gitIn(dir, ["branch", "--list", branchNameFor("task-1")]).includes("pi-dispatch/task-1"),
+      "受管分支保留（证据不丢）",
+    );
+    assert.ok(gitIn(dir, ["branch", "--list", "wip"]).includes("wip"), "孩子换到的分支也保留");
+  });
+});
+
+test("清扫：detached 的受管目录照收（目录删、无分支可删）", async () => {
+  await withGitProject(async (dir, base) => {
+    const worktreesDir = join(dir, "bucket", "worktrees");
+    const path = join(worktreesDir, "task-1");
+    await createWorktree(execFileGit, {
+      repoRoot: dir,
+      path,
+      branch: branchNameFor("task-1"),
+      baseCommit: base,
+    });
+    gitIn(path, ["checkout", "--detach"]);
+    const past = new Date(Date.now() - 31 * 86_400_000);
+    utimesSync(path, past, past);
+    const result = await sweepWorktrees({
+      git: execFileGit,
+      repoRoot: dir,
+      worktreesDir,
+      ttlMs: 30 * 86_400_000,
+      hasLedger: () => false,
+    });
+    assert.equal(result.removed, 1);
+    assert.equal(result.pruned, 0);
+    assert.equal(existsSync(path), false);
+    assert.ok(
+      gitIn(dir, ["branch", "--list", branchNameFor("task-1")]).includes("pi-dispatch/task-1"),
+      "受管分支保留",
+    );
+  });
+});
+
 test("清扫：用户自己的 worktree 不被误清", async () => {
   await withGitProject(async (dir, base) => {
     const worktreesDir = join(dir, "bucket", "worktrees");
@@ -532,6 +614,24 @@ test("清扫：单批上限生效（maxPerBatch）", async () => {
   const removes = calls.filter((c) => c[0] === "worktree" && c[1] === "remove");
   assert.equal(removes.length, 1, "一批最多清 maxPerBatch 个");
   assert.equal(result.pruned, 1, "只清了一个分支");
+});
+
+test("清扫：maxPerBatch 显式给 0 ⇒ 这一批一个都不清（0 不是缺省）", async () => {
+  const worktreesDir = mkdtempSync(join(tmpdir(), "dispatch-batch-zero-"));
+  const porcelain = `worktree ${join(worktreesDir, "task-1")}\nbranch refs/heads/pi-dispatch/task-1\n`;
+  const { runner, calls } = fakeGit({ "worktree list": { code: 0, stdout: porcelain } });
+  const result = await sweepWorktrees({
+    git: runner,
+    repoRoot: "/nope",
+    worktreesDir,
+    ttlMs: 0,
+    hasLedger: () => false,
+    maxPerBatch: 0,
+  });
+  const removes = calls.filter((c) => c[0] === "worktree" && c[1] === "remove");
+  assert.equal(removes.length, 0, "显式的 0 就是一批都不做，不落回缺省 500");
+  assert.equal(result.removed, 0);
+  assert.equal(result.pruned, 0);
 });
 
 test("清扫：没有受管根目录 ⇒ 一个 git 都不调", async () => {

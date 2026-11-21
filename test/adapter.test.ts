@@ -408,6 +408,22 @@ test("归约：小文本原样过", () => {
   assert.equal(out.text, "短文");
 });
 
+test("归约：恰好等于窗口预算 ⇒ 原样过（不插 0 字符省略标记）", () => {
+  const text = "y".repeat(8 * 1024);
+  const out = excerptDeliverable(
+    resultWith({
+      text,
+      report: {
+        summary: "s",
+        why: "w",
+        assessment: "主流程已验证。边界场景还没覆盖全，存在回归风险。",
+      },
+      reportChannel: "tool",
+    }) as never,
+  );
+  assert.equal(out.text, text, "恰好装得下就不截（<= 不是 <）");
+});
+
 // ── dispatch_read 行锚 ──────────────────────────────────────────────────────
 
 test("anchoredRead：around 命中给窗口，失配拒绝并回鲜锚", () => {
