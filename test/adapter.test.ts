@@ -28,7 +28,7 @@ import entry, {
 } from "../src/index.ts";
 import { NotificationCenter } from "../src/core/notifications.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
-import { encodeBucket, findProjectRoot } from "../src/core/storage.ts";
+import { encodeBucket, findProjectRoot, Storage } from "../src/core/storage.ts";
 
 /** 最小假 pi：只实现本扩展用到的 API。 */
 function fakePi() {
@@ -670,6 +670,62 @@ test("适配层：父方有 dispatch_blackboard 工具（只读）", async () =>
     const out = await def.execute("call_1", {});
     const payload = JSON.parse(out.content[0]!.text) as { error?: string };
     assert.match(payload.error ?? "", /本会话还没有黑板/);
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+  }
+});
+
+test("适配层：dispatch_list 对默认关记录的序列化与冻结基线逐字节相等（G14）", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dispatch-adapter-g14-"));
+  const project = mkdtempSync(join(tmpdir(), "dispatch-proj-g14-"));
+  mkdirSync(join(project, ".git"), { recursive: true });
+  const oldHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    // 默认关（没有 isolation / blackboard）的一条终态记录：先落盘，再让会话恢复它
+    new Storage(`${home}/.pi/dispatch`, project).persistRecord({
+      id: "default-off-0001",
+      status: "succeeded",
+      task: "干活",
+      startedAt: 1700000000000,
+      finishedAt: 1700000001234,
+      outputPath: "/tmp/out.log",
+      outputTruncated: false,
+    });
+    const { pi, handlers, tools } = fakePi();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    entry(pi as any);
+    await [...(handlers.get("session_start") ?? [])][0]!(undefined, fakeCtx(project));
+    const def = tools.get("dispatch_list") as {
+      execute: () => Promise<{ content: Array<{ text: string }> }>;
+    };
+    // 恢复是异步的（引擎的 #ready）；等它把记录装进 registry 再读
+    let out = await def.execute();
+    for (let i = 0; i < 20 && JSON.parse(out.content[0]!.text).total === 0; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+      out = await def.execute();
+    }
+    // 冻结基线：键集合与值都与今天逐字节相等。新增三字段（isolation/worktree/blackboard）
+    // 在默认关记录上是 undefined，JSON 里连键都不许出现。
+    assert.equal(
+      out.content[0]!.text,
+      [
+        "{",
+        '  "total": 1,',
+        '  "records": [',
+        "    {",
+        '      "id": "default-off-0001",',
+        '      "status": "succeeded",',
+        '      "startedAt": 1700000000000,',
+        '      "finishedAt": 1700000001234,',
+        '      "outputPath": "/tmp/out.log",',
+        '      "outputTruncated": false',
+        "    }",
+        "  ]",
+        "}",
+      ].join("\n"),
+    );
   } finally {
     if (oldHome === undefined) delete process.env.HOME;
     else process.env.HOME = oldHome;

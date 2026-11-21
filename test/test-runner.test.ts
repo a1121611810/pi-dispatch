@@ -83,7 +83,7 @@ test("测试门禁：旗标透传，缺文件时默认整棵 test/", () => {
   ]);
 });
 
-test("测试环境：继承来的三个变量擦掉，别的一个不动", () => {
+test("测试环境：继承来的三个变量擦掉、locale 固定，其余原样", () => {
   const env = scrubbedEnv({
     PATH: "/usr/bin",
     PI_MODEL: "m",
@@ -91,7 +91,12 @@ test("测试环境：继承来的三个变量擦掉，别的一个不动", () =>
     NODE_TEST_WORKER_ID: "7",
     PI_DISPATCH_DEPTH: "1",
   });
-  assert.deepEqual(env, { PATH: "/usr/bin", PI_MODEL: "m" });
+  assert.deepEqual(env, {
+    PATH: "/usr/bin",
+    PI_MODEL: "m",
+    LC_ALL: "C.UTF-8",
+    LANG: "C.UTF-8",
+  });
 
   // 不传 base 时读进程环境：擦口只有一个，不留旁路
   const oldDepth = process.env[INHERITED_DISPATCH_DEPTH];

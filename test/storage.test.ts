@@ -366,15 +366,20 @@ test("解析：字段不够时返回 undefined", () => {
 });
 
 test("locale：中文环境下进程启动时刻仍读得到（ps 输出带 LC_ALL=C）", () => {
-  const old = process.env.LANG;
+  const oldLang = process.env.LANG;
+  const oldLcAll = process.env.LC_ALL;
   process.env.LANG = "zh_CN.UTF-8";
+  // 门禁把 LC_ALL 固定成了 C.UTF-8；不清掉它，LANG 被压住，测不到代码自己那一锁
+  delete process.env.LC_ALL;
   try {
     const start = processStartMs(process.pid);
     assert.ok(start, "锁了 LC_ALL=C ⇒ ps 输出可解析");
     assert.ok(start! <= Date.now());
   } finally {
-    if (old === undefined) delete process.env.LANG;
-    else process.env.LANG = old;
+    if (oldLang === undefined) delete process.env.LANG;
+    else process.env.LANG = oldLang;
+    if (oldLcAll === undefined) delete process.env.LC_ALL;
+    else process.env.LC_ALL = oldLcAll;
   }
 });
 

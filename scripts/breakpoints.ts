@@ -38,6 +38,17 @@ type Breakpoint = {
 //   不给 cwd 时 spawn options 里连键都不出现 —— 缺席类：node 的 spawn 收到
 //     `cwd: undefined` 与「没有 cwd」同义（都落在父方目录），单行破坏点打不出差别。
 //     实现仍按规格连键都不给（省掉一个假键）；这条只能靠读代码守。
+//   黑板笔记永不自动注入任何提示词 —— 结构缺席：没有「读板 → 拼提示词」的代码路径。
+//     靠 test/child.test.ts 的 append 块逐字节 golden 守（开黑板与不开逐字节相等）。
+//   观测先于 resolve-exit、失败不回改终态 —— 顺序 + 缺席：顺序写不出单行差别；
+//     「失败不回改终态」由「引擎：观测失败时 dirty 留空（不填 0）」的 succeeded 断言守。
+//   建盘在启动名额内 —— 顺序类：名额跨 await 持有，单行替换打不出可观测差异；
+//     由「引擎：建盘期间被叫停 ⇒ 不 spawn」与「引擎：创建失败 ⇒ failed 且不 spawn」夹住。
+//   不自动 merge / 不代提交 / 不建消息队列 / 不按孩子数判黑板 / 无跨会话板 —— 缺席类：
+//     没有对应代码路径可改，单行破坏点写不出来。各自靠单测/契约守——孩子契约要求
+//     交付前自行 commit（不代提交、不 merge）、openBoard 不看孩子数、blackboardView 拒别家板号。
+//   观测四连的超时值本身写不出单行破坏点：5s 改成别的秒数仍是合法超时，假 git 立即返回，
+//     行为在可达用例里不变。传参本身由「观测：四连 git 各自 5s 超时」钉住。
 
 const CASES: Breakpoint[] = [
   // ── 安检 ────────────────────────────────────────────────────────────────
@@ -360,6 +371,15 @@ const CASES: Breakpoint[] = [
     test: "test/storage.test.ts",
     red: "记录：坏文件不拖垮启动，跳过继续",
     why: "一条坏记录让整个会话起不来",
+  },
+  {
+    feature: "空产出是空串，不是没产出",
+    file: "src/core/engine.ts",
+    from: "this.#storage?.readOutput(taskId) ?? this.#storage?.readArchivedOutput(taskId),",
+    to: "this.#storage?.readOutput(taskId) || this.#storage?.readArchivedOutput(taskId),",
+    test: "test/engine.test.ts",
+    red: "引擎：产出是空串时 readOutput 返回空串（不落归档）",
+    why: "空产出被当成没落盘——父方拿到 undefined，报「还没落盘：任务未结束或编号不存在」",
   },
   {
     feature: "挤掉即归档",
@@ -1405,6 +1425,97 @@ const CASES: Breakpoint[] = [
     test: "test/worktree.test.ts",
     red: "观测：未跟踪目录里的 3 个文件 ⇒ dirty 3（不折叠成目录一行）",
     why: "未跟踪目录折叠成一行——3 个未提交文件只报 1，脏度撒谎",
+  },
+  // ── P1 账本补齐（F4） ───────────────────────────────────────────────────
+  {
+    feature: "清扫：没到期 ⇒ 不删",
+    file: "src/core/worktree.ts",
+    from: "    if (mtime !== undefined && now - mtime <= ttlMs) continue;",
+    to: "    if (mtime !== undefined && false) continue;",
+    test: "test/worktree.test.ts",
+    red: "清扫：没到期 ⇒ 不删",
+    why: "TTL 没到就清掉受管工作区——账期里的孩子的工作没了",
+  },
+  {
+    feature: "黑板：空白与超 8KiB 都拒",
+    file: "src/core/blackboard.ts",
+    from: '    if (Buffer.byteLength(text, "utf8") > NOTE_MAX_BYTES) {',
+    to: "    if (false) {",
+    test: "test/blackboard.test.ts",
+    red: "黑板：空白与超 8KiB 都拒",
+    why: "超限笔记被收下——一条留言就能把父方读预算撑爆",
+  },
+  {
+    feature: "黑板：读上限 100",
+    file: "src/core/blackboard.ts",
+    from: "  return Math.min(limit, READ_MAX);",
+    to: "  return limit;",
+    test: "test/blackboard.test.ts",
+    red: "黑板：读上限 100（多了夹到 100，缺省 50）",
+    why: "limit 不夹上限——一次读能把整块板塞进父方上下文",
+  },
+  {
+    feature: "黑板：after 游标严格在那条之后",
+    file: "src/core/blackboard.ts",
+    from: "  return at + 1;",
+    to: "  return at;",
+    test: "test/blackboard.test.ts",
+    red: "黑板：after 游标严格在那条之后",
+    why: "游标那条被重复给——续读卡在原地，永远读不完",
+  },
+  {
+    feature: "黑板：清空了的板把目录删掉",
+    file: "src/core/blackboard.ts",
+    from: "      if (left === 0) {",
+    to: "      if (false) {",
+    test: "test/blackboard.test.ts",
+    red: "黑板：清空了的板把目录删掉（owner 可读且证死）",
+    why: "空板目录永不删——死板的 owner.json 与空目录只增不减",
+  },
+  {
+    feature: "引擎：shutdown 给板补 closedAt",
+    file: "src/core/engine.ts",
+    from: "      new BlackboardStore({ root: storage.blackboardsDir, boardId }).close(this.#now());",
+    to: "      new BlackboardStore({ root: storage.blackboardsDir, boardId });",
+    test: "test/engine.test.ts",
+    red: "引擎：shutdown 给板补 closedAt",
+    why: "会话收尾不关板——下次启动只能靠 pid 判死，板一直像活的",
+  },
+  {
+    feature: "适配层：父方有 dispatch_blackboard 工具（只读）",
+    file: "src/index.ts",
+    from: '    name: "dispatch_blackboard",',
+    to: '    name: "dispatch_blackboard_readonly",',
+    test: "test/adapter.test.ts",
+    red: "适配层：父方有 dispatch_blackboard 工具（只读）",
+    why: "父方拿不到读黑板的工具——孩子之间的留言父方看不见",
+  },
+  {
+    feature: "判据·默认关：记录无新键且没有 worktree 目录 ⇒ 红",
+    file: "scripts/verdicts.ts",
+    from: '    ok: failures.length === 0,\n    detail: failures.length ? failures.join("；") : "默认关：记录无新键、worktrees 只含隔离那一个",',
+    to: '    ok: true,\n    detail: failures.length ? failures.join("；") : "默认关：记录无新键、worktrees 只含隔离那一个",',
+    test: "test/verdicts.test.ts",
+    red: "判断·默认关：出现新键、多了目录或缺记录 ⇒ 红",
+    why: "默认关判据被放宽成恒真——记录多出新键、多出 worktree 也报绿",
+  },
+  {
+    feature: "会话级同板",
+    file: "src/core/engine.ts",
+    from: "    const boardId = (this.#boardId ??= randomUUID());",
+    to: "    const boardId = randomUUID();",
+    test: "test/engine.test.ts",
+    red: "引擎：同一会话的两个孩子共用一块板",
+    why: "每个孩子开一块新板——兄弟之间读不到彼此的留言",
+  },
+  {
+    feature: "建盘失败回收半截目录",
+    file: "src/core/engine.ts",
+    from: "        const attempted = this.#registry.get(taskId)?.worktree;\n        if (attempted) {",
+    to: "        const attempted = undefined as { path: string; branch: string } | undefined;\n        if (attempted) {",
+    test: "test/engine.test.ts",
+    red: "引擎：建盘失败留下半截目录 ⇒ best-effort 回收本次路径",
+    why: "建盘失败留下的半截目录没人收——磁盘孤儿只增不减（直到清扫过期）",
   },
   // ── 真机判据 ────────────────────────────────────────────────────────────
   // 判据本身也要能坏：把 ok 条件改成恒真，对应的正反夹具用例必须红。

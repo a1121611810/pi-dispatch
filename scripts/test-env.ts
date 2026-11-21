@@ -18,5 +18,9 @@ export function scrubbedEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.Proce
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of INHERITED_TEST_CONTEXT) delete env[key];
   delete env[INHERITED_DISPATCH_DEPTH];
+  // locale 固定：字符串排序/比较（板上文件名序、git/ps 输出）不随跑测试的人的机器变化，
+  // 否则同一份用例在别的 locale 下可能假绿或红错地方。C.UTF-8 仍按字节序、且支持 UTF-8。
+  env.LC_ALL = "C.UTF-8";
+  env.LANG = "C.UTF-8";
   return env;
 }

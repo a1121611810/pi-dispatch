@@ -4,6 +4,8 @@
 // 变异：core.worktree 命名空间零幸存（.metrics/mutate/core.worktree.edn）——本片新代码
 // 没有杀不掉的等价变异。（`messageOf` 的 `error instanceof Error ? error.message : String(error)`
 // 在本仓只有「抛 Error」这一条可达路径 ⇒ 两支等价；变异器不改写三元分支，本来也不产变异点。）
+// 观测四连的超时**值**写不出单行破坏点：5s 改成别的秒数仍是合法超时，假 git 立即返回，
+// 可达用例里行为不变。传没传由「观测：四连 git 各自 5s、建盘仍 30s」的实参断言钉住。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -15,7 +17,9 @@ import {
   countDirtyLines,
   createWorktree,
   execFileGit,
+  GIT_TIMEOUT_MS,
   managedBranch,
+  OBSERVE_TIMEOUT_MS,
   observeWorktree,
   parseWorktreeList,
   resolveHead,
@@ -278,6 +282,22 @@ test("worktree：观测失败只记 captureError，不回改终态", async () =>
   assert.equal(info.captureError, "git 炸了");
   assert.equal(info.dirty, undefined, "观测不到 ≠ 干净");
   assert.equal(info.path, tmpdir());
+});
+
+test("观测：四连 git 各自 5s 超时、建盘仍 30s（不拖住座位归还）", async () => {
+  const timeouts: Array<number | undefined> = [];
+  const runner: GitRunner = async (_args, _cwd, timeoutMs) => {
+    timeouts.push(timeoutMs);
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  await observeWorktree(runner, { path: tmpdir(), branch: branchNameFor("t"), baseCommit: "abc" });
+  assert.deepEqual(
+    timeouts,
+    [OBSERVE_TIMEOUT_MS, OBSERVE_TIMEOUT_MS, OBSERVE_TIMEOUT_MS, OBSERVE_TIMEOUT_MS],
+    "观测四次都用独立的 5s 上限",
+  );
+  assert.equal(OBSERVE_TIMEOUT_MS, 5_000);
+  assert.equal(GIT_TIMEOUT_MS, 30_000, "建盘仍用 30s");
 });
 
 test("观测：命令失败但目录在 ⇒ 那个字段留空（dirty 不填 0）", async () => {

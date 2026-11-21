@@ -579,6 +579,17 @@ export class TaskEngine {
       // 绝不降级共享 cwd、绝不 spawn（孩子在共享目录里干活比失败更糟）。
       const prepared = await this.#prepareWorktree(taskId);
       if (!prepared.ok) {
+        // git worktree add 失败前可能已经把目录落在盘上（建了一半/元数据写了一半）。
+        // 失败结果不带路径 ⇒ 从记录里取本次路径，best-effort 非强制回收；回收失败交给清扫。
+        const attempted = this.#registry.get(taskId)?.worktree;
+        if (attempted) {
+          await removeWorktree(
+            this.#git,
+            this.#repoRoot ?? "",
+            attempted.path,
+            attempted.branch,
+          ).catch(() => undefined);
+        }
         const r = await this.#registry
           .submit({
             kind: "resolve-exit",

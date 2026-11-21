@@ -6,9 +6,9 @@
 //   `??` 与 `||` 只在注入假值（0/""）时才有区别，而这些配置字段不会是 0 或 ""，
 //   故对「注入真值」的用法等价。要让它们不等价，得注入 0——但 terminalKeep=0
 //   意为「一条不留」，是另一个合法用例。当前注入模式下探针无法区分。
-//   src/core/engine.ts 的 `this.#storage?.x`（504/509/574 行）——storage 是可选的，
-//   没注入时 `?.` 与 `.` 都抛？不，?. 返回 undefined，. 抛 TypeError。
-//   但那些路径都有 `?? undefined` 兜底 ⇒ 等价。
+//   src/core/engine.ts 里 `this.#storage?.x` 的 `?.`——不是等价变异：没 storage 时
+//   `?.` 返回 undefined、`.` 抛 TypeError。由「引擎：没 storage 时 readOutput 返回
+//   undefined（不崩）」与「引擎：readArchivedRecord 没 storage 时返回 undefined」钉住。
 //   shutdown 里 `this.#teardown = true` → false——派发在闸口就被 sessionEndingGate
 //   （读 #ending）拒掉，#teardown 是第二道防线；默认闸口下不可达 ⇒ 等价。
 //   shutdown 循环里 `this.#registry.get(taskId)?.status` 的 ?. → .——在跑的孩子必有记录
@@ -30,6 +30,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  rmSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -1160,6 +1161,21 @@ test("引擎：有 storage 时 readOutput 读产出", async () => {
   assert.equal(await engine.readOutput("abc"), "产出内容");
 });
 
+test("引擎：产出是空串时 readOutput 返回空串（不落归档）", async () => {
+  const root = mkdtempSync(join(tmpdir(), "dispatch-empty-"));
+  const project = join(root, "proj");
+  mkdirSync(join(project, ".git"), { recursive: true });
+  const storage = new Storage(join(root, "dispatch"), project);
+  // 孩子一声不吭地跑完：产出文件在，内容是空串（不是没有产出文件）
+  storage.persistOutput("quiet", "");
+  const { engine } = freshEngine({ storage, hostMode: "one-shot" });
+  assert.equal(
+    await engine.readOutput("quiet"),
+    "",
+    "空串 = 跑完了没话说，不是 undefined（没落盘）",
+  );
+});
+
 test("引擎：readArchivedRecord 没 storage 时返回 undefined", async () => {
   const { engine } = freshEngine();
   assert.equal(await engine.readArchivedRecord("x"), undefined);
@@ -1883,6 +1899,44 @@ test("引擎：创建失败 ⇒ failed 且不 spawn（绝不回共享 cwd）", a
   assert.equal(seen.length, 0, "绝不 spawn");
   const taskId = (outcome as unknown as { taskId: string }).taskId;
   assert.equal(registry.get(taskId)?.startedAt, undefined, "startedAt 要清");
+});
+
+test("引擎：建盘失败留下半截目录 ⇒ best-effort 回收本次路径", async () => {
+  const { project, storage } = isolationStorage();
+  let attemptedPath: string | undefined;
+  const runner: GitRunner = async (args) => {
+    if (args[0] === "rev-parse" && args[1] === "--verify") {
+      return { code: 0, stdout: "base123\n", stderr: "" };
+    }
+    if (args[0] === "worktree" && args[1] === "add") {
+      attemptedPath = args[4];
+      mkdirSync(attemptedPath!, { recursive: true }); // 失败前目录已经落在盘上
+      return { code: 128, stdout: "", stderr: "fatal: could not create work tree dir" };
+    }
+    if (args[0] === "worktree" && args[1] === "remove") {
+      rmSync(args[2]!, { recursive: true, force: true });
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const { engine } = freshEngine({
+    storage,
+    git: runner,
+    repoRoot: project,
+    isGitRepo: () => true,
+    spawn: recordingSpawn([]) as never,
+    hostMode: "one-shot",
+  });
+  const outcome = (await engine.dispatch({ task: "干活", isolation: "worktree" })) as {
+    status: string;
+  };
+  assert.equal(outcome.status, "failed", "建盘失败仍是 failed");
+  assert.ok(attemptedPath !== undefined, "确实尝试建过盘");
+  assert.equal(
+    existsSync(attemptedPath!),
+    false,
+    "失败留下的半截目录被回收（非强制，失败交给清扫）",
+  );
 });
 
 test("引擎：建盘期间被叫停 ⇒ 不 spawn、started:false、终态 canceled", async () => {

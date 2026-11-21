@@ -18,6 +18,13 @@ import type { WorktreeInfo } from "./types.ts";
 /** git 调用的超时（毫秒）：挂死的 git 不许拖住整个流程。 */
 export const GIT_TIMEOUT_MS = 30_000;
 
+/**
+ * 观测调用的超时（毫秒）：观测只是收据，发生在终态写入前、座位还没归还。
+ * 给四次 git 各 30s ⇒ 一个挂死的 git 能把座位（和一次性宿主）扣住两分钟；
+ * 观测允许失败（captureError），所以收紧到 5s，建盘仍用 30s。
+ */
+export const OBSERVE_TIMEOUT_MS = 5_000;
+
 /** git 输出的上限（字节）：worktree list 之类的输出很小，但保险。 */
 const GIT_MAX_BUFFER = 8 * 1024 * 1024;
 
@@ -128,10 +135,18 @@ export async function observeWorktree(
   const fallback: WorktreeInfo = { path: o.path, branch: o.branch, baseCommit: o.baseCommit };
   try {
     if (!existsSync(o.path)) return { ...fallback, missing: true };
-    const head = await git(["rev-parse", "--verify", "HEAD"], o.path);
-    const branchName = await git(["rev-parse", "--abbrev-ref", "HEAD"], o.path);
-    const status = await git(["status", "--porcelain", "--untracked-files=all"], o.path);
-    const ahead = await git(["rev-list", "--count", `${o.baseCommit}..HEAD`], o.path);
+    const head = await git(["rev-parse", "--verify", "HEAD"], o.path, OBSERVE_TIMEOUT_MS);
+    const branchName = await git(["rev-parse", "--abbrev-ref", "HEAD"], o.path, OBSERVE_TIMEOUT_MS);
+    const status = await git(
+      ["status", "--porcelain", "--untracked-files=all"],
+      o.path,
+      OBSERVE_TIMEOUT_MS,
+    );
+    const ahead = await git(
+      ["rev-list", "--count", `${o.baseCommit}..HEAD`],
+      o.path,
+      OBSERVE_TIMEOUT_MS,
+    );
     return {
       ...fallback,
       headCommit: head.code === 0 ? head.stdout.trim() : undefined,
