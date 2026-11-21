@@ -95,6 +95,19 @@ export function applyResolveExit(
   return undefined;
 }
 
+/**
+ * 终态淘汰的排序比较器：先按结束时刻（缺失当 0），同刻按编号字典序。
+ * 抽成具名函数是为了能直接钉住「同刻时编号大的一方排在后面」——
+ * 只经 Array.sort 观察时，返回 0 与 1 在互异 id 上会得到同一个序，变异杀不掉。
+ */
+export function compareTerminal(a: TaskRecord, b: TaskRecord): number {
+  const at = a.finishedAt ?? 0;
+  const bt = b.finishedAt ?? 0;
+  if (at !== bt) return at - bt;
+  if (a.id === b.id) return 0;
+  return a.id < b.id ? -1 : 1;
+}
+
 /** 记录的唯一合法写入者。判定在写锁内做，命令不点名目标终态。 */
 export class TaskRegistry {
   readonly #records = new Map<string, TaskRecord>();
@@ -133,15 +146,7 @@ export class TaskRegistry {
     }
     // 排序键：结束时刻（缺失当 0）+ 编号。写成显式比较而不是三元嵌套——
     // 同值时靠编号定序，缺失一律当 0，不引入「缺失比 0 新」的语义。
-    // 注：这块有 5 个变异点在本仓不可达（见 test/core-logic.test.ts 顶部说明），
-    // 它们只在「两条记录 id 相同」时才有区别，而 registry 拒绝重复 id。
-    terminal.sort((a, b) => {
-      const at = a.finishedAt ?? 0;
-      const bt = b.finishedAt ?? 0;
-      if (at !== bt) return at - bt;
-      if (a.id === b.id) return 0;
-      return a.id < b.id ? -1 : 1;
-    });
+    terminal.sort(compareTerminal);
     const evicted = terminal.slice(0, Math.max(0, terminal.length - keep));
     for (const record of evicted) this.#records.delete(record.id);
     return evicted;

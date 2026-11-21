@@ -20,6 +20,7 @@ import {
   OBSERVE_TIMEOUT_MS,
   observeWorktree,
   parseWorktreeList,
+  removeWorktree,
   resolveHead,
   sweepWorktrees,
   type GitRunner,
@@ -320,6 +321,18 @@ test("观测：命令失败但目录在 ⇒ 那个字段留空（dirty 不填 0�
   });
 });
 
+test("观测：rev-list 给出小数或负数 ⇒ commitsAhead 留空，不谎报", async () => {
+  for (const stdout of ["1.5", "-1"]) {
+    const { runner } = fakeGit({ "rev-list --count": { code: 0, stdout } });
+    const info = await observeWorktree(runner, {
+      path: tmpdir(),
+      branch: branchNameFor("t"),
+      baseCommit: "abc",
+    });
+    assert.equal(info.commitsAhead, undefined, `${JSON.stringify(stdout)} 不是合法计数`);
+  }
+});
+
 // ── 观测的解析器 ──────────────────────────────────────────────────────────
 
 test("解析：porcelain 的干扰行不是一条工作区", () => {
@@ -358,6 +371,15 @@ test("解析：porcelain 的脏行数就是脏文件数", () => {
 });
 
 // ── 清扫 ──────────────────────────────────────────────────────────────────
+
+test("回收：目录本就不在 ⇒ removed 0（没删的不能算成删了）", async () => {
+  const parent = mkdtempSync(join(tmpdir(), "dispatch-gone-"));
+  const missing = join(parent, "never-created");
+  const { runner } = fakeGit({}); // worktree remove 退出 0，但目录从来不在
+  const result = await removeWorktree(runner, parent, missing);
+  assert.deepEqual(result, { removed: 0, pruned: 0 });
+  assert.equal(existsSync(missing), false);
+});
 
 test("清扫：无账本且过期 ⇒ 非强制地清掉目录与分支", async () => {
   await withGitProject(async (dir, base) => {

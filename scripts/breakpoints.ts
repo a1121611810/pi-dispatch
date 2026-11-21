@@ -268,11 +268,20 @@ const CASES: Breakpoint[] = [
   {
     feature: "挤掉时最老先出",
     file: "src/core/registry.ts",
-    from: "      if (at !== bt) return at - bt;",
-    to: "      if (at !== bt) return bt - at;",
+    from: "  if (at !== bt) return at - bt;",
+    to: "  if (at !== bt) return bt - at;",
     test: "test/core-logic.test.ts",
     red: "状态机：挤掉的是最老的那条（按结束时刻）",
     why: "挤掉的是最新的，取证价值最高的先没",
+  },
+  {
+    feature: "同刻按编号定序",
+    file: "src/core/registry.ts",
+    from: "  return a.id < b.id ? -1 : 1;",
+    to: "  return a.id < b.id ? -1 : 0;",
+    test: "test/core-logic.test.ts",
+    red: "状态机：比较器同刻按编号双向定序（大 id 必须返回正数）",
+    why: "同刻时排序退化成插入顺序，最老的那条选错",
   },
 
   // ── 看护 ────────────────────────────────────────────────────────────────

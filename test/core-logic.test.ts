@@ -2,11 +2,10 @@
 // 每个 it 对应一个变异点——变异存活 = 对应探针是假绿的（见计划「第四层 · 假绿测试」）。
 //
 // 等价变异（探针杀不掉，且也不该杀）：
-//   src/core/registry.ts 的 evictTerminal 排序比较器有 5 个变异点在本仓不可达——
-//   它们只在「两条记录 id 相同」时才有区别，而 registry 拒绝重复 id（duplicate task id）。
-//   已用穷举脚本验证：192 组可达输入（id 互异 × 结束时刻 {缺失,0,1,100}）下，
-//   原实现与这 5 个变异体的比较结果符号完全一致 ⇒ 等价，不需要补探针。
-//   其余变异点全部被杀（变异杀死率 38/43）。
+//   compareTerminal 的 `finishedAt ?? 0` → `||`——右值是 0，在 number | undefined 上
+//   两向恒同值（0 ?? 0 与 0 || 0 都是 0，undefined 都是 0，非零都是原值）；NaN 不是合法时刻。
+//   同刻编号 tiebreak 已抽成 compareTerminal，由「比较器同刻按编号双向定序」直接钉住
+//   （只经 Array.sort 观察时，返回 0 与 1 在互异 id 上会得到同一个序，变异杀不掉）。
 //   src/core/gates.ts 的 `deps.isGitRepo ?? (() => false)` → `||`——isGitRepo 的类型是
 //   `() => boolean`，函数恒真 ⇒ ?? 与 || 在可达输入上给同一个谓词 ⇒ 等价。
 import { test } from "node:test";
@@ -24,7 +23,12 @@ import {
   worktreeNeedsGit,
   defaultGates,
 } from "../src/core/gates.ts";
-import { applyAttachWorktree, applyResolveExit, TaskRegistry } from "../src/core/registry.ts";
+import {
+  applyAttachWorktree,
+  applyResolveExit,
+  compareTerminal,
+  TaskRegistry,
+} from "../src/core/registry.ts";
 import type { TaskRecord } from "../src/core/types.ts";
 
 // ── 安检 ──────────────────────────────────────────────────────────────────
@@ -354,6 +358,23 @@ test("状态机：排序用差值不是比较（负数差值也正确）", async
   const evicted = reg.evictTerminal(2).map((r) => r.id);
   assert.deepEqual(evicted, ["a"], "差值排序：10 最小 ⇒ a 先出");
   assert.equal(reg.list().length, 2);
+});
+
+test("状态机：比较器同刻按编号双向定序（大 id 必须返回正数）", () => {
+  const at = (id: string): TaskRecord => ({ id, status: "succeeded", task: "t", finishedAt: 5 });
+  assert.ok(compareTerminal(at("a"), at("b")) < 0, "a < b ⇒ 负数");
+  assert.ok(
+    compareTerminal(at("b"), at("a")) > 0,
+    "b > a ⇒ 正数；返回 0 就变成「按插入顺序」，tiebreak 失效",
+  );
+  assert.equal(compareTerminal(at("x"), at("x")), 0, "同 id 相等");
+  assert.ok(
+    compareTerminal(
+      { id: "z", status: "succeeded", task: "t", finishedAt: 1 },
+      { id: "a", status: "succeeded", task: "t", finishedAt: 2 },
+    ) < 0,
+    "结束时刻优先于编号",
+  );
 });
 
 test("状态机：结束时刻相同时按编号定序（同名也分得清）", async () => {

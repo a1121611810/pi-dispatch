@@ -3,7 +3,9 @@
 // 关键：板上的话**不可信**（信封恒 trust=unverified），作者由服务端盖章（参数伪造不了），
 // 笔记原子写（先 .tmp 后 rename），坏文件只记一笔错不毒化整次读。
 //
-// 变异：core.blackboard 命名空间零幸存（.metrics/mutate/core.blackboard.edn，69 个变异点全杀）。
+// 变异：core.blackboard 命名空间只剩构造函数两处等价变异（其余含读侧大小守卫边界全部被杀）：
+//   `o.now ?? Date.now` / `o.newId ?? randomUUID` → `||`——右值是函数，函数恒真；
+//   未注入时两向都取默认实现，注入时两向都取注入值 ⇒ 可达输入上等价。
 // 板号必填（构造参数 boardId: string）——信封里的板号没有 `??` 兜底，也就没有等价的
 // `??`↔`||` 变异点；板号恒非空 UUID 与空串两种输入各有一条用例钉住。
 import { test } from "node:test";
@@ -240,6 +242,46 @@ test("黑板：手写的 9KiB 笔记绕过写侧 ⇒ 读侧跳过并计入 error
     assert.equal(read.errors, 1, "超单条上限 ⇒ 记一笔错");
     assert.equal(read.notes.length, 1, "其余照读");
     assert.equal(read.notes[0]!.text, "好的那条");
+  });
+});
+
+test("黑板：文件大小守卫是严格大于——恰好等于阈值仍是合法笔记", () => {
+  withBoard((store, root, boardId) => {
+    store.ensureOwner({ pid: 1, startMs: 2 });
+    const notesDir = join(root, boardId, "notes");
+    mkdirSync(notesDir, { recursive: true });
+    // 阈值 = NOTE_MAX_BYTES*6+1024：拿未知字段把文件撑到恰好等于阈值。
+    // 读侧只取四字段、忽略多余键；恰好等于阈值必须照读（改 > 为 >= 就会误杀）。
+    const limitBytes = NOTE_MAX_BYTES * 6 + 1024;
+    const make = (padBytes: number): string =>
+      JSON.stringify({
+        noteId: "edge",
+        author: "c",
+        createdAt: 1,
+        text: "边上那条",
+        pad: "x".repeat(padBytes),
+      });
+    const padBytes = limitBytes - Buffer.byteLength(make(0), "utf8");
+    const body = make(padBytes);
+    assert.equal(Buffer.byteLength(body, "utf8"), limitBytes, "夹具必须恰好卡在阈值上");
+    writeFileSync(join(notesDir, "0000000000001-edge.json"), body, "utf8");
+
+    const atLimit = store.read();
+    assert.equal(atLimit.errors, 0, "恰好等于阈值 ⇒ 不是坏文件");
+    assert.deepEqual(
+      atLimit.notes.map((n) => n.text),
+      ["边上那条"],
+    );
+
+    // 阈值 +1 字节 ⇒ 读侧连读都不读，记一笔错
+    writeFileSync(join(notesDir, "0000000000002-over.json"), make(padBytes + 1), "utf8");
+    const over = store.read();
+    assert.equal(over.errors, 1, "超阈值 1 字节 ⇒ 记一笔错");
+    assert.deepEqual(
+      over.notes.map((n) => n.text),
+      ["边上那条"],
+      "超阈值的跳过，恰好等于的照读",
+    );
   });
 });
 

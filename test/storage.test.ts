@@ -3,7 +3,11 @@
 //
 // 等价变异（探针杀不掉，也不该杀）：
 //   src/core/storage.ts 的 Linux 分支（processStartMs 的 /proc 读法）——
-//   本机是 macOS，那几行只走 Linux 路径，探针无法覆盖。
+//   本机是 macOS，`process.platform === "darwin"` 恒真，Linux 分支不可达；其中三处
+//   算术变异（btime*1000、startTicks/ticksPerSec、*1000）在测试进程里无法观察。
+//   removeTrace 第二个 rmSync 的 `force: true` → false——唯一区别是目录不存在时抛
+//   ENOENT；它在外层 catch 里被吞掉，之后没有可观察副作用（第一刀 rm 记录缺文件时
+//   本来就先抛，走不到第二刀）⇒ 可达输入上等价。
 //   `parsed && typeof parsed.id`（line 213）——去掉 `parsed &&` 后 `null.id` 抛异常，
 //   被外层的 try/catch 兜住 ⇒ 行为等价。
 //   TTL 判断的 `>` vs `>=`（line 234）——真实运行中差值恰好等于 ttlMs 的那一瞬间不可达。
@@ -359,6 +363,12 @@ test("解析：普通进程名同样取到 starttime", () => {
 test("解析：没有 ) 的坏输入返回 undefined", () => {
   assert.equal(parseProcStatStarttime("garbage"), undefined);
   assert.equal(parseProcStatStarttime(""), undefined);
+});
+
+test("解析：close=0（) 紧贴开头）仍是合法输入", () => {
+  // close < 0 才是不含 ) 的坏输入；close === 0 只是 ) 在最前，切片照样取得到第 20 个字段
+  const stat = ")" + " 1".repeat(20);
+  assert.equal(parseProcStatStarttime(stat), 1);
 });
 
 test("解析：字段不够时返回 undefined", () => {

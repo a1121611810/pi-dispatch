@@ -11,6 +11,10 @@
 //   undefined（不崩）」与「引擎：readArchivedRecord 没 storage 时返回 undefined」钉住。
 //   shutdown 里 `this.#teardown = true` → false——派发在闸口就被 sessionEndingGate
 //   （读 #ending）拒掉，#teardown 是第二道防线；默认闸口下不可达 ⇒ 等价。
+//   exitDetail 的 `stderrTail.trim().split("\n").pop() ?? ""` → `||`——split 恒返回
+//   至少一个元素，pop() 恒是 string；空串时右值也是 "" ⇒ 两向同值。
+//   prepareIsolationFor 的 `created.error ?? "worktree 创建失败"` → `||`——createWorktree
+//   失败时 error 恒为非空串（stderr.trim() 或 `code N` 兜底）⇒ 两向同值。
 //   shutdown 循环里 `this.#registry.get(taskId)?.status` 的 ?. → .——在跑的孩子必有记录
 //   （记录只在终态后才被挤掉），get 不会返回 undefined ⇒ 等价。
 //   src/core/engine.ts（抽出的模块级函数）：
@@ -1146,6 +1150,36 @@ test("引擎：shutdown 只处理 queued 与 running，终态不动", async () =
   assert.equal(registry.get("done")?.status, "succeeded", "终态不被 shutdown 动");
 });
 
+test("引擎：shutdown 给在跑的孩子发 SIGTERM（不是只收排队的一条）", async () => {
+  const kills: string[] = [];
+  let spawnedResolve!: () => void;
+  const spawned = new Promise<void>((resolve) => {
+    spawnedResolve = resolve;
+  });
+  const spawn = (): ChildHandle => {
+    spawnedResolve();
+    const exitListeners: Array<(code: number, stderr: string) => void> = [];
+    return {
+      pid: 1,
+      onOutput: () => {},
+      onExit: (cb) => exitListeners.push(cb),
+      kill: (signal) => {
+        kills.push(signal);
+        for (const l of exitListeners) l(143, "");
+      },
+    };
+  };
+  const { registry, engine } = freshEngine({ spawn, hostMode: "long-lived" });
+  const outcome = await engine.dispatch({ task: "干活" });
+  const taskId = (outcome as { taskId: string }).taskId;
+  // running 状态在 spawn 之前就盖了；等 spawn 真正被调用，shutdown 才看得到 #children 里的句柄
+  await waitForStatus(registry, taskId, "running");
+  await spawned;
+  await engine.shutdown();
+  assert.deepEqual(kills, ["SIGTERM"], "在跑的孩子要被 SIGTERM");
+  assert.equal(await waitFor(registry, taskId), "canceled", "stopping 收到退出码 ⇒ canceled");
+});
+
 test("引擎：没 storage 时 readOutput 返回 undefined（不崩）", async () => {
   const { engine } = freshEngine(); // storage: undefined
   assert.equal(await engine.readOutput("whatever"), undefined);
@@ -1504,6 +1538,36 @@ test("引擎：孩子自己非零退出，errorMessage 带退出码而不是单�
     /exit code 1/,
     "第一行要可读：模型和调用方最先读 errorMessage",
   );
+});
+
+test("引擎：退出码 -1 且没有 stderr ⇒ 死因写明「信号不明或起不来」", async () => {
+  const { engine } = freshEngine({
+    spawn: fakeSpawn({ stdout: "x", exitCode: -1, stderr: "" }),
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活" });
+  assert.equal((outcome as { status: string }).status, "failed");
+  assert.match(
+    (outcome as { errorMessage?: string }).errorMessage ?? "",
+    /exit code -1（信号不明或起不来）/,
+    "起不来的 -1 不能和普通退出码 1 用同一句文案",
+  );
+});
+
+test("引擎：超长 stderr 末行截的是尾部 200 字，不是从第 201 字起", async () => {
+  // 末行 303 字：签名落在 [120,138)。slice(-200) 从 103 起 ⇒ 含签名；
+  // slice(200) 从 200 起 ⇒ 签名被切掉。截尾是为了留住死因最后那几行，不能截反。
+  const signature = "SIGNATURE_MIDDLE";
+  const stderr = "x".repeat(120) + signature + "y".repeat(167);
+  assert.equal(stderr.length, 303);
+  const { engine } = freshEngine({
+    spawn: fakeSpawn({ stdout: "x", exitCode: 1, stderr }),
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活" });
+  const message = (outcome as { errorMessage?: string }).errorMessage ?? "";
+  assert.ok(message.includes(signature), "截断后仍要包含末行尾部的中段签名");
+  assert.match(message, /^exit code 1 — …/);
 });
 
 test("引擎：非零退出把 stderr 末行拼进 errorMessage", async () => {

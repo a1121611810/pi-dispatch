@@ -654,6 +654,28 @@ test("黑板：作者取自 env，参数伪造不了", async () => {
   );
 });
 
+test("黑板：空正文被拒时返回 ok:false（不能谎报成功）", async () => {
+  const boardRoot = mkdtempSync(join(tmpdir(), "dispatch-board-"));
+  const boardId = "11111111-2222-4333-8444-555555555555";
+  await withChildTools(
+    {
+      PI_DISPATCH_DEPTH: "1",
+      PI_DISPATCH_BLACKBOARD_DIR: join(boardRoot, boardId),
+      PI_DISPATCH_BLACKBOARD_ID: boardId,
+      PI_DISPATCH_TASK_ID: "task-123",
+    },
+    async (tools) => {
+      const write = tools.get("blackboard_write") as {
+        execute: (id: string, args: unknown) => Promise<{ content: Array<{ text: string }> }>;
+      };
+      const out = await write.execute("call_1", { text: "   " });
+      const payload = JSON.parse(out.content[0]!.text) as { ok?: boolean; error?: string };
+      assert.equal(payload.ok, false, "写失败时 ok 必须是 false");
+      assert.match(payload.error ?? "", /空白/);
+    },
+  );
+});
+
 test("适配层：父方有 dispatch_blackboard 工具（只读）", async () => {
   const home = mkdtempSync(join(tmpdir(), "dispatch-adapter-bb2-"));
   const oldHome = process.env.HOME;
