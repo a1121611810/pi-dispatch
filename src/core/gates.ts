@@ -58,12 +58,45 @@ export const timeoutGate: Gate = (input) =>
     ? rejection(`invalid timeoutMs: ${String(input.timeoutMs)}（必须是正数毫秒）`)
     : null;
 
+/**
+ * 7 · 隔离档位的值合法吗。
+ * 写错值不要改成别的档——那是把「隔离」偷偷变成「共享」。
+ */
+export const isolationGate: Gate = (input) =>
+  input.isolation !== undefined && input.isolation !== "worktree"
+    ? rejection(`invalid isolation value: ${String(input.isolation)}（可用 worktree，不 coerce）`)
+    : null;
+
+/**
+ * 8 · 黑板开关是布尔吗。
+ * 写成 "true" / 1 不猜：拒掉。猜出来的开关会写错父方的意图。
+ */
+export const blackboardGate: Gate = (input) =>
+  input.blackboard !== undefined && typeof input.blackboard !== "boolean"
+    ? rejection(
+        `invalid blackboard value: ${String(input.blackboard)}（必须是 boolean，不 coerce）`,
+      )
+    : null;
+
+/**
+ * 9 · 要隔离就得有 git 仓。
+ * 谓词：探测由适配层注入（真探测），没注入就当没有——不许在非 git 目录里开隔离。
+ */
+export const worktreeNeedsGit =
+  (isGitRepo: () => boolean): Gate =>
+  (input) =>
+    input.isolation === "worktree" && !isGitRepo()
+      ? rejection("isolation=worktree 需要一个 git 仓库：当前目录不是 git 仓库（或没有可用的 git）")
+      : null;
+
 /** 安检的默认顺序。第一道不过就退回，后面的一概不问。 */
 export function defaultGates(deps: {
   isEnabled: () => boolean;
   isEnding: () => boolean;
   depth: () => number;
   maxDepth: number;
+  /** 是不是真 git 仓（适配层注入的探测）。不给 = 不是 ⇒ 不许开隔离。 */
+  isGitRepo?: () => boolean;
 }): Gate[] {
   return [
     readOnlyGate,
@@ -72,6 +105,9 @@ export function defaultGates(deps: {
     dispatchEnabledGate(deps.isEnabled),
     sessionEndingGate(deps.isEnding),
     depthGate(deps.depth, deps.maxDepth),
+    isolationGate,
+    blackboardGate,
+    worktreeNeedsGit(deps.isGitRepo ?? (() => false)),
   ];
 }
 

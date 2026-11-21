@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { constants as osConstants } from "node:os";
-import type { ChildDelivery, ChildReport, ChildUsage, ReportChannel } from "./types.ts";
+import type { ChildDelivery, ChildReport, ChildUsage, Isolation, ReportChannel } from "./types.ts";
 
 // 起子代理：拼命令 + spawn。
 // 「子代理的话不可信，子代理的动作可信」——这里只负责让它跑起来并把原始输出接住。
@@ -18,7 +18,11 @@ export interface ChildHandle {
   kill(signal: NodeJS.Signals): void;
 }
 
-export type SpawnChild = (argv: string[], env: NodeJS.ProcessEnv) => ChildHandle;
+export type SpawnChild = (
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+  options?: { cwd?: string },
+) => ChildHandle;
 
 /**
  * 子进程以用户身份跑（信任姿态与所有 pi 扩展一致，无 OS 沙箱）。
@@ -27,8 +31,17 @@ export type SpawnChild = (argv: string[], env: NodeJS.ProcessEnv) => ChildHandle
  *   ② 起不来要报错，不能崩 —— spawn 失败只发 error，不许抛未捕获异常把主方带走。
  *   ③ 退出可能早于你订阅 —— 晚订阅要补发一次退出码，否则会永远等不到。
  */
-export function spawnChild(argv: string[], env: NodeJS.ProcessEnv = process.env): ChildHandle {
-  const child = spawn(argv[0]!, argv.slice(1), { env, stdio: ["ignore", "pipe", "pipe"] });
+export function spawnChild(
+  argv: string[],
+  env: NodeJS.ProcessEnv = process.env,
+  options?: { cwd?: string },
+): ChildHandle {
+  const child = spawn(argv[0]!, argv.slice(1), {
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+    // 不给 cwd 时**连键都不出现**：省掉一个假键，父方「共享目录」这件事就不被伪装成「指定了目录」。
+    ...(options?.cwd ? { cwd: options.cwd } : {}),
+  });
   let stderr = "";
   child.stderr.on("data", (chunk) => {
     stderr = (stderr + String(chunk)).slice(-STDERR_KEEP_CHARS);
@@ -166,11 +179,25 @@ export const CHILD_REPORT_SCHEMA = {
   required: ["summary", "why", "assessment"],
 } as const;
 
-/** 拼附加块：上下文 +（可选）理由 + 报告契约。 */
-export function buildAppendBlock(options: { why?: string }): string {
+/**
+ * 隔离契约：孩子在一个独立工作区（git worktree）里干活。
+ * 分支名由引擎掌握、孩子看不到 ⇒ 只说「独立工作区」，不写具体分支名
+ * （写了一个猜的分支名，孩子会去动它）。
+ */
+export const WORKTREE_CONTRACT_BLOCK = [
+  "<pi-dispatch-worktree>",
+  "你在一个独立工作区（git worktree）里干活：当前目录不是父方的仓库目录，你的改动不会踩到父方的工作区。",
+  "分支由父方掌握，你只管在当前分支上干活：交付前自己把改动 commit 在这个工作区里——父方靠提交收编你的产出。",
+  "不要 push、不要 rebase、不要切分支、不要动父方的主分支：合并归父方。",
+  "</pi-dispatch-worktree>",
+].join("\n");
+
+/** 拼附加块：上下文 +（可选）理由 +（可选）隔离契约 + 报告契约。 */
+export function buildAppendBlock(options: { why?: string; isolation?: Isolation }): string {
   return [
     SUBAGENT_CONTEXT_BLOCK,
     options.why ? `<pi-dispatch-why>${escapeXmlText(options.why)}</pi-dispatch-why>` : "",
+    options.isolation === "worktree" ? WORKTREE_CONTRACT_BLOCK : "",
     REPORT_CONTRACT_BLOCK,
   ]
     .filter(Boolean)
@@ -189,6 +216,8 @@ export interface BuildArgvOptions {
   projectContext?: "auto" | "none";
   /** 子代理能不能写脚本批量调工具。 */
   allowScripts?: boolean;
+  /** 隔离档位。给了 worktree 就追加隔离契约段（cwd 由引擎用 spawn 第三参给）。 */
+  isolation?: Isolation;
   /** 孩子自己的扩展文件路径——用 -e 装进孩子，回执工具才在。 */
   childExtensionPath?: string;
   /** 会话当前模型（调用没给时的回落）。 */

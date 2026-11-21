@@ -7,16 +7,21 @@
 //   已用穷举脚本验证：192 组可达输入（id 互异 × 结束时刻 {缺失,0,1,100}）下，
 //   原实现与这 5 个变异体的比较结果符号完全一致 ⇒ 等价，不需要补探针。
 //   其余变异点全部被杀（变异杀死率 38/43）。
+//   src/core/gates.ts 的 `deps.isGitRepo ?? (() => false)` → `||`——isGitRepo 的类型是
+//   `() => boolean`，函数恒真 ⇒ ?? 与 || 在可达输入上给同一个谓词 ⇒ 等价。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  blackboardGate,
   depthGate,
   dispatchEnabledGate,
+  isolationGate,
   readOnlyGate,
   rejection,
   sessionEndingGate,
   taskTextGate,
   timeoutGate,
+  worktreeNeedsGit,
   defaultGates,
 } from "../src/core/gates.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
@@ -96,6 +101,61 @@ test("安检顺序：第一道不过，后面一概不问", () => {
   const result = gates[1]!({ task: "" });
   assert.ok(result);
   assert.match(result.errorMessage, /非空字符串/);
+});
+
+test("安检 7：isolation 写错值要拒，不 coerce", () => {
+  assert.equal(isolationGate({ task: "x" }), null, "不给 = 不开隔离");
+  assert.equal(isolationGate({ task: "x", isolation: "worktree" }), null);
+  const bad = isolationGate({ task: "x", isolation: "Worktree" as never });
+  assert.ok(bad, "写错值必须被拒");
+  assert.match(bad!.errorMessage, /invalid isolation value/);
+  // 关键：拒绝信息里不能出现「已按 worktree 处理」这种悄悄放行
+  assert.doesNotMatch(bad!.errorMessage, /按 worktree|已放宽|降级为|已忽略/);
+});
+
+test("安检 8：blackboard 非 boolean 要拒", () => {
+  assert.equal(blackboardGate({ task: "x" }), null, "不给 = 不开黑板");
+  assert.equal(blackboardGate({ task: "x", blackboard: true }), null);
+  assert.equal(blackboardGate({ task: "x", blackboard: false }), null);
+  const bad = blackboardGate({ task: "x", blackboard: "true" as never });
+  assert.ok(bad, "字符串不是布尔值，必须被拒");
+  assert.match(bad!.errorMessage, /invalid blackboard value/);
+  // 关键：不能悄悄当成 true/false
+  assert.doesNotMatch(bad!.errorMessage, /当作 true|已放宽|降级为|已忽略/);
+});
+
+test("安检 9：要 worktree 但没有可用 git 仓要拒", () => {
+  const noGit = worktreeNeedsGit(() => false);
+  const withGit = worktreeNeedsGit(() => true);
+  const bad = noGit({ task: "x", isolation: "worktree" });
+  assert.ok(bad, "没有 git 仓就不许开隔离");
+  assert.match(bad!.errorMessage, /git/);
+  assert.match(bad!.errorMessage, /仓库/);
+  assert.equal(withGit({ task: "x", isolation: "worktree" }), null, "有 git 仓就放行");
+  // 没开隔离就与 git 无关
+  assert.equal(noGit({ task: "x" }), null);
+  assert.equal(noGit({ task: "x", blackboard: true }), null);
+});
+
+test("安检 10：默认闸序含隔离/黑板两道值闸", () => {
+  const gates = defaultGates({
+    isEnabled: () => true,
+    isEnding: () => false,
+    depth: () => 0,
+    maxDepth: 3,
+  });
+  // 既有 6 道位置一个字不动（既有用例按索引断言 gates[1]）
+  assert.equal(gates.length, 9);
+  assert.equal(gates[0], readOnlyGate);
+  assert.equal(gates[1], taskTextGate);
+  assert.equal(gates[2], timeoutGate);
+  // 新闸追加在末尾，编号 7/8/9
+  assert.equal(gates[6], isolationGate, "安检 7 在末尾第一位");
+  assert.equal(gates[7], blackboardGate, "安检 8 在末尾第二位");
+  // 安检 9 是谓词闸（要 git）：没 git 时 isolation=worktree 要被拒
+  const rejected = gates[8]!({ task: "x", isolation: "worktree" });
+  assert.ok(rejected, "安检 9 要在默认闸序里");
+  assert.match(rejected.errorMessage, /git/);
 });
 
 test("安检：rejection 造的形状对", () => {

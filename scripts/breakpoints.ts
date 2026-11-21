@@ -35,6 +35,9 @@ type Breakpoint = {
 //   座位上限不超发 —— 座位数与池子两道上限互为备份，单行破坏点打不破，行为不变。
 //   定终态先于还座位 —— 缺陷是语句顺序，文本替换表达不了。
 //   收件四样一起收 —— 顺序无关。
+//   不给 cwd 时 spawn options 里连键都不出现 —— 缺席类：node 的 spawn 收到
+//     `cwd: undefined` 与「没有 cwd」同义（都落在父方目录），单行破坏点打不出差别。
+//     实现仍按规格连键都不给（省掉一个假键）；这条只能靠读代码守。
 
 const CASES: Breakpoint[] = [
   // ── 安检 ────────────────────────────────────────────────────────────────
@@ -1010,6 +1013,52 @@ const CASES: Breakpoint[] = [
     test: "test/test-runner.test.ts",
     red: "破坏点跑器：子代理环境里也真判红（擦掉继承来的测试上下文）",
     why: "子代理里跑验红，每条都报「原本不是绿的」——验红门禁全瘫",
+  },
+  // ── 隔离与黑板地基 ──────────────────────────────────────────────────────
+  {
+    feature: "isolation 写错值要退回",
+    file: "src/core/gates.ts",
+    from: '  input.isolation !== undefined && input.isolation !== "worktree"',
+    to: "  input.isolation !== undefined && false",
+    test: "test/core-logic.test.ts",
+    red: "安检 7：isolation 写错值要拒，不 coerce",
+    why: "隔离档位写错值时悄悄放行，子代理在共享目录里干活",
+  },
+  {
+    feature: "blackboard 非布尔要退回",
+    file: "src/core/gates.ts",
+    from: 'typeof input.blackboard !== "boolean"',
+    to: "false",
+    test: "test/core-logic.test.ts",
+    red: "安检 8：blackboard 非 boolean 要拒",
+    why: "开关值被猜成布尔，父方的意图被改写",
+  },
+  {
+    feature: "要 worktree 得有 git 仓",
+    file: "src/core/gates.ts",
+    from: 'input.isolation === "worktree" && !isGitRepo()',
+    to: "false",
+    test: "test/core-logic.test.ts",
+    red: "安检 9：要 worktree 但没有可用 git 仓要拒",
+    why: "非 git 目录里也放行隔离，worktree 到运行时才炸",
+  },
+  {
+    feature: "新闸接进默认闸序",
+    file: "src/core/gates.ts",
+    from: "    isolationGate,",
+    to: "    // isolationGate,",
+    test: "test/core-logic.test.ts",
+    red: "安检 10：默认闸序含隔离/黑板两道值闸",
+    why: "闸写好了却没接进默认闸序，隔离值写错也放行",
+  },
+  {
+    feature: "spawn 第三参 cwd 落到子进程",
+    file: "src/core/child.ts",
+    from: "...(options?.cwd ? { cwd: options.cwd } : {})",
+    to: "...({})",
+    test: "test/child.test.ts",
+    red: "真起进程：第三参 cwd 落到子进程工作目录",
+    why: "隔离开的孩子还在父方目录里干活，改动踩到父方的工作区",
   },
 ];
 

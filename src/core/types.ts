@@ -34,6 +34,40 @@ export type ReadOnlyTier = "strict" | "lenient";
 /** 项目上下文加载方式。 */
 export type ProjectContext = "auto" | "none";
 
+/** 隔离档位。v1 只有一种：独立 git 工作区。 */
+export type Isolation = "worktree";
+
+/**
+ * worktree 的观测回执。
+ * 字段观测不到就留 undefined——**观测不到 ≠ 干净**（没测到脏，不能报 0）。
+ */
+export interface WorktreeInfo {
+  /** worktree 目录（<bucket>/worktrees/<taskId>） */
+  path: string;
+  /** 分支名（pi-dispatch/<taskId>） */
+  branch: string;
+  /** 受理时钉死的基点提交 */
+  baseCommit: string;
+  /** 观测到的 HEAD（观测不到就没有） */
+  headCommit?: string;
+  /** git status --porcelain 的非空行数 */
+  dirty?: number;
+  /** 是不是在预期分支上 */
+  onExpectedBranch?: boolean;
+  /** 相对基点前进的提交数 */
+  commitsAhead?: number;
+  /** 目录已经不在（被手工删了） */
+  missing?: boolean;
+  /** 观测失败：只记，不回改终态 */
+  captureError?: string;
+}
+
+/** 黑板。引擎会话级一块板，父方与孩子共读共写。 */
+export interface BlackboardInfo {
+  boardId: string;
+  path: string;
+}
+
 /** 父方递给核心的派发参数。 */
 export interface DispatchInput {
   /** 任务描述。必填，空就退回。子代理只看得到这一段。 */
@@ -50,6 +84,10 @@ export interface DispatchInput {
   projectContext?: ProjectContext;
   /** 子代理能不能写脚本批量调工具。不给 = 用会话默认值。 */
   allowScripts?: boolean;
+  /** 要不要把子代理放进独立工作区。不给 = 与父方共享目录。 */
+  isolation?: Isolation;
+  /** 要不要开共享黑板。不给 = 不开。 */
+  blackboard?: boolean;
 }
 
 /** 安检不过时的理由。 */
@@ -131,6 +169,12 @@ export interface TaskRecord {
   outputPath?: string;
   /** 孩子 stdout 超尾部上限被截断 */
   outputTruncated?: boolean;
+  /** 隔离档位（只在开了时写——默认关时记录里不出现这个键） */
+  isolation?: Isolation;
+  /** worktree 回执（只在开了隔离时写） */
+  worktree?: WorktreeInfo;
+  /** 黑板信息（只在开了黑板时写） */
+  blackboard?: BlackboardInfo;
 }
 
 /** 派发的结果。长驻模式返回 handle，一次性模式返回完整结果。 */
@@ -165,6 +209,12 @@ export interface DispatchResult {
   /** assessment 空转（缺/过短/全正面）——小窗资格粗筛结果，信任只走记账规则 */
   assessmentVacuous?: boolean;
   outputTruncated: boolean;
+  /** 隔离档位（只在开了时带出） */
+  isolation?: Isolation;
+  /** worktree 回执（只在开了隔离时带出） */
+  worktree?: WorktreeInfo;
+  /** 黑板信息（只在开了黑板时带出） */
+  blackboard?: BlackboardInfo;
 }
 
 export type DispatchOutcome = DispatchHandle | TaskRejection | DispatchResult;

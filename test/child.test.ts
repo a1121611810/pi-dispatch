@@ -28,7 +28,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -46,6 +46,7 @@ import {
   CHILD_REPORT_TOOL_NAME,
   REPORT_CONTRACT_BLOCK,
   SUBAGENT_CONTEXT_BLOCK,
+  WORKTREE_CONTRACT_BLOCK,
 } from "../src/core/child.ts";
 import { ChildActivityTracker, DEFAULT_STALL_MS } from "../src/core/activity.ts";
 
@@ -1290,4 +1291,187 @@ test("收件：没有 type 字段的 JSON 行不算事件，也不崩（?. 必�
   const stream = "{}\n" + '{"type":"tool_execution_start","toolName":"read","args":{"path":"/a"}}';
   assert.doesNotThrow(() => parseChildStream(stream));
   assert.equal(parseChildStream(stream).delivery.tools.read, 1);
+});
+
+// ── golden：argv 与附加块逐字节冻结 ──────────────────────────────────────
+//
+// 冻结的字面量是**今天的输出**（跑一次当前实现抄下来的）。
+// 以后多一个旗标、少一段契约、换个顺序，都要显式改这里——
+// 于是「改了什么」在 diff 里自己会说话；没改这里 ⇒ 孩子的契约没动。
+
+/** 冻结：上下文块（逐字节）。 */
+const FROZEN_CONTEXT_BLOCK = [
+  "<pi-dispatch-context>",
+  "你是被派出去的子代理：看不到父方的对话，你的最后一段话就是交付物。",
+  "你的最终消息就是父方读到的东西——把结论写在正文里，不要只放在 JSON 块里。",
+  "</pi-dispatch-context>",
+].join("\n");
+
+/** 冻结：报告契约块（逐字节）。 */
+const FROZEN_REPORT_CONTRACT_BLOCK = [
+  "<child-report-contract>",
+  "Before finishing, deliver a child report — preferably by calling the child_report tool (its schema fixes the shape); if that tool is not available, put a fenced JSON block at the very end of your final message:",
+  "```json",
+  '{ "summary": "one sentence conclusion", "why": "why you conclude so", "assessment": "how it actually went", "findings": [{ "what": "claim", "evidence": "where it comes from" }], "files_touched": ["relative/path"], "verified": [{ "command": "pnpm test", "exitCode": 0 }], "usage": { "input": 0, "output": 0, "cost": 0, "turns": 0 } }',
+  "```",
+  "Rules: the report is a SUMMARY — it is NOT the deliverable. The deliverable is your prose answer, in exactly the format the task asked for; never hide the deliverable inside the JSON block.",
+  'The report judges in three sections. "summary" = what you concluded (one sentence). "why" = why you conclude so — if your instructions contained a <pi-dispatch-why> block, take it as input (answer the parent\'s actual motive); otherwise reason from the task text alone. "assessment" = how the work actually went — quality judgment, problems hit, deviations, what remains unverified; its main anchor is the same: the why block if you received one, else the task text.',
+  'Goodhart pin: "assessment" must name at least one concrete problem, risk, limitation, or thing to recheck. If it is uniformly positive, the parent treats the whole report as not delivered.',
+  '"files_touched", "verified" and "usage" are a receipt for the parent\'s machine cross-check, not prose — keep them exact: files you actually touched, checks you actually ran (commands exactly as run).',
+  "Do NOT write report/summary .md files — your final message is what the parent reads.",
+  "findings/files_touched/verified/usage may be omitted when empty.",
+  "</child-report-contract>",
+].join("\n");
+
+/** 冻结：默认附加块（上下文 + 报告契约；中间没有理由段）。 */
+const FROZEN_APPEND_BLOCK = [FROZEN_CONTEXT_BLOCK, FROZEN_REPORT_CONTRACT_BLOCK].join("\n");
+
+/** 冻结：带理由的附加块。 */
+const FROZEN_APPEND_BLOCK_WITH_WHY = [
+  FROZEN_CONTEXT_BLOCK,
+  "<pi-dispatch-why>为什么</pi-dispatch-why>",
+  FROZEN_REPORT_CONTRACT_BLOCK,
+].join("\n");
+
+/** 冻结：五种组合的 argv（逐元素）。 */
+const FROZEN_ARGV = {
+  默认: [
+    "pi",
+    "-p",
+    "--no-session",
+    "--mode",
+    "json",
+    "--append-system-prompt",
+    FROZEN_APPEND_BLOCK,
+    "--no-extensions",
+    "--no-skills",
+    "干活",
+  ],
+  strict: [
+    "pi",
+    "-p",
+    "--no-session",
+    "--mode",
+    "json",
+    "--append-system-prompt",
+    FROZEN_APPEND_BLOCK,
+    "--no-extensions",
+    "--no-skills",
+    "--tools",
+    "read,grep,find,ls,child_report",
+    "干活",
+  ],
+  strict加脚本: [
+    "pi",
+    "-p",
+    "--no-session",
+    "--mode",
+    "json",
+    "--append-system-prompt",
+    FROZEN_APPEND_BLOCK,
+    "--no-extensions",
+    "--no-skills",
+    "--tools",
+    "read,grep,find,ls,child_report,codemode",
+    "-e",
+    "builtin:codemode",
+    "干活",
+  ],
+  不带项目上下文: [
+    "pi",
+    "-p",
+    "--no-session",
+    "--mode",
+    "json",
+    "--append-system-prompt",
+    FROZEN_APPEND_BLOCK,
+    "--no-extensions",
+    "--no-skills",
+    "--no-context-files",
+    "干活",
+  ],
+  模型加思考档: [
+    "pi",
+    "-p",
+    "--no-session",
+    "--mode",
+    "json",
+    "--append-system-prompt",
+    FROZEN_APPEND_BLOCK,
+    "--no-extensions",
+    "--no-skills",
+    "--model",
+    "a/b:high",
+    "干活",
+  ],
+} as const;
+
+test("golden：buildPiArgv 五种组合逐元素等于冻结字面量", () => {
+  assert.deepEqual(buildPiArgv({ task: "干活" }), [...FROZEN_ARGV.默认]);
+  assert.deepEqual(buildPiArgv({ task: "干活", readOnly: "strict" }), [...FROZEN_ARGV.strict]);
+  assert.deepEqual(buildPiArgv({ task: "干活", readOnly: "strict", allowScripts: true }), [
+    ...FROZEN_ARGV.strict加脚本,
+  ]);
+  assert.deepEqual(buildPiArgv({ task: "干活", projectContext: "none" }), [
+    ...FROZEN_ARGV.不带项目上下文,
+  ]);
+  assert.deepEqual(buildPiArgv({ task: "干活", model: "a/b", thinkingLevel: "high" }), [
+    ...FROZEN_ARGV.模型加思考档,
+  ]);
+});
+
+test("golden：buildAppendBlock 与今天逐字节相等", () => {
+  assert.equal(buildAppendBlock({ why: "为什么" }), FROZEN_APPEND_BLOCK_WITH_WHY);
+  assert.equal(buildAppendBlock({}), FROZEN_APPEND_BLOCK);
+});
+
+test("golden：开隔离时附加块多一段 worktree 契约", () => {
+  const block = buildAppendBlock({ why: "为什么", isolation: "worktree" });
+  assert.ok(block.includes(WORKTREE_CONTRACT_BLOCK), "要有隔离契约段");
+  // 契约要点一个都不能少：独立工作区 / 交付前自行 commit / 不 push 不 rebase 不动主分支
+  assert.match(block, /独立工作区/);
+  assert.match(block, /交付前自己把改动 commit/);
+  assert.match(block, /不要 push、不要 rebase/);
+  assert.match(block, /主分支/);
+  // 默认关时这段不出现
+  assert.ok(!buildAppendBlock({ why: "为什么" }).includes("<pi-dispatch-worktree>"));
+  assert.ok(!buildAppendBlock({}).includes("<pi-dispatch-worktree>"));
+});
+
+test("golden：strict 的 --tools 名单与今天相等", () => {
+  const argv = buildPiArgv({ task: "干活", readOnly: "strict" });
+  assert.equal(argv[argv.indexOf("--tools") + 1], "read,grep,find,ls,child_report");
+  const withScripts = buildPiArgv({ task: "干活", readOnly: "strict", allowScripts: true });
+  assert.equal(
+    withScripts[withScripts.indexOf("--tools") + 1],
+    "read,grep,find,ls,child_report,codemode",
+  );
+});
+
+/** 起一个轻量 node 进程打印自己的 cwd（不起 pi）。 */
+function cwdOfChild(options?: { cwd?: string }): Promise<string> {
+  const child = spawnChild(
+    [process.execPath, "-e", "console.log(process.cwd())"],
+    process.env,
+    options,
+  );
+  let out = "";
+  child.onOutput((chunk) => {
+    out += chunk;
+  });
+  return new Promise((resolve) => {
+    child.onExit(() => resolve(out));
+  });
+}
+
+test("真起进程：第三参 cwd 落到子进程工作目录", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dispatch-cwd-"));
+  const out = await cwdOfChild({ cwd: dir });
+  // macOS 上 /var 是 /private/var 的软链 ⇒ 两边都归一到真实路径再比
+  assert.equal(out.trim(), realpathSync(dir), "子进程的工作目录要给到 cwd");
+});
+
+test("真起进程：不给第三参时子进程在父方 cwd", async () => {
+  const out = await cwdOfChild();
+  assert.equal(out.trim(), realpathSync(process.cwd()), "不给 cwd 就继承父方目录");
 });
