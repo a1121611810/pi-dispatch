@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { ChildActivityTracker, DEFAULT_STALL_MS, STALL_CHECK_INTERVAL_MS } from "./activity.ts";
 import {
   assessmentVacuous,
@@ -236,6 +237,12 @@ export async function captureWorktreeFor(
     missing: probe.missing,
     captureError: probe.captureError,
   };
+}
+
+/** 结果里的 worktree 回执：目录不在（没建 / 建好又回收）⇒ 标 missing，不谎报路径可用。 */
+export function worktreeReceipt(worktree: WorktreeInfo | undefined): { worktree?: WorktreeInfo } {
+  if (!worktree) return {};
+  return { worktree: existsSync(worktree.path) ? worktree : { ...worktree, missing: true } };
 }
 
 /** 判活要问系统的两件事（测试注入假实现；生产用缺省）。 */
@@ -864,7 +871,7 @@ export class TaskEngine {
       outputTruncated: record.outputTruncated ?? false,
       // 隔离的键只在开启时出现（默认关时 Object.keys 不变）
       ...(record.isolation ? { isolation: record.isolation } : {}),
-      ...(record.worktree ? { worktree: record.worktree } : {}),
+      ...worktreeReceipt(record.worktree),
       ...(record.blackboard ? { blackboard: record.blackboard } : {}),
     };
   }
@@ -891,7 +898,7 @@ export class TaskEngine {
       outputTruncated: false,
       // 隔离的键只在开启时出现（默认关时 Object.keys 不变）
       ...(input.isolation ? { isolation: input.isolation } : {}),
-      ...(record?.worktree ? { worktree: record.worktree } : {}),
+      ...worktreeReceipt(record?.worktree),
       ...(record?.blackboard ? { blackboard: record.blackboard } : {}),
     };
   }
@@ -982,7 +989,7 @@ export class TaskEngine {
     // 清扫受管 worktree：有账本（热记录或归档）⇒ 保护；无账本且过期 ⇒ 非强制地清
     await this.#sweepWorktrees();
     // 清扫黑板：活跃板整板跳过；非活跃板的笔记按 TTL 清
-    await this.#sweepBlackboards();
+    this.#sweepBlackboards();
   }
 
   /**
@@ -990,7 +997,7 @@ export class TaskEngine {
    * 规则：活跃板（有人在用）⇒ 整板跳过；非活跃板 ⇒ 笔记按 mtime 过 TTL 就清，
    * 清空了的板把目录删掉。
    */
-  async #sweepBlackboards(): Promise<void> {
+  #sweepBlackboards(): void {
     const storage = this.#storage;
     if (!storage) return;
     const store = new BlackboardStore({

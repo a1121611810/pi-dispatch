@@ -24,12 +24,12 @@ import {
   BLACKBOARD_READ,
   BLACKBOARD_WRITE,
   BlackboardStore,
+  isSafeBoardId,
   NOTE_MAX_BYTES,
   READ_BYTE_BUDGET,
   READ_MAX,
   TRUST,
 } from "../src/core/blackboard.ts";
-import { Storage, isSafeBoardId } from "../src/core/storage.ts";
 
 const BOARD_ID = "11111111-2222-4333-8444-555555555555";
 
@@ -268,12 +268,12 @@ test("黑板：预算内的多条照常读（不误伤）", () => {
 });
 
 test("黑板：板编号过不了 UUID 字符集就拒（防路径拼接）", () => {
-  const root = mkdtempSync(join(tmpdir(), "dispatch-store-"));
-  const storage = new Storage(join(root, "dispatch"), join(root, "proj"));
-  assert.throws(() => storage.blackboardDir("../evil"), /invalid board id/);
-  assert.throws(() => storage.blackboardDir("a/b"), /invalid board id/);
-  assert.throws(() => storage.blackboardDir(""), /invalid board id/);
-  assert.equal(storage.blackboardDir(BOARD_ID), join(storage.blackboardsDir, BOARD_ID));
+  const root = mkdtempSync(join(tmpdir(), "dispatch-board-"));
+  const dirOf = (boardId: string): string => new BlackboardStore({ root, boardId }).boardDir();
+  assert.throws(() => dirOf("../evil"), /invalid board id/);
+  assert.throws(() => dirOf("a/b"), /invalid board id/);
+  assert.throws(() => dirOf(""), /invalid board id/);
+  assert.equal(dirOf(BOARD_ID), join(root, BOARD_ID));
   assert.equal(isSafeBoardId(BOARD_ID), true);
   assert.equal(isSafeBoardId("../../etc"), false);
 });
@@ -284,24 +284,24 @@ test("黑板：owner 四象限（新建 / 已存在不覆盖 / 关板补 closedA
   withBoard((store, root) => {
     const ownerPath = join(root, BOARD_ID, "owner.json");
     // ① 还没有板 ⇒ 没有 owner
-    assert.equal(store.ownerInfo(), undefined);
+    assert.equal(store.ownerInfo(BOARD_ID), undefined);
     // ② 建板 ⇒ owner 写出来
     store.ensureOwner({ pid: 111, startMs: 222 });
     const first = JSON.parse(readFileSync(ownerPath, "utf8")) as Record<string, unknown>;
     assert.equal(first.pid, 111);
     assert.equal(first.startMs, 222);
     assert.equal(first.closedAt, undefined);
-    assert.equal(store.ownerInfo()?.closedAt, undefined);
-    assert.equal(store.ownerInfo()?.boardId, BOARD_ID, "owner 里的板号与这块板一致");
+    assert.equal(store.ownerInfo(BOARD_ID)?.closedAt, undefined);
+    assert.equal(store.ownerInfo(BOARD_ID)?.boardId, BOARD_ID, "owner 里的板号与这块板一致");
     // ③ 已存在 ⇒ 不覆盖
     store.ensureOwner({ pid: 999, startMs: 999 });
-    assert.equal(store.ownerInfo()?.pid, 111, "owner 不覆盖");
+    assert.equal(store.ownerInfo(BOARD_ID)?.pid, 111, "owner 不覆盖");
     // ④ 关板 ⇒ 补 closedAt；关过之后再 ensureOwner 也不覆盖
     store.close(1700000000000);
-    assert.equal(store.ownerInfo()?.closedAt, 1700000000000);
+    assert.equal(store.ownerInfo(BOARD_ID)?.closedAt, 1700000000000);
     store.ensureOwner({ pid: 999, startMs: 999 });
-    assert.equal(store.ownerInfo()?.closedAt, 1700000000000, "closedAt 不被抹掉");
-    assert.equal(store.ownerInfo()?.pid, 111);
+    assert.equal(store.ownerInfo(BOARD_ID)?.closedAt, 1700000000000, "closedAt 不被抹掉");
+    assert.equal(store.ownerInfo(BOARD_ID)?.pid, 111);
   });
 });
 
@@ -323,7 +323,7 @@ test("黑板：owner.json 被改坏 ⇒ 读回来的是规整值（createdAt 归
       JSON.stringify({ boardId: BOARD_ID, pid: 1, startMs: 2, createdAt: "坏的" }),
       "utf8",
     );
-    const owner = store.ownerInfo();
+    const owner = store.ownerInfo(BOARD_ID);
     assert.equal(owner?.pid, 1, "能用的字段照读");
     assert.equal(owner?.createdAt, 0, "不是数字就归零，不外泄坏值");
   });

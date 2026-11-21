@@ -40,6 +40,11 @@ export const READ_MAX = 100;
 /** 单次读的缺省条数。 */
 const READ_DEFAULT = 50;
 
+/** 板编号会拼进路径——只认 UUID 的字符集，其余一律拒绝（防路径拼接）。 */
+export function isSafeBoardId(boardId: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(boardId);
+}
+
 /** 板上的一条留言。 */
 export interface BlackboardNote {
   noteId: string;
@@ -155,10 +160,10 @@ export class BlackboardStore {
     this.#newId = o.newId ?? randomUUID;
   }
 
-  /** 这块板的目录：<root>/<boardId>。 */
+  /** 这块板的目录：<root>/<boardId>。板编号是路径的一段，这里一处守全。 */
   boardDir(): string {
     const boardId = this.#boardId;
-    if (!boardId) throw new Error("这块板还没有编号");
+    if (!isSafeBoardId(boardId)) throw new Error(`invalid board id: ${boardId}`);
     return join(this.#root, boardId);
   }
 
@@ -176,7 +181,6 @@ export class BlackboardStore {
    */
   ensureOwner(owner: { pid: number; startMs: number }): void {
     const boardId = this.#boardId;
-    if (!boardId) throw new Error("这块板还没有编号");
     const path = this.#ownerPath();
     mkdirSync(this.boardDir(), { recursive: true });
     mkdirSync(this.#notesDir(), { recursive: true });
@@ -198,11 +202,10 @@ export class BlackboardStore {
     writeJsonAtomic(path, { ...owner, closedAt: now });
   }
 
-  /** 这块板（或指定那块）的 owner 信息；没有或坏了就 undefined。 */
-  ownerInfo(boardId?: string): BlackboardOwner | undefined {
-    const id = boardId === undefined ? this.#boardId : boardId;
-    if (!id) return undefined;
-    return readOwnerFile(join(this.#root, id, "owner.json"));
+  /** 指定那块板的 owner 信息；没有或坏了就 undefined。 */
+  ownerInfo(boardId: string): BlackboardOwner | undefined {
+    if (!isSafeBoardId(boardId)) return undefined;
+    return readOwnerFile(join(this.#root, boardId, "owner.json"));
   }
 
   /**

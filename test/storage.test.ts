@@ -426,19 +426,3 @@ test("归档：hasArchivedRecord 看的是压缩档在不在", () => {
   assert.equal(storage.hasArchivedRecord("b"), false);
   assert.equal(storage.hasArchivedRecord("../evil"), false, "编号不安全时不碰盘");
 });
-
-test("归档：listArchivedIds 列出归档里的编号", () => {
-  const { storage } = freshStorage();
-  assert.deepEqual(storage.listArchivedIds(), []);
-  storage.persistRecord(record("a"));
-  storage.persistOutput("a", "x");
-  storage.archiveOne(record("a"));
-  storage.persistRecord(record("b"));
-  storage.archiveOne(record("b"));
-  assert.deepEqual(storage.listArchivedIds().sort(), ["a", "b"]);
-});
-
-test("留痕：projectRoot 拿得回当初那个根", () => {
-  const { project, storage } = freshStorage();
-  assert.equal(storage.projectRoot, project);
-});

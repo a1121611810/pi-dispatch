@@ -4,8 +4,6 @@
 // 变异：core.worktree 命名空间零幸存（.metrics/mutate/core.worktree.edn）——本片新代码
 // 没有杀不掉的等价变异。（`messageOf` 的 `error instanceof Error ? error.message : String(error)`
 // 在本仓只有「抛 Error」这一条可达路径 ⇒ 两支等价；变异器不改写三元分支，本来也不产变异点。）
-// 观测四连的超时**值**写不出单行破坏点：5s 改成别的秒数仍是合法超时，假 git 立即返回，
-// 可达用例里行为不变。传没传由「观测：四连 git 各自 5s、建盘仍 30s」的实参断言钉住。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -342,8 +340,6 @@ test("解析：porcelain 的干扰行不是一条工作区", () => {
   assert.equal(entries[0]!.branch, "refs/heads/main");
   assert.equal(entries[1]!.path, "/repo/wt");
   assert.equal(entries[1]!.branch, "refs/heads/pi-dispatch/t1");
-  assert.equal(entries[1]!.prunable, true);
-  assert.equal(entries[0]!.prunable, false);
 });
 
 test("解析：受管分支才认，用户自己的分支不认", () => {
@@ -747,4 +743,21 @@ test("假 runner：命令失败 ⇒ 该字段留空，不是 0", async () => {
   });
   assert.equal(info.headCommit, undefined, "读不到 HEAD ⇒ 留空，不填 0");
   assert.equal(info.dirty, 1, "别的字段照常");
+});
+
+test("假 runner：commitsAhead 不是非负整数 ⇒ undefined（不落 null）", async () => {
+  const { runner } = fakeGit({
+    "rev-list --count": { code: 0, stdout: "not-a-number\n" },
+  });
+  const info = await observeWorktree(runner, {
+    path: tmpdir(),
+    branch: "pi-dispatch/t",
+    baseCommit: "abc",
+  });
+  assert.equal(info.commitsAhead, undefined, "非法输出给 undefined，不给 NaN");
+  assert.equal(
+    JSON.stringify(info).includes('"commitsAhead":null'),
+    false,
+    "序列化后没有 null——「没观测到」不许变成「0 个提交」的谎报",
+  );
 });

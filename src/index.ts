@@ -241,6 +241,9 @@ function startSession(
   // git 根：projectRoot 认 .git 或 .pi，可能不是 git 根 ⇒ 真问一次 git。
   // 问不出来（非 git 仓）⇒ 隔离能力关闭（安检 9 会拒 isolation=worktree）。
   const repoRoot = resolveRepoRoot(projectRoot);
+  // 探测一次布尔就够（会话内缓存）：每次隔离派发同步跑两条 git 太贵。
+  // HEAD 会话中途消失时受理阶段（pinBaseCommit）读不到一样会退回——行为不变。
+  let repoIsGit: boolean | undefined;
   const engine = new TaskEngine({
     registry: new TaskRegistry(),
     storage,
@@ -248,7 +251,7 @@ function startSession(
     piVersion: safe(() => PI_VERSION),
     childExtensionPath: fileURLToPath(import.meta.url),
     repoRoot,
-    isGitRepo: () => isGitRepoAt(repoRoot),
+    isGitRepo: () => (repoIsGit ??= isGitRepoAt(repoRoot)),
     sessionModel: () => {
       try {
         return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;

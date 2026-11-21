@@ -47,8 +47,6 @@ type Breakpoint = {
 //   不自动 merge / 不代提交 / 不建消息队列 / 不按孩子数判黑板 / 无跨会话板 —— 缺席类：
 //     没有对应代码路径可改，单行破坏点写不出来。各自靠单测/契约守——孩子契约要求
 //     交付前自行 commit（不代提交、不 merge）、openBoard 不看孩子数、blackboardView 拒别家板号。
-//   观测四连的超时值本身写不出单行破坏点：5s 改成别的秒数仍是合法超时，假 git 立即返回，
-//     行为在可达用例里不变。传参本身由「观测：四连 git 各自 5s 超时」钉住。
 
 const CASES: Breakpoint[] = [
   // ── 安检 ────────────────────────────────────────────────────────────────
@@ -1516,6 +1514,24 @@ const CASES: Breakpoint[] = [
     test: "test/engine.test.ts",
     red: "引擎：建盘失败留下半截目录 ⇒ best-effort 回收本次路径",
     why: "建盘失败留下的半截目录没人收——磁盘孤儿只增不减（直到清扫过期）",
+  },
+  {
+    feature: "观测四连用独立 5s 超时",
+    file: "src/core/worktree.ts",
+    from: "export const OBSERVE_TIMEOUT_MS = 5_000;",
+    to: "export const OBSERVE_TIMEOUT_MS = GIT_TIMEOUT_MS;",
+    test: "test/worktree.test.ts",
+    red: "观测：四连 git 各自 5s 超时、建盘仍 30s（不拖住座位归还）",
+    why: "观测借建盘的 30s 上限——一条挂死的 git 扣住座位（和一次性宿主）两分钟",
+  },
+  {
+    feature: "locale 固定",
+    file: "scripts/test-env.ts",
+    from: '  env.LC_ALL = "C.UTF-8";',
+    to: "  void 0;",
+    test: "test/test-runner.test.ts",
+    red: "测试环境：继承来的三个变量擦掉、locale 固定，其余原样",
+    why: "locale 随跑测试的人走——同一破坏点换台机器就假绿/红错地方",
   },
   // ── 真机判据 ────────────────────────────────────────────────────────────
   // 判据本身也要能坏：把 ok 条件改成恒真，对应的正反夹具用例必须红。

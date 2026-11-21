@@ -62,7 +62,7 @@ export function applyAttachWorktree(
   command: AttachWorktreeCommand,
 ): CommandResult {
   const next: TaskRecord = { ...current, worktree: command.worktree };
-  return { record: next, fromStatus: current.status, changed: next !== current };
+  return { record: next, fromStatus: current.status, changed: true };
 }
 
 /**

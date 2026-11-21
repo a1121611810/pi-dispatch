@@ -1929,8 +1929,10 @@ test("引擎：建盘失败留下半截目录 ⇒ best-effort 回收本次路径
   });
   const outcome = (await engine.dispatch({ task: "干活", isolation: "worktree" })) as {
     status: string;
+    worktree?: { missing?: boolean };
   };
   assert.equal(outcome.status, "failed", "建盘失败仍是 failed");
+  assert.equal(outcome.worktree?.missing, true, "目录已回收 ⇒ 回执标 missing，不谎报路径可用");
   assert.ok(attemptedPath !== undefined, "确实尝试建过盘");
   assert.equal(
     existsSync(attemptedPath!),
@@ -2366,21 +2368,21 @@ test("引擎：boardIsActive——pid 活但启动时刻读不到 ⇒ 按活（f
     true,
     "读不到启动时刻 ⇒ 证不死 ⇒ 活板（宁留垃圾，不删证据）",
   );
-  assert.equal(ownerIsActive(store.ownerInfo()!, unknowable), true);
-  assert.equal(ownerProvenDead(store.ownerInfo()!, unknowable), false, "证不死就不许算死");
+  assert.equal(ownerIsActive(store.ownerInfo(boardId)!, unknowable), true);
+  assert.equal(ownerProvenDead(store.ownerInfo(boardId)!, unknowable), false, "证不死就不许算死");
   // 启动时刻读得到且对不上 ⇒ 证死（光看 pid 会认错人）
   const mismatched = { alive: () => true, startMs: () => 8 };
   assert.equal(boardIsActive([], store, boardId, mismatched), false);
-  assert.equal(ownerProvenDead(store.ownerInfo()!, mismatched), true);
+  assert.equal(ownerProvenDead(store.ownerInfo(boardId)!, mismatched), true);
   // pid 已死 ⇒ 证死
   const deadPid = { alive: () => false, startMs: () => 7 };
-  assert.equal(ownerProvenDead(store.ownerInfo()!, deadPid), true);
-  assert.equal(ownerIsActive(store.ownerInfo()!, deadPid), false);
+  assert.equal(ownerProvenDead(store.ownerInfo(boardId)!, deadPid), true);
+  assert.equal(ownerIsActive(store.ownerInfo(boardId)!, deadPid), false);
   // 关板 ⇒ 证死（closedAt 优先于 pid / 启动时刻）
   store.close(11);
   const matching = { alive: () => true, startMs: () => 7 };
-  assert.equal(ownerProvenDead(store.ownerInfo()!, matching), true, "有 closedAt ⇒ 证死");
-  assert.equal(ownerIsActive(store.ownerInfo()!, matching), false, "有 closedAt ⇒ 不算活");
+  assert.equal(ownerProvenDead(store.ownerInfo(boardId)!, matching), true, "有 closedAt ⇒ 证死");
+  assert.equal(ownerIsActive(store.ownerInfo(boardId)!, matching), false, "有 closedAt ⇒ 不算活");
 });
 
 test("引擎：没注入 isGitRepo ⇒ 默认不许开隔离（缺省配置不做没把握的事）", async () => {

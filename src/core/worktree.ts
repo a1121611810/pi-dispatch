@@ -122,6 +122,12 @@ export function countDirtyLines(porcelain: string): number {
   return count;
 }
 
+/** 解析 git 输出里的非负整数；非法输出给 undefined（NaN 序列化成 null 就成了谎报）。 */
+function parseCount(out: string): number | undefined {
+  const value = Number(out.trim());
+  return Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
 /**
  * 观测一个 worktree：孩子跑完后留下了什么。
  * 永不抛——观测失败只记 captureError（终态是既成事实，不能被观测改掉）。
@@ -152,7 +158,7 @@ export async function observeWorktree(
       headCommit: head.code === 0 ? head.stdout.trim() : undefined,
       onExpectedBranch: branchName.code === 0 ? branchName.stdout.trim() === o.branch : undefined,
       dirty: status.code === 0 ? countDirtyLines(status.stdout) : undefined,
-      commitsAhead: ahead.code === 0 ? Number(ahead.stdout.trim()) : undefined,
+      commitsAhead: ahead.code === 0 ? parseCount(ahead.stdout) : undefined,
     };
   } catch (error) {
     return { ...fallback, captureError: messageOf(error) };
@@ -165,8 +171,6 @@ export interface WorktreeEntry {
   path: string;
   /** refs/heads/<name> */
   branch?: string;
-  /** 目录已被手工删（git 说 prunable） */
-  prunable: boolean;
 }
 
 /**
@@ -179,16 +183,14 @@ export function parseWorktreeList(porcelain: string): WorktreeEntry[] {
   let current: WorktreeEntry | undefined;
   for (const line of porcelain.split("\n")) {
     if (line.startsWith("worktree ")) {
-      current = { path: line.slice("worktree ".length).trim(), prunable: false };
+      current = { path: line.slice("worktree ".length).trim() };
       entries.push(current);
       continue;
     }
     if (!current) continue;
     if (line.startsWith("branch ")) {
       current.branch = line.slice("branch ".length).trim();
-      continue;
     }
-    if (line.startsWith("prunable")) current.prunable = true;
   }
   return entries;
 }
