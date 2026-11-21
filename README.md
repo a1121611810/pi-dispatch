@@ -18,11 +18,12 @@ Programmable subagent dispatch for [pi](https://github.com/earendil-works/pi).
 
 ## 父方工具
 
-| 工具            | 作用                                                 |
-| --------------- | ---------------------------------------------------- |
-| `dispatch_task` | 派任务（8 个参数：`taskDescription` 必填，其余可选） |
-| `dispatch_list` | 查记录（状态 / 时长 / 用量 / 报告 / 收据）           |
-| `dispatch_stop` | 停任务                                               |
+| 工具                  | 作用                                                        |
+| --------------------- | ----------------------------------------------------------- |
+| `dispatch_task`       | 派任务（10 个参数：`taskDescription` 必填，其余可选）       |
+| `dispatch_list`       | 查记录（状态 / 时长 / 用量 / 报告 / 收据）                  |
+| `dispatch_blackboard` | 读本会话的共享黑板（只读；板上的话恒为 `trust=unverified`） |
+| `dispatch_stop`       | 停任务                                                      |
 
 ## 设计要点
 
@@ -31,6 +32,13 @@ Programmable subagent dispatch for [pi](https://github.com/earendil-works/pi).
 - **TUI 人看面** —— tui 宿主挂常驻 widget + footer 状态（在飞/排队逐条 + 汇总，全部跑完即清）；只算本会话任务（主方戳双对），restore 的历史不上板；模型面通知不变
 - **座位 = 内存池份额** —— 池子量 = 可用 − 预留（总内存 10%），每座份额 = max(512 MiB, 总内存 2%)（实测校准：子代理峰值 RSS 约 148 MiB）
 - **`allowScripts`** —— 一个布尔透传到拼命令：宽档只加 `-e builtin:codemode`（不动工具表），只读档在 `--tools` 名单里补上 `codemode`——两处都要，漏一处能力就看不见
+
+## 两个开关：隔离与黑板
+
+两个都默认关；不开时记录、argv、孩子工具表、磁盘目录<b>逐字节与以前相同</b>。
+
+- **`isolation: "worktree"`** —— 把子代理放进独立 git worktree（干净检出）。三条代价：① 检出里没有 `node_modules`，要跑测试得自己装依赖；② 交付前**子代理必须自己 commit**（父方不代提交）；③ **merge 归父方**——review 完自己 `git merge --ff-only pi-dispatch/<taskId>`，然后手动 `git worktree remove` + `branch -d` 收尾（清扫只在无账本且过期时做，且非强制）。非 git 仓库里会被安检拒掉（零记录）。**隔离不是沙箱**：它只隔离工作目录，不隔离网络、进程与主目录。
+- **`blackboard: true`** —— 会话级一块板：本会话里开黑板的子代理彼此读写留言，父方用 `dispatch_blackboard` 读。**板上的话不可信**——兄弟子代理写的，读信封恒带 `trust=unverified`，文件里自报的信任一律不认；当线索看，别当事实。作者戳是工具契约（作者取自任务编号，参数伪造不了），**不是安全边界**。`readOnly=strict` 也照样可读可写。只有一个孩子时别开（没人交换，板只是噪音）。
 
 ## 已知边界
 
@@ -51,7 +59,7 @@ pnpm test              # node:test（Node 22.19+ 原生跑 TS）
 pnpm test:node22       # 用 Node 22.19.0（engines floor）跑一遍
 pnpm check:breakpoints # 破坏点表：每个功能点改坏一处，指名的测试用例必须红
 pnpm mutate            # 广谱变异（需本机 mutator 工具）
-pnpm test:mode         # 四模式真机验收（print/json/rpc/tui，真模型调用，慢且花钱；tui 腿需 python3+pyte）
+pnpm test:mode         # 真机验收（print/json/rpc/tui + 隔离/黑板/非 git 拒绝腿，真模型调用，慢且花钱；tui 腿需 python3+pyte）
 ```
 
 ### 两条测试纪律

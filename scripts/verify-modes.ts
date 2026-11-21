@@ -1,23 +1,29 @@
 #!/usr/bin/env node
-// 四模式真机验收：print / json / rpc / tui 各起真 pi 进程 + 装本扩展 + 发指令 + 断言产出。
+// 真机验收：print / json / rpc / tui 各起真 pi 进程 + 装本扩展 + 发指令 + 断言产出；
+// 另有隔离（worktree）、黑板往返、非 git 拒绝三条腿。
 // 手动触发：pnpm test:mode
 // 真模型调用，慢且花钱——不进 node --test 快腿。
 // tui 腿另需 python3 + pyte（缺了跳过不判失败），用真 pty 重建屏幕帧断言常驻面板。
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import {
   judgeAllowScripts,
+  judgeBlackboardExchange,
   judgeChildReport,
   judgeCommandReceipt,
+  judgeDefaultOffUntouched,
   judgeDispatch,
   judgeJsonStream,
   judgeReject,
   judgeRpc,
   judgeVerifyAudit,
+  judgeWorktreeIsolation,
+  judgeWorktreeRejected,
+  type BoardNoteFact,
 } from "./verdicts.ts";
 import type { TaskRecord } from "../src/core/types.ts";
 
@@ -60,7 +66,12 @@ function runPrintLike(mode: "print" | "json", prompt: string, cwd: string, timeo
   args.push(prompt);
   return new Promise<{ stdout: string; stderr: string; code: number }>((resolve) => {
     // cwd 决定留痕落哪个桶——必须在临时项目目录里跑，否则落到当前仓库的桶
-    const child = spawn("pi", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("pi", args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      // git 的环境也一并收紧：不读系统配置、不弹终端提示（隔离腿的孩子要真跑 git）
+      env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" },
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (c) => (stdout += String(c)));
@@ -81,6 +92,116 @@ function withTempProject<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), "dispatch-verify-"));
   mkdirSync(join(dir, ".git"), { recursive: true });
   return fn(dir);
+}
+
+/**
+ * 真仓夹具：隔离腿必须真 git（旧的 withTempProject 只 mkdir .git，rev-parse 会报不是仓库）。
+ * 配置全走本仓：不读系统配置、不弹终端、不签名、hooks 指向不存在的目录（孩子 commit 不被拦）。
+ */
+function withGitProject<T>(
+  fn: (dir: string, base: string, git: (args: string[]) => string) => Promise<T>,
+): Promise<T> {
+  const dir = mkdtempSync(join(tmpdir(), "dispatch-git-"));
+  const git = (args: string[]): string =>
+    execFileSync("git", args, {
+      cwd: dir,
+      env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  try {
+    git(["init", "-b", "main"]); // git ≥ 2.28
+  } catch {
+    git(["init"]); // 老 git 退化：init + checkout -b
+    git(["checkout", "-b", "main"]);
+  }
+  git(["config", "user.email", "verify@example.invalid"]);
+  git(["config", "user.name", "verify"]);
+  git(["config", "commit.gpgsign", "false"]);
+  git(["config", "core.hooksPath", join(dir, ".no-hooks")]);
+  writeFileSync(join(dir, "README.md"), "base\n");
+  git(["add", "-A"]);
+  git(["commit", "-m", "base"]);
+  return fn(dir, git(["rev-parse", "HEAD"]).trim(), git);
+}
+
+/** 读文件；不在就空串（区分「没有」与「内容为空白」交给判据）。 */
+function readTextIfExists(path: string): string {
+  try {
+    return existsSync(path) ? readFileSync(path, "utf8") : "";
+  } catch {
+    return "";
+  }
+}
+
+/** 目录下的子目录数（worktrees 下只该有隔离那一个）。 */
+function countDirectories(dir: string): number {
+  if (!existsSync(dir)) return 0;
+  return readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).length;
+}
+
+/** 路径是不是普通文件（worktree 的 .git 该是文件；不在/是目录都算不是）。 */
+function isFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** 桶里 worktrees 目录的落点。 */
+function worktreesDirFor(projectDir: string): string {
+  return join(dispatchStorageRoot(), bucketFor(projectDir), "worktrees");
+}
+
+/** 板上落盘的笔记文件（父方读信封之外的另一侧证据）。 */
+function readBoardNoteFiles(boardDir: string): BoardNoteFact[] {
+  const notesDir = join(boardDir, "notes");
+  if (!existsSync(notesDir)) return [];
+  return readdirSync(notesDir)
+    .filter((file) => file.endsWith(".json"))
+    .flatMap((file) => {
+      try {
+        const parsed = JSON.parse(readFileSync(join(notesDir, file), "utf8")) as BoardNoteFact;
+        return [{ author: parsed.author, text: parsed.text }];
+      } catch {
+        return [];
+      }
+    });
+}
+
+/**
+ * 父方 JSONL 里 dispatch_blackboard 的工具结果（信封 + 笔记）。
+ * trust 来自信封——文件里自报的 trust 不作数。
+ */
+function parentBoardNotes(stdout: string): BoardNoteFact[] {
+  for (const line of stdout.split("\n")) {
+    if (!line.includes("tool_execution_end")) continue;
+    let event: {
+      toolName?: string;
+      result?: { content?: Array<{ type?: string; text?: string }> };
+    };
+    try {
+      event = JSON.parse(line) as typeof event;
+    } catch {
+      continue;
+    }
+    if (event.toolName !== "dispatch_blackboard") continue;
+    const text = event.result?.content?.[0]?.text;
+    if (typeof text !== "string") continue;
+    try {
+      const parsed = JSON.parse(text) as { trust?: string; notes?: BoardNoteFact[] };
+      if (!Array.isArray(parsed.notes)) continue;
+      return parsed.notes.map((note) => ({
+        author: note.author,
+        text: note.text,
+        trust: parsed.trust,
+      }));
+    } catch {
+      // 不是我们的信封——继续找下一条
+    }
+  }
+  return [];
 }
 
 function dispatchStorageRoot(): string {
@@ -209,6 +330,115 @@ async function caseJsonEventShape(mode: "json"): Promise<void> {
     // 复用核心的解析器：同一份逻辑已有测试用例，脚本不再自己实现一遍
     const v = judgeJsonStream(stdout);
     report(mode, "JSONL 事件流能被核心解析出工具调用", v.ok, v.detail);
+  });
+}
+
+/**
+ * 隔离腿（print）：真仓里同一父 turn 派两个——①isolation=worktree 建 canary 并提交
+ * ②默认关回 hi。判据全落 git 事实与 record 字段；最后脚本自己 ff-merge，证明可收编。
+ */
+async function caseIsolationWorktree(): Promise<void> {
+  await withGitProject(async (dir, base, git) => {
+    const canary = `canary-${Math.random().toString(36).slice(2, 8)}`;
+    const prompt =
+      "Do these two steps in order, one after the other. " +
+      "Step 1: call the dispatch_task tool with taskDescription " +
+      `"Create a file named canary.txt in your current working directory whose content is exactly: ${canary}. Then run this bash command: git add canary.txt && git commit -m canary. Answer with the single word: done" ` +
+      'and isolation "worktree". ' +
+      'Step 2: call the dispatch_task tool with taskDescription "Answer with the single word: hi". ' +
+      "Then report both results briefly.";
+    const { stdout } = await runPrintLike("print", prompt, dir, 300_000);
+    const records = readRecords(dir);
+    const isolated = records.find((record) => record.isolation === "worktree");
+    const plain = records.find((record) => record.isolation === undefined);
+    const worktreePath = isolated?.worktree?.path ?? "";
+
+    const worktreeDirExists = worktreePath !== "" && existsSync(worktreePath);
+    const worktreeGitIsFile = worktreeDirExists && isFile(join(worktreePath, ".git"));
+    const canaryInWorktree = readTextIfExists(join(worktreePath, "canary.txt")).includes(canary);
+    const canaryInParent = readTextIfExists(join(dir, "canary.txt")).includes(canary);
+    // 先取父仓事实，再做 ff-merge（merge 会把父 HEAD 往前推）
+    const parentHead = git(["rev-parse", "HEAD"]).trim();
+    const parentStatus = git(["status", "--porcelain"]);
+    let mergeOk = false;
+    let mergedCanary = false;
+    if (isolated?.worktree?.branch) {
+      try {
+        git(["merge", "--ff-only", isolated.worktree.branch]);
+        mergeOk = true;
+      } catch {
+        mergeOk = false;
+      }
+      mergedCanary = readTextIfExists(join(dir, "canary.txt")).includes(canary);
+    }
+
+    const v = judgeWorktreeIsolation(isolated, {
+      base,
+      worktreeDirExists,
+      worktreeGitIsFile,
+      canaryInWorktree,
+      canaryInParent,
+      parentHead,
+      parentStatus,
+      mergeOk,
+      mergedCanary,
+    });
+    report(
+      "isolation",
+      "隔离：独立 worktree / 分支 / 观测 / 父仓不动 / ff-merge 可收编",
+      v.ok,
+      v.detail,
+    );
+    const d = judgeDefaultOffUntouched(plain, countDirectories(worktreesDirFor(dir)));
+    report("isolation", "默认关：记录无新键、worktrees 下只含隔离那一个", d.ok, d.detail);
+    if (!v.ok || !d.ok) console.log(`    父方输出尾部：${stdout.slice(-400)}`);
+  });
+}
+
+/**
+ * 黑板腿（json）：同一父会话依次派 A（写 canary）与 B（读并复述），父方自己再读一次。
+ * 判据看两块 record 的板号、读写收据、板上署名的 canary，以及父方工具结果的 trust 信封。
+ */
+async function caseBlackboardExchange(): Promise<void> {
+  await withGitProject(async (dir) => {
+    const canary = `board-${Math.random().toString(36).slice(2, 8)}`;
+    const prompt =
+      "Do these three steps in order, one after the other. " +
+      "Step 1: call the dispatch_task tool with taskDescription " +
+      `"Call the blackboard_write tool with exactly this text: ${canary}. Then answer: posted" ` +
+      "and blackboard true. " +
+      "Step 2: call the dispatch_task tool with taskDescription " +
+      '"Call the blackboard_read tool to read the shared blackboard. Reply quoting the message text you read and its author." ' +
+      "and blackboard true. " +
+      "Step 3: call the dispatch_blackboard tool yourself, then report the trust value you saw and the notes.";
+    const { stdout } = await runPrintLike("json", prompt, dir, 300_000);
+    const records = readRecords(dir);
+    const writer = records.find((record) => (record.delivery?.tools?.blackboard_write ?? 0) >= 1);
+    const reader = records.find(
+      (record) => record.id !== writer?.id && (record.delivery?.tools?.blackboard_read ?? 0) >= 1,
+    );
+    const boardDir = writer?.blackboard?.path ?? reader?.blackboard?.path ?? "";
+    const diskNotes = boardDir === "" ? [] : readBoardNoteFiles(boardDir);
+    const v = judgeBlackboardExchange(writer, reader, parentBoardNotes(stdout), canary);
+    report(
+      "blackboard",
+      "黑板往返：同板号 / 署名 canary / trust 未核实 / 读写收据",
+      v.ok,
+      `${v.detail}；落盘笔记=${diskNotes.length}`,
+    );
+    if (!v.ok) console.log(`    父方输出尾部：${stdout.slice(-400)}`);
+  });
+}
+
+/** 非 git 拒绝腿（print）：假 .git 目录（旧夹具）派 isolation ⇒ 闸在铸 id 前退回，零记录。 */
+async function caseIsolationRejected(): Promise<void> {
+  await withTempProject(async (dir) => {
+    const prompt =
+      'Use the dispatch_task tool with taskDescription "Say hi" and isolation "worktree". ' +
+      "Report whether it was rejected, and why.";
+    await runPrintLike("print", prompt, dir);
+    const v = judgeWorktreeRejected(readRecords(dir));
+    report("isolation", "非 git 仓：isolation 被拒（零记录）", v.ok, v.detail);
   });
 }
 
@@ -400,7 +630,7 @@ async function caseTuiDispatch(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  console.log("pi-dispatch 四模式真机验收\n");
+  console.log("pi-dispatch 真机验收（print/json/rpc/tui + 隔离/黑板/非 git 拒绝）\n");
   // 确认扩展已构建
   if (!existsSync(EXT)) {
     console.error(`扩展产物不存在：${EXT}\n先跑 pnpm build`);
@@ -426,6 +656,12 @@ async function main(): Promise<void> {
   await caseReject("json");
   await caseCommandReceipt("json");
   await caseVerifyAudit("json");
+  console.log();
+  await caseIsolationWorktree();
+  console.log();
+  await caseBlackboardExchange();
+  console.log();
+  await caseIsolationRejected();
   console.log();
   await caseRpcDispatch();
   console.log();

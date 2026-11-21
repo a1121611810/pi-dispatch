@@ -1234,6 +1234,22 @@
             <td><code>true</code> = 能写脚本批量调工具（见第 5 节）。</td>
             <td>用会话的默认值</td>
           </tr>
+          <tr>
+            <td><b>隔离档</b><br /><code>isolation</code></td>
+            <td>
+              <code>worktree</code> = 把孩子放进独立 git 工作区（见第 14
+              节）。<b>不是沙箱</b>：只隔离工作目录。非 git 仓会被安检拒（写错值也拒，不 coerce）。
+            </td>
+            <td>与父方共享目录</td>
+          </tr>
+          <tr>
+            <td><b>黑板</b><br /><code>blackboard</code></td>
+            <td>
+              <code>true</code> = 本会话开一块共享板，开黑板的子代理彼此读写留言（见第 15
+              节）。板上的话<b>不可信</b>。非布尔会被安检拒。
+            </td>
+            <td>不开板</td>
+          </tr>
         </tbody>
       </table>
 
@@ -1875,6 +1891,25 @@
         </tbody>
       </table>
 
+      <div class="card warn">
+        <h3>隔离与黑板：argv 零新增</h3>
+        <ul style="margin-bottom: 0">
+          <li>
+            <b>隔离不改 argv</b>：cwd 走 spawn 的 options（不给时连键都不出现）。工作区由
+            <code>git worktree add</code> 建好，命令本身<b>一条旗标都不加</b>。
+          </li>
+          <li>
+            <b>strict + 黑板</b>：<code>--tools</code> 名单末尾追加
+            <code>blackboard_read,blackboard_write</code>——这是 strict 唯一的例外（黑板写的是
+            dispatch 桶里的板，不是被隔离的工作区）。
+          </li>
+          <li>
+            <b>黑板不加提示块</b>：契约全在工具描述与读信封的 trust 常量里——孩子每次读都会看到
+            <code>trust=unverified</code>，不需要往提示词里塞散文。
+          </li>
+        </ul>
+      </div>
+
       <div class="card red">
         <h3>起子代理这一段的三条硬规矩</h3>
         <ol style="margin-bottom: 0">
@@ -2224,7 +2259,170 @@
         </ul>
       </div>
 
-      <h2><span class="n">14</span>别踩的坑</h2>
+      <h2><span class="n">14</span>隔离：独立工作区</h2>
+
+      <p>
+        开了隔离，孩子不在父方的目录里干活：每人一个独立 git
+        worktree，改动、暂存、提交都落在自己那儿。
+        <b>它不是沙箱</b>——只隔离工作目录，不隔离网络、进程与主目录。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>环节</th>
+            <th>做什么</th>
+            <th>为什么</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><b>受理</b></td>
+            <td>读一次 <code>HEAD</code>，钉成记录里的 <code>baseCommit</code>。</td>
+            <td><b>钉 base</b>：排队期间父仓 HEAD 前进，孩子的起点不跟着漂。</td>
+          </tr>
+          <tr>
+            <td><b>启动</b></td>
+            <td>
+              <code
+                >git worktree add -b pi-dispatch/&lt;编号&gt; &lt;桶&gt;/worktrees/&lt;编号&gt;
+                &lt;baseCommit&gt;</code
+              >，在<b>启动名额内</b>做，然后 <code>spawn</code> 时把 cwd 指过去。
+            </td>
+            <td>
+              <b>建不出来就失败</b>：任务落 failed、<b>绝不 spawn</b
+              >——绝不降级回共享目录。名额内建盘， 没抢到启动名额就一个 worktree 都不建。
+            </td>
+          </tr>
+          <tr>
+            <td><b>收</b></td>
+            <td>
+              观测 HEAD / 分支 / <code>status --porcelain</code> 的非空行数 / 相对 base
+              的提交数，写进 记录（<code>attach-worktree</code> 只写元数据，<b>不改状态</b>）。
+            </td>
+            <td>
+              <b>观测永不抛</b>：失败只记 <code>captureError</code>，不回改终态。<b
+                >观测不到 ≠ 干净</b
+              >——看不到就留空，不填 0。
+            </td>
+          </tr>
+          <tr>
+            <td><b>留</b></td>
+            <td>所有终态都保留 worktree 与分支。</td>
+            <td>父方要 review、要 merge，证据不能在任务结束时被收走。</td>
+          </tr>
+          <tr>
+            <td><b>扫</b></td>
+            <td>
+              有账本（热记录或归档）⇒ 保护，不看 mtime；无账本且过了 TTL ⇒ 非强制
+              <code>worktree remove</code> → 非强制 <code>branch -d</code>。
+            </td>
+            <td>
+              <b>宁可留垃圾，不可删证据</b>：脏的、未合并的 git 自己会拒 ⇒ 留下。严禁全局
+              <code>worktree prune</code>；只碰受管根下的目录，用户自己的 worktree
+              不动。手工删掉的目录只清元数据， <b>不重建</b>。
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="card warn">
+        <h3>三条边界，说清楚</h3>
+        <ul style="margin-bottom: 0">
+          <li>
+            <b>不自动 merge、不代提交</b>：交付前孩子必须自己 commit；merge 归父方（<code
+              >git merge --ff-only</code
+            >），合完自己收尾。
+          </li>
+          <li>
+            <b>干净检出没有 <code>node_modules</code></b
+            >：要跑测试，孩子得自己装依赖。
+          </li>
+          <li>
+            <b>不是沙箱</b>：路径、网络、进程都还看得见主目录；隔离挡的是「改动踩到父方工作区」。
+          </li>
+        </ul>
+      </div>
+
+      <h2><span class="n">15</span>黑板：会话级共享板</h2>
+
+      <p>
+        开了黑板，本会话里开黑板的子代理共用一块板：彼此能读对方留的言，父方用
+        <code>dispatch_blackboard</code>
+        也能读（只读，只能读本会话当前那块板）。<b>只有一个孩子时别开</b>——没人交换，
+        板只是噪音；要不要开是父级的策略判断，引擎不替你数孩子。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>东西</th>
+            <th>形状</th>
+            <th>为什么</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><b>boardId</b></td>
+            <td>引擎实例（=一次会话）懒生成一个 UUID，整个会话一块板。</td>
+            <td>v1 不存在跨会话板；父方凭旧编号只能回查当前板。</td>
+          </tr>
+          <tr>
+            <td><b>目录</b></td>
+            <td>
+              <code>&lt;桶&gt;/blackboards/&lt;boardId&gt;/owner.json</code> +
+              <code>notes/&lt;createdAt 13 位补零&gt;-&lt;noteId&gt;.json</code>
+            </td>
+            <td>
+              文件名序 = 时间序；建板即写 owner（pid + 启动时刻），shutdown 原子补
+              <code>closedAt</code>。
+            </td>
+          </tr>
+          <tr>
+            <td><b>笔记</b></td>
+            <td><code>noteId / author / createdAt / text</code>；单条 ≤8KiB，空白拒。</td>
+            <td>
+              先写 <code>.tmp</code> 再 rename——崩了最多留一个没用的 .tmp，不留半个 JSON；读只认
+              .json，坏文件计入 <code>errors</code> 跳过。
+            </td>
+          </tr>
+          <tr>
+            <td><b>作者戳</b></td>
+            <td>写工具的参数里<b>没有作者字段</b>；作者取自孩子环境里的任务编号。</td>
+            <td>
+              <b>这是工具契约，不是安全边界</b>——它让兄弟之间分得清谁说的，挡不住有心的孩子伪造。
+            </td>
+          </tr>
+          <tr>
+            <td><b>trust 信封</b></td>
+            <td>读结果恒带 <code>trust: "unverified"</code>。</td>
+            <td>
+              板上的话来自兄弟子代理，可能是假的；文件里自报的 trust
+              与多余字段<b>一律不认</b>。板的内容
+              <b>永不自动进任何提示词</b>——读的人才知道该多疑。
+            </td>
+          </tr>
+          <tr>
+            <td><b>TTL</b></td>
+            <td>
+              活跃板（有非终态记录引用，或 owner 双条件判活且未关板）整板跳过；死板按笔记 mtime 过
+              TTL 清，清空后删板目录。
+            </td>
+            <td>有人正在用的板一条都不清；死板的垃圾才会被收走。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="card warn">
+        <h3>strict 也读得写</h3>
+        <p style="margin-bottom: 0">
+          <code>readOnly: "strict"</code> 时白名单也放 <code>blackboard_read</code> /
+          <code>blackboard_write</code>。这是唯一的例外：板在 dispatch
+          桶里，不在被隔离的工作区；只读子代理也得能跟兄弟交换信息。
+        </p>
+      </div>
+
+      <h2><span class="n">16</span>别踩的坑</h2>
 
       <div class="card red">
         <ol style="margin-bottom: 0">

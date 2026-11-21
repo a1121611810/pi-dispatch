@@ -1289,6 +1289,36 @@ const CASES: Breakpoint[] = [
     red: "收据：黑板写带上 args.command 也不进 commands",
     why: "黑板留言被记成跑过的命令——自检对质拿留言当证据",
   },
+  // ── 真机判据 ────────────────────────────────────────────────────────────
+  // 判据本身也要能坏：把 ok 条件改成恒真，对应的正反夹具用例必须红。
+  // 真机腿（pnpm test:mode）用的是同一个函数，所以判据被放宽时真机腿也会假绿。
+  {
+    feature: "判据：隔离腿的 ok 条件",
+    file: "scripts/verdicts.ts",
+    from: '    ok: failures.length === 0,\n    detail: failures.length ? failures.join("；") : "隔离判据全部符合",',
+    to: '    ok: true,\n    detail: failures.length ? failures.join("；") : "隔离判据全部符合",',
+    test: "test/verdicts.test.ts",
+    red: "判断·隔离：缺字段/脏/漂移/父仓被动过 ⇒ 红",
+    why: "隔离判据被放宽成恒真——没建盘、没提交、父仓被动过也报绿",
+  },
+  {
+    feature: "判据：黑板腿的 ok 条件",
+    file: "scripts/verdicts.ts",
+    from: '    ok: failures.length === 0,\n    detail: failures.length ? failures.join("；") : `黑板判据全部符合（笔记=${notes.length}）`,',
+    to: '    ok: true,\n    detail: failures.length ? failures.join("；") : `黑板判据全部符合（笔记=${notes.length}）`,',
+    test: "test/verdicts.test.ts",
+    red: "判断·黑板：板号不同 / trust 被改 / canary 缺失 / 收据为 0 ⇒ 红",
+    why: "黑板判据被放宽成恒真——板号不同、信任被标成已核实也报绿",
+  },
+  {
+    feature: "判据：隔离退回的 ok 条件",
+    file: "scripts/verdicts.ts",
+    from: "    ok: records.length === 0,\n    detail: `隔离退回后记录数=${records.length}`,",
+    to: "    ok: true,\n    detail: `隔离退回后记录数=${records.length}`,",
+    test: "test/verdicts.test.ts",
+    red: "判断·隔离退回：零记录 ⇒ 绿，有记录 ⇒ 红",
+    why: "退回判据被放宽成恒真——非 git 仓里隔离照样被放行也报绿",
+  },
 ];
 
 /** 数一个子串在文本里出现几次。 */
