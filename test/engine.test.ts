@@ -38,8 +38,8 @@ const GiB = 1024 * 1024 * 1024;
 const MiB = 1024 * 1024;
 
 /** 假机器：一台 24 GiB / 10 核、此刻可用 5.24 GiB 的机器 ⇒ 池子量 2911 MiB ÷ 512 = 5 座。 */
-function machineReader(availableBytes = 5369 * MiB): MachineReader {
-  const spec: MachineSpec = { totalBytes: 24 * GiB, cpus: 10 };
+function machineReader(availableBytes = 5369 * MiB, cpus = 10): MachineReader {
+  const spec: MachineSpec = { totalBytes: 24 * GiB, cpus };
   return { readSpec: () => spec, readAvailable: () => availableBytes };
 }
 
@@ -130,6 +130,65 @@ function fakeGit(
   return { runner, calls };
 }
 
+/**
+ * 可控延迟的假 git：`worktree add` 挂住直到测试显式放行。
+ * 用来把「建盘 await 期间」这个窗口打开——不靠 sleep 猜时序。
+ */
+function gatedGit(): {
+  runner: GitRunner;
+  calls: string[][];
+  addsStarted: () => number;
+  maxAddsInFlight: () => number;
+  waitForAdds: (count: number) => Promise<void>;
+  releaseNextAdd: () => Promise<void>;
+} {
+  const calls: string[][] = [];
+  let started = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const pending: Array<() => void> = [];
+  const startWaiters: Array<{ count: number; resolve: () => void }> = [];
+  const releaseWaiters: Array<() => void> = [];
+  const runner: GitRunner = (args) => {
+    calls.push(args);
+    if (args[0] === "rev-parse" && args[1] === "--verify") {
+      return Promise.resolve({ code: 0, stdout: "base123\n", stderr: "" });
+    }
+    if (args[0] === "worktree" && args[1] === "add") {
+      mkdirSync(args[4]!, { recursive: true });
+      started++;
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      for (const waiter of startWaiters.splice(0)) {
+        if (started >= waiter.count) waiter.resolve();
+        else startWaiters.push(waiter);
+      }
+      return new Promise((resolve) => {
+        pending.push(() => {
+          inFlight--;
+          resolve({ code: 0, stdout: "", stderr: "" });
+        });
+        releaseWaiters.shift()?.(); // 有人在等放行 ⇒ 叫醒它
+      });
+    }
+    return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+  };
+  return {
+    runner,
+    calls,
+    addsStarted: () => started,
+    maxAddsInFlight: () => maxInFlight,
+    waitForAdds: (count) =>
+      started >= count
+        ? Promise.resolve()
+        : new Promise((resolve) => startWaiters.push({ count, resolve })),
+    releaseNextAdd: async () => {
+      if (pending.length === 0) await new Promise<void>((resolve) => releaseWaiters.push(resolve));
+      pending.shift()!();
+    },
+  };
+}
+
 /** 假 spawn（记参数）：立刻退出 0。 */
 function recordingSpawn(seen: unknown[][]): (...args: unknown[]) => ChildHandle {
   return (...args: unknown[]) => {
@@ -167,8 +226,25 @@ function waitFor(registry: TaskRegistry, taskId: string, timeoutMs = 3000): Prom
   });
 }
 
-// ── 通知队列 ──────────────────────────────────────────────────────────────
+/** 等 registry 里某任务到指定状态。 */
+function waitForStatus(registry: TaskRegistry, taskId: string, status: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`等 ${taskId} 到 ${status} 超时`)), 3000);
+    const check = (r: { id: string; status: string }): void => {
+      if (r.id === taskId && r.status === status) {
+        clearTimeout(timer);
+        resolve();
+      }
+    };
+    registry.subscribe(check);
+    if (registry.get(taskId)?.status === status) {
+      clearTimeout(timer);
+      resolve();
+    }
+  });
+}
 
+// ── 通知队列 ──────────────────────────────────────────────────────────────
 test("通知：终态进队列，drain 取走即清", async () => {
   const registry = new TaskRegistry();
   const nc = new NotificationCenter();
@@ -1789,6 +1865,69 @@ test("引擎：创建失败 ⇒ failed 且不 spawn（绝不回共享 cwd）", a
   assert.equal(seen.length, 0, "绝不 spawn");
   const taskId = (outcome as unknown as { taskId: string }).taskId;
   assert.equal(registry.get(taskId)?.startedAt, undefined, "startedAt 要清");
+});
+
+test("引擎：建盘期间被叫停 ⇒ 不 spawn、started:false、终态 canceled", async () => {
+  const { project, storage } = isolationStorage();
+  const git = gatedGit();
+  const seen: unknown[][] = [];
+  const { registry, engine } = freshEngine({
+    storage,
+    git: git.runner,
+    repoRoot: project,
+    isGitRepo: () => true,
+    spawn: recordingSpawn(seen) as never,
+    hostMode: "one-shot",
+  });
+  // 一次性宿主：dispatch 的 promise 等终态——先拿着，别 await（要趁建盘窗口叫停）
+  const pending = engine.dispatch({ task: "干活", isolation: "worktree" });
+  await git.waitForAdds(1);
+  const taskId = registry.list()[0]!.id;
+  await engine.stop(taskId, "建盘期间叫停");
+  await git.releaseNextAdd();
+
+  const outcome = (await pending) as { status: string; started: boolean };
+  assert.equal(outcome.status, "canceled");
+  assert.equal(outcome.started, false, "孩子压根没起");
+  assert.equal(seen.length, 0, "绝不 spawn");
+  assert.equal(registry.get(taskId)?.startedAt, undefined, "startedAt 不记");
+  const removed = git.calls.find((c) => c[0] === "worktree" && c[1] === "remove");
+  assert.ok(removed, "刚建好的盘被 best-effort 回收");
+  assert.equal(removed!.at(-1), registry.get(taskId)?.worktree?.path, "回收的是本任务的盘");
+});
+
+test("引擎：叫停等名额的任务只归还一次名额（之后启动仍受节流）", async () => {
+  const { project, storage } = isolationStorage();
+  const git = gatedGit();
+  const { registry, engine } = freshEngine({
+    machineReader: machineReader(5369 * MiB, 1), // 1 核 ⇒ 启动名额 1
+    storage,
+    git: git.runner,
+    repoRoot: project,
+    isGitRepo: () => true,
+    spawn: recordingSpawn([]) as never,
+    hostMode: "long-lived",
+  });
+  // A 占住唯一的名额（建盘卡住）
+  await engine.dispatch({ task: "A", isolation: "worktree" });
+  await git.waitForAdds(1);
+  // B 排在名额后：确认已转 running（挂在名额上），再叫停
+  const b = (await engine.dispatch({ task: "B" })) as { taskId: string };
+  await waitForStatus(registry, b.taskId, "running");
+  await engine.stop(b.taskId, "等名额时叫停");
+  // 放行 A ⇒ 名额还给 B ⇒ 叫停分支执行（双次归还会把 #starting 减成负数）
+  await git.releaseNextAdd();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  // 再派两个隔离任务：名额只剩一个 ⇒ 两个 add 不能同时在飞
+  await engine.dispatch({ task: "C", isolation: "worktree" });
+  await engine.dispatch({ task: "D", isolation: "worktree" });
+  await git.waitForAdds(2); // A 之后，C/D 里先到的那一个
+  await new Promise((resolve) => setTimeout(resolve, 30)); // 给「第二个 add」冒头的时间
+  assert.equal(git.maxAddsInFlight(), 1, "启动名额只还了一次：第二个建盘要等第一个");
+
+  await git.releaseNextAdd();
+  await git.releaseNextAdd();
 });
 
 test("引擎：孩子 close 后观测 worktree 并入记录", async () => {

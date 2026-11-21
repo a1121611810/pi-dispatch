@@ -132,7 +132,11 @@ export class TaskRegistry {
       }
       case "resolve-exit": {
         const current = this.#require(command.id);
-        if (current.status === "stopping") return this.#move(command.id, "canceled", {});
+        if (current.status === "stopping") {
+          // 建盘期间被叫停：孩子压根没起 ⇒ 与 running 分支同款，startedAt 要清。
+          const patch: Partial<TaskRecord> = command.notStarted ? { startedAt: undefined } : {};
+          return this.#move(command.id, "canceled", patch);
+        }
         if (current.status === "running") {
           return this.#move(command.id, command.exitCode === 0 ? "succeeded" : "failed", {
             // 孩子压根没起（建 worktree 失败）：startedAt 要清——

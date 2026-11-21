@@ -211,8 +211,11 @@ function mtimeOf(path: string): number | undefined {
   }
 }
 
-/** 清一个工作区：非强制 remove → 非强制删分支。 */
-async function removeWorktree(
+/**
+ * 清一个工作区：非强制 remove → 非强制删分支。
+ * 也供引擎回收「建好但没来得及 spawn」的盘用——非强制，脏了就留给清扫。
+ */
+export async function removeWorktree(
   git: GitRunner,
   repoRoot: string,
   path: string,

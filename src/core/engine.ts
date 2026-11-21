@@ -30,6 +30,7 @@ import {
   createWorktree,
   execFileGit,
   observeWorktree,
+  removeWorktree,
   resolveHead,
   sweepWorktrees,
   type GitRunner,
@@ -397,7 +398,6 @@ export class TaskEngine {
     try {
       const beforeSpawn = this.#registry.get(taskId);
       if (!beforeSpawn || beforeSpawn.status !== "running") {
-        this.#releaseLaunchSlot();
         return this.#notStartedResult(taskId, input, "等启动名额时被叫停", "canceled");
       }
       // 启动名额内建 worktree：建不出来 ⇒ 失败。
@@ -420,6 +420,31 @@ export class TaskEngine {
           `worktree 创建失败：${prepared.error}`,
           "failed",
         );
+      }
+      // 建盘是 await（git worktree add 最长 30s）：回来时任务可能已被叫停/会话已拆卸。
+      // 此刻 #children 里还没有句柄，SIGTERM 无处发，shutdown 也走不到它 ⇒ 必须在这里复查。
+      const afterPrepare = this.#registry.get(taskId);
+      if (this.#teardown || afterPrepare?.status !== "running") {
+        // 刚建好的盘 best-effort 非强制回收；回收失败留给清扫。
+        if (prepared.worktree) {
+          await removeWorktree(
+            this.#git,
+            this.#repoRoot ?? "",
+            prepared.worktree.path,
+            prepared.worktree.branch,
+          ).catch(() => undefined);
+        }
+        const r = await this.#registry
+          .submit({
+            kind: "resolve-exit",
+            id: taskId,
+            exitCode: -1,
+            notStarted: true,
+            detail: "取消发生在 worktree 检出之后",
+          })
+          .catch(() => undefined);
+        if (r) this.#notifyTerminal(r.record);
+        return this.#notStartedResult(taskId, input, "取消发生在 worktree 检出之后", "canceled");
       }
       child = this.#spawnChild(input, taskId, prepared.worktree);
       this.#children.set(taskId, child);
