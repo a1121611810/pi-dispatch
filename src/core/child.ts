@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { constants as osConstants } from "node:os";
+import { BLACKBOARD_READ, BLACKBOARD_WRITE } from "./blackboard.ts";
 import type { ChildDelivery, ChildReport, ChildUsage, Isolation, ReportChannel } from "./types.ts";
 
 // 起子代理：拼命令 + spawn。
@@ -218,6 +219,8 @@ export interface BuildArgvOptions {
   allowScripts?: boolean;
   /** 隔离档位。给了 worktree 就追加隔离契约段（cwd 由引擎用 spawn 第三参给）。 */
   isolation?: Isolation;
+  /** 要不要开共享黑板。开了 strict 档也放行黑板那两个工具（唯一的白名单例外）。 */
+  blackboard?: boolean;
   /** 孩子自己的扩展文件路径——用 -e 装进孩子，回执工具才在。 */
   childExtensionPath?: string;
   /** 会话当前模型（调用没给时的回落）。 */
@@ -282,6 +285,7 @@ export function buildPiArgv(options: BuildArgvOptions): string[] {
  * 只读档位的工具名单；非 strict 不收窄——收窄会把 bash/edit/write 全砍掉。
  * allowScripts 时读集里必须含 codemode，否则「能力进来了也调不到」
  * （实测：--tools 白名单会砍掉没列进去的扩展工具）。
+ * 黑板是唯一的例外：strict 档也放行黑板那两个工具——只读子代理要能跟兄弟交换信息。
  */
 function strictToolsArgv(options: BuildArgvOptions): string[] {
   if (options.readOnly !== "strict") return [];
@@ -289,6 +293,7 @@ function strictToolsArgv(options: BuildArgvOptions): string[] {
     ...READ_ONLY_TOOLS,
     CHILD_REPORT_TOOL_NAME,
     ...(options.allowScripts ? ["codemode"] : []),
+    ...(options.blackboard ? [BLACKBOARD_READ, BLACKBOARD_WRITE] : []),
   ];
   return ["--tools", tools.join(",")];
 }

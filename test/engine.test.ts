@@ -15,13 +15,21 @@
 //   （记录只在终态后才被挤掉），get 不会返回 undefined ⇒ 等价。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, utimesSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TaskEngine } from "../src/core/engine.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
 import { batchBySize, NotificationCenter } from "../src/core/notifications.ts";
-import { Storage } from "../src/core/storage.ts";
+import { Storage, processStartMs } from "../src/core/storage.ts";
 import type { MachineReader, MachineSpec } from "../src/core/pool.ts";
 import type { ChildHandle } from "../src/core/child.ts";
 import type { GitRunner } from "../src/core/worktree.ts";
@@ -1893,4 +1901,151 @@ test("引擎：boot 清扫——归档里的 worktree 也受保护", async () =>
   const removed = calls.filter((c) => c[0] === "worktree" && c[1] === "remove").map((c) => c[2]);
   assert.ok(!removed.includes(archived), "归档里的 ⇒ 保护");
   assert.ok(removed.includes(orphan), "没账本的 ⇒ 清");
+});
+
+// ── 黑板 ──────────────────────────────────────────────────────────────────
+
+test("引擎：开黑板的孩子 env 里有板目录", async () => {
+  const { storage } = isolationStorage();
+  const seen: unknown[][] = [];
+  const { registry, engine } = freshEngine({
+    storage,
+    spawn: recordingSpawn(seen) as never,
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活", blackboard: true });
+  const taskId = (outcome as { taskId: string }).taskId;
+  const env = seen[0]![1] as NodeJS.ProcessEnv;
+  const boardDir = env.PI_DISPATCH_BLACKBOARD_DIR;
+  const boardId = env.PI_DISPATCH_BLACKBOARD_ID;
+  assert.ok(boardDir, "env 里有板目录");
+  assert.ok(boardId, "env 里有板号");
+  assert.ok(boardDir.includes(boardId!), "板目录里带着板号");
+  assert.equal(boardDir, storage.blackboardDir(boardId!), "板目录就是留痕目录下的那块");
+  const record = registry.get(taskId);
+  assert.equal(record?.blackboard?.boardId, boardId, "记录里写着这块板");
+  assert.equal(record?.blackboard?.path, boardDir);
+});
+
+test("引擎：默认关——继承来的黑板 env 被擦除", async () => {
+  const oldDir = process.env.PI_DISPATCH_BLACKBOARD_DIR;
+  const oldId = process.env.PI_DISPATCH_BLACKBOARD_ID;
+  process.env.PI_DISPATCH_BLACKBOARD_DIR = "/tmp/inherited-board";
+  process.env.PI_DISPATCH_BLACKBOARD_ID = "inherited-board";
+  try {
+    const seen: unknown[][] = [];
+    const { engine } = freshEngine({
+      spawn: recordingSpawn(seen) as never,
+      hostMode: "one-shot",
+    });
+    await engine.dispatch({ task: "干活" });
+    const env = seen[0]![1] as NodeJS.ProcessEnv;
+    assert.equal(env.PI_DISPATCH_BLACKBOARD_DIR, undefined, "继承来的板目录要擦掉");
+    assert.equal(env.PI_DISPATCH_BLACKBOARD_ID, undefined, "继承来的板号也要擦掉");
+  } finally {
+    if (oldDir === undefined) delete process.env.PI_DISPATCH_BLACKBOARD_DIR;
+    else process.env.PI_DISPATCH_BLACKBOARD_DIR = oldDir;
+    if (oldId === undefined) delete process.env.PI_DISPATCH_BLACKBOARD_ID;
+    else process.env.PI_DISPATCH_BLACKBOARD_ID = oldId;
+  }
+});
+
+test("引擎：同一会话的两个孩子共用一块板", async () => {
+  const { storage } = isolationStorage();
+  const seen: unknown[][] = [];
+  const { engine } = freshEngine({
+    storage,
+    spawn: recordingSpawn(seen) as never,
+    hostMode: "one-shot",
+  });
+  await engine.dispatch({ task: "一号", blackboard: true });
+  await engine.dispatch({ task: "二号", blackboard: true });
+  const first = (seen[0]![1] as NodeJS.ProcessEnv).PI_DISPATCH_BLACKBOARD_ID;
+  const second = (seen[1]![1] as NodeJS.ProcessEnv).PI_DISPATCH_BLACKBOARD_ID;
+  assert.ok(first, "第一个孩子有板号");
+  assert.equal(first, second, "同一会话共用一块板");
+  assert.equal(readdirSync(storage.blackboardsDir).length, 1, "桶里只有一块板");
+});
+
+test("引擎：没有黑板时父方视图报错", async () => {
+  const { engine } = freshEngine({ hostMode: "one-shot" });
+  const none = engine.blackboardView() as { error?: string };
+  assert.match(none.error ?? "", /本会话还没有黑板/);
+  const other = engine.blackboardView({
+    boardId: "11111111-2222-4333-8444-555555555555",
+  }) as { error?: string };
+  assert.match(other.error ?? "", /本会话没有该黑板/, "别家会话的板不认");
+});
+
+test("引擎：shutdown 给板补 closedAt", async () => {
+  const { storage } = isolationStorage();
+  const { engine } = freshEngine({
+    storage,
+    spawn: recordingSpawn([]) as never,
+    hostMode: "one-shot",
+  });
+  await engine.dispatch({ task: "干活", blackboard: true });
+  const boardId = readdirSync(storage.blackboardsDir)[0]!;
+  const ownerPath = join(storage.blackboardDir(boardId), "owner.json");
+  const before = JSON.parse(readFileSync(ownerPath, "utf8")) as Record<string, unknown>;
+  assert.equal(before.closedAt, undefined, "没关就没有 closedAt");
+  await engine.shutdown();
+  const after = JSON.parse(readFileSync(ownerPath, "utf8")) as Record<string, unknown>;
+  assert.equal(typeof after.closedAt, "number", "关板补 closedAt");
+});
+
+test("引擎：没开黑板 ⇒ 记录与结果里都没有黑板的键", async () => {
+  const { registry, engine } = freshEngine({ hostMode: "one-shot" });
+  const outcome = await engine.dispatch({ task: "干活" });
+  const taskId = (outcome as { taskId: string }).taskId;
+  assert.ok(!Object.keys(registry.get(taskId) ?? {}).includes("blackboard"));
+  assert.ok(!("blackboard" in (outcome as Record<string, unknown>)));
+});
+
+test("引擎：boot 清扫黑板——活板一条不动，死板的过期笔记清掉", async () => {
+  const { storage } = isolationStorage();
+  const past = new Date(Date.now() - 31 * 86_400_000);
+  // 造一块板：owner.json + 一条老笔记（mtime 在 TTL 之外）
+  const boardOf = (boardId: string, startMs: number): string => {
+    const dir = storage.blackboardDir(boardId);
+    mkdirSync(join(dir, "notes"), { recursive: true });
+    writeFileSync(
+      join(dir, "owner.json"),
+      JSON.stringify({ boardId, pid: process.pid, startMs, createdAt: 1 }),
+      "utf8",
+    );
+    const note = join(dir, "notes", "0000000000001-x.json");
+    writeFileSync(
+      note,
+      JSON.stringify({ noteId: "x", author: "a", createdAt: 1, text: "老的" }),
+      "utf8",
+    );
+    utimesSync(note, past, past);
+    return dir;
+  };
+  const liveStart = processStartMs(process.pid) ?? 0;
+  // ① 活板：owner 就是本进程且启动时刻对得上 ⇒ 判活
+  const liveId = "77777777-2222-4333-8444-555555555555";
+  const liveDir = boardOf(liveId, liveStart);
+  // ② 死板：owner 启动时刻对不上（光看进程号会认错人）⇒ 判死
+  const deadId = "88888888-2222-4333-8444-555555555555";
+  const deadDir = boardOf(deadId, liveStart + 1);
+  // ③ 有人在用的板：一条非终态记录还引用它 ⇒ 整板跳过
+  const busyId = "99999999-2222-4333-8444-555555555555";
+  const busyDir = boardOf(busyId, liveStart + 1);
+  storage.persistRecord({
+    id: "busy-task",
+    status: "running",
+    task: "t",
+    ownerPid: process.pid,
+    ownerStartMs: liveStart,
+    blackboard: { boardId: busyId, path: busyDir },
+  });
+
+  const { engine } = freshEngine({ storage, hostMode: "one-shot" });
+  await engine.ready;
+
+  assert.equal(readdirSync(join(liveDir, "notes")).length, 1, "活板一条都不清");
+  assert.equal(readdirSync(join(busyDir, "notes")).length, 1, "有人在用的板一条都不清");
+  assert.equal(existsSync(join(deadDir, "notes")), false, "死板的过期笔记清掉了");
 });

@@ -13,6 +13,7 @@ import {
   type SpawnChild,
 } from "./child.ts";
 import { defaultGates, type Gate, rejection } from "./gates.ts";
+import { BlackboardStore, type BlackboardRead } from "./blackboard.ts";
 import {
   canOpenAnother,
   maxConcurrentStarts,
@@ -158,6 +159,8 @@ export class TaskEngine {
   #starting = 0;
   readonly #launchLimit: number;
   readonly #launchWaiters: Array<() => void> = [];
+  /** 本会话的黑板编号（懒生成）——引擎实例 = 会话，一会话一块板 */
+  #boardId?: string;
   /** 机器规格（总内存 + 核数）：恒定，启动时读一次 */
   readonly #spec: MachineSpec;
   /** 座位上限（启动时算，此后不变） */
@@ -298,6 +301,13 @@ export class TaskEngine {
       }
       probe = { headCommit: head.headCommit };
     }
+    // 黑板：闸后、铸 id 前——开不出来就退回，不留记录不占座位。
+    let board: { boardId: string; path: string } | undefined;
+    if (input.blackboard === true) {
+      const opened = this.#openBoard();
+      if (!opened.ok) return rejection(opened.error);
+      board = opened.board;
+    }
     const taskId = randomUUID();
     const record: TaskRecord = {
       id: taskId,
@@ -317,6 +327,8 @@ export class TaskEngine {
             },
           }
         : {}),
+      // 黑板的键只在开启时出现（默认关时 Object.keys 不变）
+      ...(board ? { blackboard: board } : {}),
     };
     await this.#registry.submit({ kind: "spawn", record });
     this.#inputs.set(taskId, input);
@@ -429,6 +441,30 @@ export class TaskEngine {
   }
 
   /**
+   * 开板：确保有留痕目录、懒生成板号、写 owner.json。
+   * 开不出来 ⇒ 退回（不留记录不占座位）——闸在铸 id 前。
+   */
+  #openBoard():
+    | { ok: true; board: { boardId: string; path: string } }
+    | { ok: false; error: string } {
+    const storage = this.#storage;
+    if (!storage) return { ok: false, error: "blackboard 需要留痕目录（storage 未配置）" };
+    this.#boardId ??= randomUUID();
+    const boardId = this.#boardId;
+    const path = storage.blackboardDir(boardId);
+    try {
+      new BlackboardStore({ root: storage.blackboardsDir, boardId }).ensureOwner({
+        pid: this.#owner.pid,
+        startMs: this.#owner.startMs,
+      });
+    } catch (error) {
+      const why = error instanceof Error ? error.message : String(error);
+      return { ok: false, error: `blackboard 开板失败：${why}` };
+    }
+    return { ok: true, board: { boardId, path } };
+  }
+
+  /**
    * 启动名额内建 worktree。
    * 失败 ⇒ 返回错误（绝不降级共享 cwd、绝不 spawn）。
    * 非隔离任务 ⇒ 直接放行（没有 worktree 要建）。
@@ -472,7 +508,7 @@ export class TaskEngine {
     worktree: { path: string } | undefined,
   ): ChildHandle {
     const argv = this.#buildArgv(input);
-    const env = this.#childEnv(taskId);
+    const env = this.#childEnv(taskId, input);
     if (!worktree) {
       return this.#spawn(argv, env);
     }
@@ -489,6 +525,7 @@ export class TaskEngine {
       projectContext: input.projectContext,
       allowScripts: input.allowScripts,
       isolation: input.isolation,
+      blackboard: input.blackboard,
       sessionModel: this.#sessionModel?.(),
       piVersion: this.#piVersion,
       piPath: this.#piPath,
@@ -497,12 +534,22 @@ export class TaskEngine {
   }
 
   /** 深度 + 编号：孩子知道自己 depth 与父任务 id。 */
-  #childEnv(taskId: string): NodeJS.ProcessEnv {
-    return {
+  #childEnv(taskId: string, input: DispatchInput): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = {
       ...process.env,
       PI_DISPATCH_DEPTH: String(Number(process.env.PI_DISPATCH_DEPTH ?? 0) + 1),
       PI_DISPATCH_TASK_ID: taskId,
     };
+    // 继承来的黑板 env 一律擦掉：这块会话没开黑板就不该有板目录（G5）
+    delete env.PI_DISPATCH_BLACKBOARD_DIR;
+    delete env.PI_DISPATCH_BLACKBOARD_ID;
+    const board = this.#registry.get(taskId)?.blackboard;
+    if (input.blackboard === true && board) {
+      const boardPath = board.path;
+      env.PI_DISPATCH_BLACKBOARD_DIR = boardPath;
+      env.PI_DISPATCH_BLACKBOARD_ID = board.boardId;
+    }
+    return env;
   }
 
   /** 盯住已经起好的孩子：超时 / 卡住 / 收四样 / 定终态。 */
@@ -671,6 +718,7 @@ export class TaskEngine {
       // 隔离的键只在开启时出现（默认关时 Object.keys 不变）
       ...(record.isolation ? { isolation: record.isolation } : {}),
       ...(record.worktree ? { worktree: record.worktree } : {}),
+      ...(record.blackboard ? { blackboard: record.blackboard } : {}),
     };
   }
 
@@ -697,6 +745,7 @@ export class TaskEngine {
       // 隔离的键只在开启时出现（默认关时 Object.keys 不变）
       ...(input.isolation ? { isolation: input.isolation } : {}),
       ...(record?.worktree ? { worktree: record.worktree } : {}),
+      ...(record?.blackboard ? { blackboard: record.blackboard } : {}),
     };
   }
 
@@ -785,6 +834,45 @@ export class TaskEngine {
     storage.purgeExpiredArchive(this.#archiveTtlDays);
     // 清扫受管 worktree：有账本（热记录或归档）⇒ 保护；无账本且过期 ⇒ 非强制地清
     await this.#sweepWorktrees();
+    // 清扫黑板：活跃板整板跳过；非活跃板的笔记按 TTL 清
+    await this.#sweepBlackboards();
+  }
+
+  /**
+   * 清扫黑板。
+   * 规则：活跃板（有人在用）⇒ 整板跳过；非活跃板 ⇒ 笔记按 mtime 过 TTL 就清，
+   * 清空了的板把目录删掉。
+   */
+  async #sweepBlackboards(): Promise<void> {
+    const storage = this.#storage;
+    if (!storage) return;
+    const store = new BlackboardStore({
+      root: storage.blackboardsDir,
+      boardId: this.#boardId ?? "",
+    });
+    try {
+      store.purgeExpired({
+        ttlMs: this.#archiveTtlDays * 86_400_000,
+        isActive: (boardId) => this.#boardActive(store, boardId),
+      });
+    } catch {
+      // 清扫失败不拖垮启动——下轮再收
+    }
+  }
+
+  /**
+   * 这块板还活着吗？
+   * 两条判据：① 有非终态的记录还引用它（有人在跑）；② 它的 owner 还活着（pid + 启动时刻两个都对）且板没关。
+   */
+  #boardActive(store: BlackboardStore, boardId: string): boolean {
+    for (const record of this.#registry.list()) {
+      if (record.blackboard?.boardId !== boardId) continue;
+      if (!isTerminal(record.status)) return true;
+    }
+    const owner = store.ownerInfo(boardId);
+    if (!owner || owner.closedAt !== undefined) return false;
+    // owner 双条件判活：进程号 + 启动时刻两个都对（光看进程号会认错人）
+    return owner.startMs === processStartMs(owner.pid) && isPidAlive(owner.pid);
   }
 
   /**
@@ -838,6 +926,44 @@ export class TaskEngine {
       if (this.#registry.get(taskId)?.status !== "running") continue;
       await this.#registry.submit({ kind: "stop", id: taskId, reason: "session ended" });
       child.kill("SIGTERM");
+    }
+    // 收尾：给当前板补 closedAt（原子写）——不删任何笔记，证据留着
+    this.#closeBoard();
+  }
+
+  /** 关板：给 owner.json 补 closedAt。没开过板 ⇒ 没得关。 */
+  #closeBoard(): void {
+    const storage = this.#storage;
+    const boardId = this.#boardId;
+    if (!storage || !boardId) return;
+    try {
+      new BlackboardStore({ root: storage.blackboardsDir, boardId }).close(this.#now());
+    } catch {
+      // 关板失败不阻塞收尾
+    }
+  }
+
+  /**
+   * 父方读黑板（只读）。
+   * 缺省读当前板；给了别的编号 ⇒ 本会话没有那块板（v1 不存在跨会话板）。
+   */
+  blackboardView(
+    options: { boardId?: string; after?: string; limit?: number } = {},
+  ): BlackboardRead | { error: string } {
+    const current = this.#boardId;
+    if (options.boardId !== undefined && options.boardId !== current) {
+      return { error: "本会话没有该黑板" };
+    }
+    if (!current) return { error: "本会话还没有黑板" };
+    const storage = this.#storage;
+    if (!storage) return { error: "本会话还没有黑板" };
+    try {
+      return new BlackboardStore({ root: storage.blackboardsDir, boardId: current }).read({
+        after: options.after,
+        limit: options.limit,
+      });
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error) };
     }
   }
 }

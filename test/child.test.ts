@@ -1475,3 +1475,45 @@ test("真起进程：不给第三参时子进程在父方 cwd", async () => {
   const out = await cwdOfChild();
   assert.equal(out.trim(), realpathSync(process.cwd()), "不给 cwd 就继承父方目录");
 });
+
+// ── 黑板：strict 白名单的例外 + 附加块不动 ────────────────────────────────
+
+test("拼命令：strict + blackboard 名单含两个黑板工具", () => {
+  const argv = buildPiArgv({ task: "干活", readOnly: "strict", blackboard: true });
+  const idx = argv.indexOf("--tools");
+  assert.ok(idx >= 0, "strict 要发 --tools");
+  assert.equal(
+    argv[idx + 1],
+    "read,grep,find,ls,child_report,blackboard_read,blackboard_write",
+    "名单精确：黑板那两个接在末尾",
+  );
+});
+
+test("拼命令：黑板没开时 strict 名单一个字都不多", () => {
+  const argv = buildPiArgv({ task: "干活", readOnly: "strict" });
+  assert.equal(argv[argv.indexOf("--tools") + 1], "read,grep,find,ls,child_report");
+  const wide = buildPiArgv({ task: "干活", blackboard: true });
+  assert.ok(!wide.includes("--tools"), "宽档不因黑板收窄");
+});
+
+test("golden：开黑板时附加块逐字节不变（黑板契约全在工具描述里）", () => {
+  const off = buildPiArgv({ task: "干活", why: "为什么" });
+  const on = buildPiArgv({ task: "干活", why: "为什么", blackboard: true });
+  const blockOf = (argv: string[]): string => argv[argv.indexOf("--append-system-prompt") + 1]!;
+  assert.equal(blockOf(on), blockOf(off), "开黑板不改附加块");
+  assert.equal(blockOf(on), FROZEN_APPEND_BLOCK_WITH_WHY, "附加块与冻结字面量逐字节相等");
+  assert.ok(!blockOf(on).includes("黑板"), "附加块里不出现黑板段");
+});
+
+test("收据：黑板写带上 args.command 也不进 commands", () => {
+  const stream = [
+    JSON.stringify({
+      type: "tool_execution_start",
+      toolName: "blackboard_write",
+      args: { text: "留言", command: "rm -rf /" },
+    }),
+  ].join("\n");
+  const parsed = parseChildStream(stream);
+  assert.deepEqual(parsed.delivery.commands, [], "黑板写不是跑命令");
+  assert.equal(parsed.delivery.tools.blackboard_write, 1, "工具照记");
+});

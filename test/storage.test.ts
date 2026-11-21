@@ -388,6 +388,14 @@ test("golden：默认关——桶里没有 worktrees 目录", () => {
   assert.equal(existsSync(join(bucketRoot, "worktrees")), false, "隔离没开就不建这个目录");
 });
 
+test("golden：默认关——桶里没有 blackboards 目录", () => {
+  const { storage } = freshStorage();
+  storage.persistRecord(record("a"));
+  storage.persistOutput("a", "x");
+  const bucketRoot = storage.recordPath("a").replace(/records.*$/, "");
+  assert.equal(existsSync(join(bucketRoot, "blackboards")), false, "黑板没开就不建这个目录");
+});
+
 test("worktree：路径落在受管根下，编号不安全时抛", () => {
   const { storage } = freshStorage();
   const path = storage.worktreePath("task-1");

@@ -682,9 +682,11 @@ const CASES: Breakpoint[] = [
     file: "src/index.ts",
     from: `    if (Number(process.env.PI_DISPATCH_DEPTH ?? 0) > 0) {
       registerChildReportTool(pi);
+      registerBlackboardTools(pi);
       return;
     }`,
     to: `    if (Number(process.env.PI_DISPATCH_DEPTH ?? 0) > 0) {
+      registerBlackboardTools(pi);
       return;
     }`,
     test: "test/adapter.test.ts",
@@ -1195,6 +1197,97 @@ const CASES: Breakpoint[] = [
     test: "test/worktree.test.ts",
     red: "清扫：手工删掉的目录不重建，只清元数据",
     why: "手工删掉的工作区被算成「我们删掉了目录」——计数撒谎，也掩盖了「我们没重建」",
+  },
+  // ── 黑板 ────────────────────────────────────────────────────────────────
+  {
+    feature: "黑板 env 注入",
+    file: "src/core/engine.ts",
+    from: "env.PI_DISPATCH_BLACKBOARD_DIR = boardPath;",
+    to: "void 0;",
+    test: "test/engine.test.ts",
+    red: "引擎：开黑板的孩子 env 里有板目录",
+    why: "孩子拿不到板目录——开了黑板也读不到兄弟的留言",
+  },
+  {
+    feature: "继承 env 必擦",
+    file: "src/core/engine.ts",
+    from: "delete env.PI_DISPATCH_BLACKBOARD_DIR;",
+    to: "void env.PI_DISPATCH_BLACKBOARD_DIR;",
+    test: "test/engine.test.ts",
+    red: "引擎：默认关——继承来的黑板 env 被擦除",
+    why: "父进程预置的黑板 env 漏进孩子——没开黑板的孩子拿到了别人的板目录",
+  },
+  {
+    feature: "黑板作者服务端盖章",
+    file: "src/index.ts",
+    from: '      const author = process.env.PI_DISPATCH_TASK_ID ?? "unknown";',
+    to: '      const author = "unknown";',
+    test: "test/adapter.test.ts",
+    red: "黑板：作者取自 env，参数伪造不了",
+    why: "作者写死——留言都成了同一个人签的，兄弟之间分不出谁说的",
+  },
+  {
+    feature: "黑板 trust 恒 unverified",
+    file: "src/core/blackboard.ts",
+    from: "      trust: TRUST,\n      notes: window,",
+    to: '      trust: "verified" as typeof TRUST,\n      notes: window,',
+    test: "test/blackboard.test.ts",
+    red: "黑板：文件自报的 trust 与多余字段不作数",
+    why: "板上的话被标成已核实——兄弟子代理的谎话被当成事实",
+  },
+  {
+    feature: "黑板活跃板不清",
+    file: "src/core/blackboard.ts",
+    from: "if (isActive(boardId)) continue;",
+    to: "if (false) continue;",
+    test: "test/blackboard.test.ts",
+    red: "黑板：活跃板一条笔记都不清",
+    why: "有人正在用的板被清掉——在飞的兄弟之间丢了留言",
+  },
+  {
+    feature: "黑板 TTL 生效",
+    file: "src/core/blackboard.ts",
+    from: "if (now - mtimeMs > ttlMs) {",
+    to: "if (false) {",
+    test: "test/blackboard.test.ts",
+    red: "黑板：TTL 边界——正好到期留着，过了 1ms 就清",
+    why: "死板的笔记永不清理——磁盘只增不减",
+  },
+  {
+    feature: "黑板笔记原子写",
+    file: "src/core/blackboard.ts",
+    from: "renameSync(tmp, final);",
+    to: "void tmp;",
+    test: "test/blackboard.test.ts",
+    red: "黑板：先 .tmp 后 rename，不留半个 JSON",
+    why: "写到一半崩了，磁盘上留半个 JSON——读的时候被当坏文件",
+  },
+  {
+    feature: "黑板坏笔记不毒化",
+    file: "src/core/blackboard.ts",
+    from: "errors += 1;",
+    to: "errors += 0;",
+    test: "test/blackboard.test.ts",
+    red: "黑板：坏 JSON 与 .tmp 计入 errors，其余照读",
+    why: "坏文件不记错——父方看不到板上读漏了东西",
+  },
+  {
+    feature: "strict 白名单收编黑板工具",
+    file: "src/core/child.ts",
+    from: "...(options.blackboard ? [BLACKBOARD_READ, BLACKBOARD_WRITE] : [])",
+    to: "...([] as string[])",
+    test: "test/child.test.ts",
+    red: "拼命令：strict + blackboard 名单含两个黑板工具",
+    why: "strict 孩子被白名单砍掉黑板工具——只读子代理没法跟兄弟交换信息",
+  },
+  {
+    feature: "黑板写不算跑过命令",
+    file: "src/core/child.ts",
+    from: 'if (toolName !== "bash") return;',
+    to: 'if (toolName === "bash") return;',
+    test: "test/child.test.ts",
+    red: "收据：黑板写带上 args.command 也不进 commands",
+    why: "黑板留言被记成跑过的命令——自检对质拿留言当证据",
   },
 ];
 

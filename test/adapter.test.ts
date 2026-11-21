@@ -74,6 +74,7 @@ test("适配层：session_start 触发两次后，turn_end 只剩 1 个 handler"
     assert.equal(handlers.get("turn_end")!.size, 1, "turn_end 不能累积");
     assert.equal(handlers.get("session_shutdown")!.size, 1, "session_shutdown 不能累积");
     assert.deepEqual([...tools.keys()].sort(), [
+      "dispatch_blackboard",
       "dispatch_list",
       "dispatch_read",
       "dispatch_stop",
@@ -544,4 +545,141 @@ test("适配层：空仓（还没提交）⇒ HEAD 不存在，不算可用 git 
   const root = resolveRepoRoot(empty);
   assert.ok(root !== undefined, "空仓也问得出根");
   assert.equal(isGitRepoAt(root), false, "钉不住 base ⇒ 隔离能力关着");
+});
+
+// ── 黑板：父方工具 / 孩子的黑板工具 / schema ──────────────────────────────
+
+/** 装一个子代理进程（depth>0），在它活着的时候跑 fn（env 在 fn 期间保持不变）。 */
+async function withChildTools<T>(
+  env: Record<string, string | undefined>,
+  fn: (tools: Map<string, unknown>) => Promise<T>,
+): Promise<T> {
+  const old = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(env)) {
+    old.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  try {
+    const { pi, handlers, tools } = fakePi();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    entry(pi as any);
+    await [...(handlers.get("session_start") ?? [])][0]!(undefined, fakeCtx(process.cwd()));
+    return await fn(tools);
+  } finally {
+    for (const [key, value] of old) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+test("适配层：depth>0 时有黑板 env 才注册黑板工具", async () => {
+  const plain = await withChildTools({ PI_DISPATCH_DEPTH: "1" }, async (tools) => tools);
+  assert.deepEqual([...plain.keys()], ["child_report"], "没开黑板 ⇒ 孩子的工具表不变");
+
+  const boardRoot = mkdtempSync(join(tmpdir(), "dispatch-board-"));
+  const boardId = "11111111-2222-4333-8444-555555555555";
+  const tools = await withChildTools(
+    {
+      PI_DISPATCH_DEPTH: "1",
+      PI_DISPATCH_BLACKBOARD_DIR: join(boardRoot, boardId),
+      PI_DISPATCH_BLACKBOARD_ID: boardId,
+      PI_DISPATCH_TASK_ID: "task-123",
+    },
+    async (t) => t,
+  );
+  assert.deepEqual(
+    [...tools.keys()].sort(),
+    ["blackboard_read", "blackboard_write", "child_report"],
+    "开了黑板 ⇒ 多两个黑板工具",
+  );
+});
+
+test("黑板：作者取自 env，参数伪造不了", async () => {
+  const boardRoot = mkdtempSync(join(tmpdir(), "dispatch-board-"));
+  const boardId = "11111111-2222-4333-8444-555555555555";
+  await withChildTools(
+    {
+      PI_DISPATCH_DEPTH: "1",
+      PI_DISPATCH_BLACKBOARD_DIR: join(boardRoot, boardId),
+      PI_DISPATCH_BLACKBOARD_ID: boardId,
+      PI_DISPATCH_TASK_ID: "task-123",
+    },
+    async (tools) => {
+      const write = tools.get("blackboard_write") as {
+        execute: (id: string, args: unknown) => Promise<{ content: Array<{ text: string }> }>;
+      };
+      const out = await write.execute("call_1", {
+        text: "我看到 X 了",
+        author: "冒充的",
+        trust: "verified",
+      });
+      const payload = JSON.parse(out.content[0]!.text) as {
+        ok: boolean;
+        note?: { author: string; text: string };
+      };
+      assert.equal(payload.ok, true);
+      assert.equal(payload.note?.author, "task-123", "作者取自 env，参数伪造不了");
+      assert.equal(payload.note?.text, "我看到 X 了");
+
+      const read = tools.get("blackboard_read") as {
+        execute: (id: string, args: unknown) => Promise<{ content: Array<{ text: string }> }>;
+      };
+      const readOut = await read.execute("call_2", {});
+      const readPayload = JSON.parse(readOut.content[0]!.text) as {
+        trust: string;
+        notes: Array<{ text: string; author: string }>;
+      };
+      assert.equal(readPayload.trust, "unverified", "板上的话一律未核实");
+      assert.equal(readPayload.notes[0]?.text, "我看到 X 了");
+      assert.equal(readPayload.notes[0]?.author, "task-123");
+    },
+  );
+});
+
+test("适配层：父方有 dispatch_blackboard 工具（只读）", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dispatch-adapter-bb2-"));
+  const oldHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const { pi, handlers, tools } = fakePi();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    entry(pi as any);
+    await [...(handlers.get("session_start") ?? [])][0]!(undefined, fakeCtx(home));
+    assert.ok(tools.has("dispatch_blackboard"), "父方要能读黑板");
+    const def = tools.get("dispatch_blackboard") as {
+      execute: (id: string, args: unknown) => Promise<{ content: Array<{ text: string }> }>;
+    };
+    const out = await def.execute("call_1", {});
+    const payload = JSON.parse(out.content[0]!.text) as { error?: string };
+    assert.match(payload.error ?? "", /本会话还没有黑板/);
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+  }
+});
+
+test("适配层：dispatch_task 的 schema 有 blackboard", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dispatch-adapter-bb3-"));
+  const oldHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const { pi, handlers, tools } = fakePi();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    entry(pi as any);
+    await [...(handlers.get("session_start") ?? [])][0]!(undefined, fakeCtx(home));
+    const def = tools.get("dispatch_task") as {
+      parameters: { properties: Record<string, { type: string; description: string }> };
+    };
+    const blackboard = def.parameters.properties.blackboard!;
+    assert.equal(blackboard.type, "boolean");
+    assert.match(blackboard.description, /本会话/, "共享范围写清楚");
+    assert.match(blackboard.description, /不可信/, "兄弟的话不可信");
+    assert.match(blackboard.description, /strict/, "strict 例外写清楚");
+    assert.match(blackboard.description, /策略/, "要不要开是父级策略");
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+  }
 });

@@ -44,6 +44,11 @@ export function isSafeTaskId(taskId: string): boolean {
   return !taskId.includes("/") && !taskId.includes("\\") && !taskId.includes("..");
 }
 
+/** 板编号会拼进路径——只认 UUID 的字符集，其余一律拒绝（防路径拼接）。 */
+export function isSafeBoardId(boardId: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(boardId);
+}
+
 /** 项目桶下的目录布局。 */
 export interface StoragePaths {
   recordsDir: string;
@@ -51,6 +56,8 @@ export interface StoragePaths {
   archiveDir: string;
   /** 受管 worktree 的根目录。默认不建（隔离没开就不该有这个目录）。 */
   worktreesDir: string;
+  /** 受管黑板的根目录。默认不建（黑板没开就不该有这个目录）。 */
+  blackboardsDir: string;
 }
 
 export class Storage {
@@ -67,6 +74,7 @@ export class Storage {
       tasksDir: join(base, "tasks"),
       archiveDir: join(base, "archive"),
       worktreesDir: join(base, "worktrees"),
+      blackboardsDir: join(base, "blackboards"),
     };
   }
 
@@ -88,6 +96,17 @@ export class Storage {
   worktreePath(taskId: string): string {
     if (!isSafeTaskId(taskId)) throw new Error(`invalid task id: ${taskId}`);
     return join(this.#paths.worktreesDir, taskId);
+  }
+
+  /** 受管黑板的根目录（板们都在这儿底下）。默认不建。 */
+  get blackboardsDir(): string {
+    return this.#paths.blackboardsDir;
+  }
+
+  /** 受管黑板的落点：<桶>/blackboards/<boardId>。目录默认不建（用时由黑板自己建）。 */
+  blackboardDir(boardId: string): string {
+    if (!isSafeBoardId(boardId)) throw new Error(`invalid board id: ${boardId}`);
+    return join(this.#paths.blackboardsDir, boardId);
   }
 
   #ensureDirs(): void {
