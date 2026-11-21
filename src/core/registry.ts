@@ -49,6 +49,52 @@ export interface CommandResult {
   changed: boolean;
 }
 
+type AttachWorktreeCommand = Extract<TaskCommand, { kind: "attach-worktree" }>;
+type ResolveExitCommand = Extract<TaskCommand, { kind: "resolve-exit" }>;
+
+/**
+ * worktree 回执：磁盘观测事实，不是生命周期——全状态可写（含终态），永不改 status。
+ * 终态上的迟到写入是崩溃恢复对账，无害。
+ * 返回新记录（记录不可变），changed 恒真（每次都换一个对象）。
+ */
+export function applyAttachWorktree(
+  current: TaskRecord,
+  command: AttachWorktreeCommand,
+): CommandResult {
+  const next: TaskRecord = { ...current, worktree: command.worktree };
+  return { record: next, fromStatus: current.status, changed: next !== current };
+}
+
+/**
+ * resolve-exit 的判定：
+ *   stopping（建盘/等启动名额期间被叫停）⇒ canceled（notStarted 清 startedAt）；
+ *   running ⇒ succeeded / failed（notStarted 清 startedAt；非零退出的死因进 stopReason）；
+ *   终态 ⇒ undefined（迟到消息静默丢弃）。
+ * 只算「去哪 + 补什么」，真正的写入仍由 #move 在写锁内做。
+ */
+export function applyResolveExit(
+  current: TaskRecord,
+  command: ResolveExitCommand,
+): { to: TaskStatus; patch: Partial<TaskRecord> } | undefined {
+  if (current.status === "stopping") {
+    return { to: "canceled", patch: command.notStarted ? { startedAt: undefined } : {} };
+  }
+  if (current.status === "running") {
+    return {
+      to: command.exitCode === 0 ? "succeeded" : "failed",
+      patch: {
+        // 孩子压根没起（建 worktree 失败 / 等名额被叫停）：startedAt 要清——
+        // 记录里 startedAt 有值必须恒等于「孩子真起过」。
+        ...(command.notStarted ? { startedAt: undefined } : {}),
+        exitCode: command.exitCode,
+        // 孩子自己非零退出：死因进 stopReason——errorMessage 第一行才可读（模型和调用方最先读它）
+        ...(command.exitCode !== 0 && command.detail ? { stopReason: command.detail } : {}),
+      },
+    };
+  }
+  return undefined;
+}
+
 /** 记录的唯一合法写入者。判定在写锁内做，命令不点名目标终态。 */
 export class TaskRegistry {
   readonly #records = new Map<string, TaskRecord>();
@@ -132,22 +178,9 @@ export class TaskRegistry {
       }
       case "resolve-exit": {
         const current = this.#require(command.id);
-        if (current.status === "stopping") {
-          // 建盘期间被叫停：孩子压根没起 ⇒ 与 running 分支同款，startedAt 要清。
-          const patch: Partial<TaskRecord> = command.notStarted ? { startedAt: undefined } : {};
-          return this.#move(command.id, "canceled", patch);
-        }
-        if (current.status === "running") {
-          return this.#move(command.id, command.exitCode === 0 ? "succeeded" : "failed", {
-            // 孩子压根没起（建 worktree 失败）：startedAt 要清——
-            // 记录里 startedAt 有值必须恒等于「孩子真起过」。
-            ...(command.notStarted ? { startedAt: undefined } : {}),
-            exitCode: command.exitCode,
-            // 孩子自己非零退出：死因进 stopReason——errorMessage 第一行才可读（模型和调用方最先读它）
-            ...(command.exitCode !== 0 && command.detail ? { stopReason: command.detail } : {}),
-          });
-        }
-        return { record: current, fromStatus: current.status, changed: false };
+        const next = applyResolveExit(current, command);
+        if (!next) return { record: current, fromStatus: current.status, changed: false };
+        return this.#move(command.id, next.to, next.patch);
       }
       case "reconcile-lost":
         return this.#move(command.id, "lost", { stopReason: command.reason });
@@ -171,13 +204,11 @@ export class TaskRegistry {
         return { record: next, fromStatus: current.status, changed: true };
       }
       case "attach-worktree": {
-        // worktree 回执是磁盘观测事实，不是生命周期：全状态可写（含终态），
-        // 永不改 status（终态上补写是崩溃恢复对账，无害）。
         const current = this.#require(command.id);
-        const next: TaskRecord = { ...current, worktree: command.worktree };
-        this.#records.set(command.id, next);
-        this.#emit(next, current);
-        return { record: next, fromStatus: current.status, changed: next !== current };
+        const next = applyAttachWorktree(current, command);
+        this.#records.set(command.id, next.record);
+        this.#emit(next.record, current);
+        return next;
       }
       case "attach-output": {
         // 产出路径挂记录：任务链的「产出」锚点；终态上的迟到写入静默丢弃

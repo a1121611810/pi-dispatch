@@ -13,6 +13,13 @@
 //   （读 #ending）拒掉，#teardown 是第二道防线；默认闸口下不可达 ⇒ 等价。
 //   shutdown 循环里 `this.#registry.get(taskId)?.status` 的 ?. → .——在跑的孩子必有记录
 //   （记录只在终态后才被挤掉），get 不会返回 undefined ⇒ 等价。
+//   src/core/engine.ts（抽出的模块级函数）：
+//     childEnvFor 的 `baseEnv.PI_DISPATCH_DEPTH ?? 0` → `||`——ProcessEnv 的值是
+//     string | undefined：undefined 两向都取 0；非空串（含 "0"）两向都取该串；
+//     "" 两向都取 0（Number("")）⇒ 可达输入上等价。
+//     构造器里 `process.env.PI_DISPATCH_DEPTH ?? 0` → `||` 同理。
+//     构造器里 `deps.isGitRepo ?? (() => false)` → `||`——函数恒真，两向给同一个谓词 ⇒ 等价。
+//     （默认谓词 `() => false` → `true` 不等价，已由「没注入 isGitRepo ⇒ 默认不许开隔离」杀掉。）
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -26,7 +33,14 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TaskEngine } from "../src/core/engine.ts";
+import {
+  TaskEngine,
+  boardIsActive,
+  childEnvFor,
+  openBoardState,
+  pinBaseCommit,
+} from "../src/core/engine.ts";
+import { BlackboardStore } from "../src/core/blackboard.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
 import { batchBySize, NotificationCenter } from "../src/core/notifications.ts";
 import { Storage, processStartMs } from "../src/core/storage.ts";
@@ -2139,6 +2153,118 @@ test("引擎：没开黑板 ⇒ 记录与结果里都没有黑板的键", async 
   const taskId = (outcome as { taskId: string }).taskId;
   assert.ok(!Object.keys(registry.get(taskId) ?? {}).includes("blackboard"));
   assert.ok(!("blackboard" in (outcome as Record<string, unknown>)));
+});
+
+test("引擎：等启动名额时被叫停 ⇒ 一次性宿主以 canceled 返回，不挂住", async () => {
+  const { project, storage } = isolationStorage();
+  const git = gatedGit();
+  const { registry, engine } = freshEngine({
+    machineReader: machineReader(5369 * MiB, 1), // 1 核 ⇒ 启动名额 1
+    storage,
+    git: git.runner,
+    repoRoot: project,
+    isGitRepo: () => true,
+    spawn: recordingSpawn([]) as never,
+    hostMode: "one-shot",
+  });
+  // A 占住唯一名额（建盘卡住）；一次性宿主会一直等 A 的终态，先别 await。
+  const a = engine.dispatch({ task: "A", isolation: "worktree" });
+  await git.waitForAdds(1);
+  // B 也走一次性宿主：记录转 running 后挂在启动名额上。
+  const b = engine.dispatch({ task: "B" });
+  let bId = "";
+  for (let i = 0; i < 200 && !bId; i++) {
+    bId = registry.list().find((r) => r.task === "B")?.id ?? "";
+    if (!bId) await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.ok(bId, "B 已入队");
+  await waitForStatus(registry, bId, "running");
+  await engine.stop(bId, "等名额时叫停");
+  // 放行 A ⇒ 名额还给 B ⇒ 走「等启动名额时被叫停」分支。
+  await git.releaseNextAdd();
+  // 缺陷表现：该分支不落终态 ⇒ B 的 promise 永不 resolve。2s 护栏把「挂住」变成失败。
+  let guard!: NodeJS.Timeout;
+  const timeout = new Promise<never>((_, reject) => {
+    guard = setTimeout(() => reject(new Error("dispatch 挂住了：记录停在 stopping")), 2000);
+  });
+  try {
+    const outcome = (await Promise.race([b, timeout])) as { status: string };
+    assert.equal(outcome.status, "canceled", "一次性宿主拿到 canceled，而不是永远等");
+    assert.equal(outcome.started, false);
+    assert.equal(registry.get(bId)?.status, "canceled", "记录不停在 stopping");
+  } finally {
+    clearTimeout(guard);
+  }
+  await a;
+});
+
+test("引擎：childEnvFor——有板注入两键，没板把继承来的两键擦掉", () => {
+  const base = {
+    PI_DISPATCH_DEPTH: "2",
+    PI_DISPATCH_BLACKBOARD_DIR: "/inherited/board",
+    PI_DISPATCH_BLACKBOARD_ID: "inherited",
+  };
+  const withBoard = childEnvFor(base, "t1", { boardId: "b1", path: "/boards/b1" });
+  assert.equal(withBoard.PI_DISPATCH_DEPTH, "3");
+  assert.equal(withBoard.PI_DISPATCH_TASK_ID, "t1");
+  assert.equal(withBoard.PI_DISPATCH_BLACKBOARD_DIR, "/boards/b1");
+  assert.equal(withBoard.PI_DISPATCH_BLACKBOARD_ID, "b1");
+  const without = childEnvFor(base, "t2");
+  assert.equal(without.PI_DISPATCH_DEPTH, "3");
+  assert.equal(without.PI_DISPATCH_BLACKBOARD_DIR, undefined, "继承来的板目录要擦掉");
+  assert.equal(without.PI_DISPATCH_BLACKBOARD_ID, undefined, "继承来的板号要擦掉");
+  assert.equal(base.PI_DISPATCH_BLACKBOARD_ID, "inherited", "不改入参");
+  // depth 缺失时从 0 起算（不是 1）
+  assert.equal(childEnvFor({}, "t0").PI_DISPATCH_DEPTH, "1");
+});
+
+test("引擎：openBoardState——没留痕目录就算失败", () => {
+  const result = openBoardState(undefined, { pid: 1, startMs: 1 }, "board-1");
+  assert.equal(result.ok, false);
+  assert.match((result as { error: string }).error, /storage/);
+});
+
+test("引擎：boardIsActive——owner 双条件判活、关板/无 owner 判死、非终态引用判活", () => {
+  const { storage } = isolationStorage();
+  const boardId = "aaaaaaaa-2222-4333-8444-555555555555";
+  const store = new BlackboardStore({ root: storage.blackboardsDir, boardId });
+  const liveStart = processStartMs(process.pid) ?? 0;
+  assert.equal(boardIsActive([], store, boardId), false, "没有 owner ⇒ 死板");
+  store.ensureOwner({ pid: process.pid, startMs: liveStart });
+  assert.equal(boardIsActive([], store, boardId), true, "owner 双条件对上 ⇒ 活板");
+  const noBoard = { id: "plain", status: "running" as const, task: "t" };
+  assert.equal(
+    boardIsActive([noBoard], store, boardId),
+    true,
+    "没开黑板的记录不绊倒判活（读 owner）",
+  );
+  store.close(1);
+  assert.equal(boardIsActive([], store, boardId), false, "已关板 ⇒ 死板（即便 owner 还活着）");
+  const record = {
+    id: "q",
+    status: "queued" as const,
+    task: "t",
+    blackboard: { boardId, path: "/x" },
+  };
+  assert.equal(boardIsActive([record], store, boardId), true, "非终态引用 ⇒ 活板");
+  const otherBoard = { ...record, blackboard: { boardId: "other", path: "/y" } };
+  assert.equal(boardIsActive([otherBoard], store, boardId), false, "别的板不算");
+});
+
+test("引擎：没注入 isGitRepo ⇒ 默认不许开隔离（缺省配置不做没把握的事）", async () => {
+  const { project, storage } = isolationStorage();
+  const { registry, engine } = freshEngine({ storage, repoRoot: project, hostMode: "one-shot" });
+  const outcome = await engine.dispatch({ task: "干活", isolation: "worktree" });
+  assert.equal((outcome as { status: string }).status, "rejected");
+  assert.match((outcome as { errorMessage: string }).errorMessage, /git 仓库/);
+  assert.equal(registry.list().length, 0);
+});
+
+test("引擎：pinBaseCommit——git 读 HEAD 失败要把原因带回来", async () => {
+  const failing: GitRunner = async () => ({ code: 128, stdout: "", stderr: "fatal: not a repo" });
+  const result = await pinBaseCommit(failing, "/repo");
+  assert.equal(result.ok, false);
+  assert.match((result as { error: string }).error, /not a repo|HEAD/);
 });
 
 test("引擎：boot 清扫黑板——活板一条不动，死板的过期笔记清掉", async () => {

@@ -232,8 +232,8 @@ const CASES: Breakpoint[] = [
   {
     feature: "退出码 0 是成了",
     file: "src/core/registry.ts",
-    from: '          return this.#move(command.id, command.exitCode === 0 ? "succeeded" : "failed", {',
-    to: '          return this.#move(command.id, command.exitCode === 1 ? "succeeded" : "failed", {',
+    from: '      to: command.exitCode === 0 ? "succeeded" : "failed",',
+    to: '      to: command.exitCode === 1 ? "succeeded" : "failed",',
     test: "test/core-logic.test.ts",
     red: "状态机：queued → running → succeeded 走通",
     why: "跑成功却记成失败",
@@ -241,8 +241,8 @@ const CASES: Breakpoint[] = [
   {
     feature: "叫停过的收完算取消",
     file: "src/core/registry.ts",
-    from: '          return this.#move(command.id, "canceled", patch);',
-    to: '          return this.#move(command.id, "failed", patch);',
+    from: '    return { to: "canceled", patch: command.notStarted ? { startedAt: undefined } : {} };',
+    to: '    return { to: "failed", patch: command.notStarted ? { startedAt: undefined } : {} };',
     test: "test/core-logic.test.ts",
     red: "状态机：stopping 的子代理收完算 canceled",
     why: "用户主动停的显示成失败",
@@ -1127,6 +1127,23 @@ const CASES: Breakpoint[] = [
     why: "叫停分支与 finally 各还一次 ⇒ #starting 变负，启动节流超发",
   },
   {
+    feature: "等名额被叫停要落终态",
+    file: "src/core/engine.ts",
+    from: `        const r = await this.#registry
+          .submit({
+            kind: "resolve-exit",
+            id: taskId,
+            exitCode: -1,
+            notStarted: true,
+            detail: "等启动名额时被叫停",
+          })
+          .catch(() => undefined);`,
+    to: "        const r = undefined;",
+    test: "test/engine.test.ts",
+    red: "引擎：等启动名额时被叫停 ⇒ 一次性宿主以 canceled 返回，不挂住",
+    why: "叫停分支不 submit resolve-exit ⇒ 记录永远停在 stopping，一次性宿主在 #awaitTerminal 上永久挂住",
+  },
+  {
     feature: "notStarted 清 startedAt",
     file: "src/core/registry.ts",
     from: "...(command.notStarted ? { startedAt: undefined } : {})",
@@ -1220,8 +1237,8 @@ const CASES: Breakpoint[] = [
   {
     feature: "黑板 env 注入",
     file: "src/core/engine.ts",
-    from: "env.PI_DISPATCH_BLACKBOARD_DIR = boardPath;",
-    to: "void 0;",
+    from: "env.PI_DISPATCH_BLACKBOARD_DIR = blackboard.path;",
+    to: "void blackboard.path;",
     test: "test/engine.test.ts",
     red: "引擎：开黑板的孩子 env 里有板目录",
     why: "孩子拿不到板目录——开了黑板也读不到兄弟的留言",

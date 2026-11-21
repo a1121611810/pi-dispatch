@@ -128,6 +128,135 @@ function definedOnly<T extends object>(source: T): Partial<T> {
   ) as Partial<T>;
 }
 
+// ── 确定性逻辑（模块级函数）─────────────────────────────────────────────────
+// 抽到模块级的理由：变异器只看得到模块级 defn；类私有 # 方法在变异账本里零站点。
+// 这里只做「解析 / 判定 / 组装」，编排与副作用留在类方法里（类方法只做薄封装）。
+
+/** 受理时钉 base：读仓库当前的 HEAD。读不到就返回失败（引擎据此退回，不留痕）。 */
+export async function pinBaseCommit(
+  git: GitRunner,
+  repoRoot: string | undefined,
+): Promise<{ ok: true; headCommit: string } | { ok: false; error: string }> {
+  if (!repoRoot) return { ok: false, error: "不知道 git 仓库根（repoRoot 未注入）" };
+  try {
+    const headCommit = await resolveHead(git, repoRoot);
+    return { ok: true, headCommit };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * 开板：确保有留痕目录、写 owner.json。
+ * 开不出来 ⇒ 退回（不留记录不占座位）——闸在铸 id 前。
+ */
+export function openBoardState(
+  storage: Storage | undefined,
+  owner: { pid: number; startMs: number },
+  boardId: string,
+): { ok: true; board: { boardId: string; path: string } } | { ok: false; error: string } {
+  if (!storage) return { ok: false, error: "blackboard 需要留痕目录（storage 未配置）" };
+  const path = storage.blackboardDir(boardId);
+  try {
+    new BlackboardStore({ root: storage.blackboardsDir, boardId }).ensureOwner(owner);
+  } catch (error) {
+    const why = error instanceof Error ? error.message : String(error);
+    return { ok: false, error: `blackboard 开板失败：${why}` };
+  }
+  return { ok: true, board: { boardId, path } };
+}
+
+/**
+ * 启动名额内建 worktree。
+ * 失败 ⇒ 返回错误（绝不降级共享 cwd、绝不 spawn）。
+ * 非隔离任务 ⇒ 直接放行（没有 worktree 要建）。
+ */
+export async function prepareIsolationFor(
+  git: GitRunner,
+  repoRoot: string,
+  record: TaskRecord | undefined,
+): Promise<
+  | { ok: true; worktree?: { path: string; branch: string; baseCommit: string } }
+  | { ok: false; error: string }
+> {
+  if (record?.isolation !== "worktree") return { ok: true };
+  const base = record.worktree;
+  if (!base) return { ok: false, error: "记录里没有 worktree 基线" };
+  const created = await createWorktree(git, {
+    repoRoot,
+    path: base.path,
+    branch: base.branch,
+    baseCommit: base.baseCommit,
+  });
+  if (!created.ok) {
+    return { ok: false, error: created.error ?? "worktree 创建失败" };
+  }
+  return {
+    ok: true,
+    worktree: { path: base.path, branch: base.branch, baseCommit: base.baseCommit },
+  };
+}
+
+/** 深度 + 编号：孩子知道自己 depth 与父任务 id；继承来的黑板 env 一律擦掉（G5）。 */
+export function childEnvFor(
+  baseEnv: NodeJS.ProcessEnv,
+  taskId: string,
+  blackboard?: { boardId: string; path: string },
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...baseEnv,
+    PI_DISPATCH_DEPTH: String(Number(baseEnv.PI_DISPATCH_DEPTH ?? 0) + 1),
+    PI_DISPATCH_TASK_ID: taskId,
+  };
+  // 继承来的黑板 env 一律擦掉：这块会话没开黑板就不该有板目录（G5）
+  delete env.PI_DISPATCH_BLACKBOARD_DIR;
+  delete env.PI_DISPATCH_BLACKBOARD_ID;
+  if (blackboard) {
+    env.PI_DISPATCH_BLACKBOARD_DIR = blackboard.path;
+    env.PI_DISPATCH_BLACKBOARD_ID = blackboard.boardId;
+  }
+  return env;
+}
+
+/** 观测 worktree：只取磁盘事实；观测不到 ≠ 干净（dirty 不兜 0）。 */
+export async function captureWorktreeFor(
+  git: GitRunner,
+  worktree: { path: string; branch: string; baseCommit: string },
+): Promise<WorktreeInfo> {
+  const probe = await observeWorktree(git, worktree);
+  return {
+    path: probe.path,
+    branch: probe.branch,
+    baseCommit: probe.baseCommit,
+    headCommit: probe.headCommit,
+    // 观测不到 ≠ 干净：观测不到就留空，绝不兜 0
+    dirty: probe.dirty,
+    onExpectedBranch: probe.onExpectedBranch,
+    commitsAhead: probe.commitsAhead,
+    missing: probe.missing,
+    captureError: probe.captureError,
+  };
+}
+
+/**
+ * 这块板还活着吗？
+ * 两条判据：① 有非终态的记录还引用它（有人在跑）；② 它的 owner 还活着（pid + 启动时刻两个都对）且板没关。
+ */
+export function boardIsActive(
+  records: readonly TaskRecord[],
+  store: BlackboardStore,
+  boardId: string,
+): boolean {
+  for (const record of records) {
+    if (record.blackboard?.boardId !== boardId) continue;
+    if (!isTerminal(record.status)) return true;
+  }
+  const owner = store.ownerInfo(boardId);
+  if (!owner || owner.closedAt !== undefined) return false;
+  // owner 双条件判活：进程号 + 启动时刻两个都对（光看进程号会认错人）
+  return owner.startMs === processStartMs(owner.pid) && isPidAlive(owner.pid);
+}
+
 export class TaskEngine {
   readonly #registry: TaskRegistry;
   readonly #gates: Gate[];
@@ -398,11 +527,23 @@ export class TaskEngine {
     try {
       const beforeSpawn = this.#registry.get(taskId);
       if (!beforeSpawn || beforeSpawn.status !== "running") {
+        // 记录已转 stopping（stop 命令先走一步）；不补这张 resolve-exit，
+        // 记录会永远停在 stopping——一次性宿主的 #awaitTerminal 永久挂住。
+        const r = await this.#registry
+          .submit({
+            kind: "resolve-exit",
+            id: taskId,
+            exitCode: -1,
+            notStarted: true,
+            detail: "等启动名额时被叫停",
+          })
+          .catch(() => undefined);
+        if (r) this.#notifyTerminal(r.record);
         return this.#notStartedResult(taskId, input, "等启动名额时被叫停", "canceled");
       }
       // 启动名额内建 worktree：建不出来 ⇒ 失败。
       // 绝不降级共享 cwd、绝不 spawn（孩子在共享目录里干活比失败更糟）。
-      const prepared = await this.#prepareWorktree(taskId, input);
+      const prepared = await this.#prepareWorktree(taskId);
       if (!prepared.ok) {
         const r = await this.#registry
           .submit({
@@ -455,14 +596,8 @@ export class TaskEngine {
   }
 
   /** 受理时钉 base：读仓库当前的 HEAD。读不到就返回失败（引擎据此退回，不留痕）。 */
-  async #pinBase(): Promise<{ ok: true; headCommit: string } | { ok: false; error: string }> {
-    if (!this.#repoRoot) return { ok: false, error: "不知道 git 仓库根（repoRoot 未注入）" };
-    try {
-      const headCommit = await resolveHead(this.#git, this.#repoRoot);
-      return { ok: true, headCommit };
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
+  #pinBase(): Promise<{ ok: true; headCommit: string } | { ok: false; error: string }> {
+    return pinBaseCommit(this.#git, this.#repoRoot);
   }
 
   /**
@@ -472,21 +607,8 @@ export class TaskEngine {
   #openBoard():
     | { ok: true; board: { boardId: string; path: string } }
     | { ok: false; error: string } {
-    const storage = this.#storage;
-    if (!storage) return { ok: false, error: "blackboard 需要留痕目录（storage 未配置）" };
-    this.#boardId ??= randomUUID();
-    const boardId = this.#boardId;
-    const path = storage.blackboardDir(boardId);
-    try {
-      new BlackboardStore({ root: storage.blackboardsDir, boardId }).ensureOwner({
-        pid: this.#owner.pid,
-        startMs: this.#owner.startMs,
-      });
-    } catch (error) {
-      const why = error instanceof Error ? error.message : String(error);
-      return { ok: false, error: `blackboard 开板失败：${why}` };
-    }
-    return { ok: true, board: { boardId, path } };
+    const boardId = (this.#boardId ??= randomUUID());
+    return openBoardState(this.#storage, this.#owner, boardId);
   }
 
   /**
@@ -494,29 +616,13 @@ export class TaskEngine {
    * 失败 ⇒ 返回错误（绝不降级共享 cwd、绝不 spawn）。
    * 非隔离任务 ⇒ 直接放行（没有 worktree 要建）。
    */
-  async #prepareWorktree(
+  #prepareWorktree(
     taskId: string,
-    input: DispatchInput,
   ): Promise<
     | { ok: true; worktree?: { path: string; branch: string; baseCommit: string } }
     | { ok: false; error: string }
   > {
-    if (input.isolation !== "worktree") return { ok: true };
-    const base = this.#registry.get(taskId)?.worktree;
-    if (!base) return { ok: false, error: "记录里没有 worktree 基线" };
-    const created = await createWorktree(this.#git, {
-      repoRoot: this.#repoRoot ?? "",
-      path: base.path,
-      branch: base.branch,
-      baseCommit: base.baseCommit,
-    });
-    if (!created.ok) {
-      return { ok: false, error: created.error ?? "worktree 创建失败" };
-    }
-    return {
-      ok: true,
-      worktree: { path: base.path, branch: base.branch, baseCommit: base.baseCommit },
-    };
+    return prepareIsolationFor(this.#git, this.#repoRoot ?? "", this.#registry.get(taskId));
   }
 
   /** 受管 worktree 的落点（隔离任务的 cwd）。 */
@@ -560,21 +666,8 @@ export class TaskEngine {
 
   /** 深度 + 编号：孩子知道自己 depth 与父任务 id。 */
   #childEnv(taskId: string, input: DispatchInput): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      PI_DISPATCH_DEPTH: String(Number(process.env.PI_DISPATCH_DEPTH ?? 0) + 1),
-      PI_DISPATCH_TASK_ID: taskId,
-    };
-    // 继承来的黑板 env 一律擦掉：这块会话没开黑板就不该有板目录（G5）
-    delete env.PI_DISPATCH_BLACKBOARD_DIR;
-    delete env.PI_DISPATCH_BLACKBOARD_ID;
     const board = this.#registry.get(taskId)?.blackboard;
-    if (input.blackboard === true && board) {
-      const boardPath = board.path;
-      env.PI_DISPATCH_BLACKBOARD_DIR = boardPath;
-      env.PI_DISPATCH_BLACKBOARD_ID = board.boardId;
-    }
-    return env;
+    return childEnvFor(process.env, taskId, input.blackboard === true ? board : undefined);
   }
 
   /** 盯住已经起好的孩子：超时 / 卡住 / 收四样 / 定终态。 */
@@ -651,23 +744,7 @@ export class TaskEngine {
     // 观测失败只记 captureError，不回改终态（终态是既成事实）。
     const base = this.#registry.get(taskId)?.worktree;
     if (base) {
-      const probe = await observeWorktree(this.#git, {
-        path: base.path,
-        branch: base.branch,
-        baseCommit: base.baseCommit,
-      });
-      const receipt: WorktreeInfo = {
-        path: probe.path,
-        branch: probe.branch,
-        baseCommit: probe.baseCommit,
-        headCommit: probe.headCommit,
-        // 观测不到 ≠ 干净：观测不到就留空，绝不兜 0
-        dirty: probe.dirty,
-        onExpectedBranch: probe.onExpectedBranch,
-        commitsAhead: probe.commitsAhead,
-        missing: probe.missing,
-        captureError: probe.captureError,
-      };
+      const receipt = await captureWorktreeFor(this.#git, base);
       await this.#registry.submit({ kind: "attach-worktree", id: taskId, worktree: receipt });
     }
     await this.#registry.submit({
@@ -890,14 +967,7 @@ export class TaskEngine {
    * 两条判据：① 有非终态的记录还引用它（有人在跑）；② 它的 owner 还活着（pid + 启动时刻两个都对）且板没关。
    */
   #boardActive(store: BlackboardStore, boardId: string): boolean {
-    for (const record of this.#registry.list()) {
-      if (record.blackboard?.boardId !== boardId) continue;
-      if (!isTerminal(record.status)) return true;
-    }
-    const owner = store.ownerInfo(boardId);
-    if (!owner || owner.closedAt !== undefined) return false;
-    // owner 双条件判活：进程号 + 启动时刻两个都对（光看进程号会认错人）
-    return owner.startMs === processStartMs(owner.pid) && isPidAlive(owner.pid);
+    return boardIsActive(this.#registry.list(), store, boardId);
   }
 
   /**

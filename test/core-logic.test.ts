@@ -24,7 +24,7 @@ import {
   worktreeNeedsGit,
   defaultGates,
 } from "../src/core/gates.ts";
-import { TaskRegistry } from "../src/core/registry.ts";
+import { applyAttachWorktree, applyResolveExit, TaskRegistry } from "../src/core/registry.ts";
 import type { TaskRecord } from "../src/core/types.ts";
 
 // ── 安检 ──────────────────────────────────────────────────────────────────
@@ -519,4 +519,65 @@ test("状态机：普通的 resolve-exit 保留 startedAt", async () => {
   await reg.submit({ kind: "transition", id: "ok", to: "running" });
   const result = await reg.submit({ kind: "resolve-exit", id: "ok", exitCode: 0 });
   assert.ok(result.record.startedAt, "孩子真起过 ⇒ startedAt 留着");
+});
+
+// ── 从 #apply 抽出的纯判定 ────────────────────────────────────────────────
+
+test("纯函数：applyResolveExit——stopping + notStarted 清 startedAt 并落 canceled", () => {
+  const current: TaskRecord = { id: "s", status: "stopping", task: "t", startedAt: 123 };
+  const next = applyResolveExit(current, {
+    kind: "resolve-exit",
+    id: "s",
+    exitCode: -1,
+    notStarted: true,
+  });
+  assert.deepEqual(next, { to: "canceled", patch: { startedAt: undefined } });
+});
+
+test("纯函数：applyResolveExit——stopping 不带 notStarted 保留 startedAt", () => {
+  const current: TaskRecord = { id: "s", status: "stopping", task: "t", startedAt: 123 };
+  const next = applyResolveExit(current, { kind: "resolve-exit", id: "s", exitCode: -1 });
+  assert.deepEqual(next, { to: "canceled", patch: {} }, "没起过的证据别乱清");
+});
+
+test("纯函数：applyResolveExit——只有非零退出的 detail 进 stopReason", () => {
+  const running: TaskRecord = { id: "r", status: "running", task: "t", startedAt: 1 };
+  const ok = applyResolveExit(running, {
+    kind: "resolve-exit",
+    id: "r",
+    exitCode: 0,
+    detail: "不该进死因",
+  });
+  assert.equal(ok?.to, "succeeded");
+  assert.equal(ok?.patch.exitCode, 0);
+  assert.equal(ok?.patch.stopReason, undefined, "成功退出没有死因");
+  const bad = applyResolveExit(running, {
+    kind: "resolve-exit",
+    id: "r",
+    exitCode: 2,
+    detail: "boom",
+  });
+  assert.equal(bad?.to, "failed");
+  assert.equal(bad?.patch.stopReason, "boom");
+  const silent = applyResolveExit(running, { kind: "resolve-exit", id: "r", exitCode: 2 });
+  assert.equal(silent?.patch.stopReason, undefined, "没给 detail 就不写死因");
+  const terminal = applyResolveExit(
+    { ...running, status: "succeeded" },
+    { kind: "resolve-exit", id: "r", exitCode: 0 },
+  );
+  assert.equal(terminal, undefined, "终态上的迟到消息静默丢弃");
+});
+
+test("纯函数：applyAttachWorktree——只写元数据，不改 status、不改旧记录", () => {
+  const current: TaskRecord = { id: "w", status: "running", task: "t" };
+  const result = applyAttachWorktree(current, {
+    kind: "attach-worktree",
+    id: "w",
+    worktree: { path: "/wt/w", branch: "pi-dispatch/w", baseCommit: "abc" },
+  });
+  assert.equal(result.changed, true);
+  assert.equal(result.fromStatus, "running");
+  assert.equal(result.record.status, "running", "不改 status");
+  assert.equal(result.record.worktree?.path, "/wt/w");
+  assert.equal(current.worktree, undefined, "旧记录不受影响（不可变）");
 });
