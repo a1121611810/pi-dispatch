@@ -32,6 +32,16 @@ export function judgeJsonStream(stdout: string): Verdict {
   return { ok: tools.length > 0, detail: `工具=${tools.join(",") || "无"}` };
 }
 
+/** 运行中转向：收据到 seen，且最后一条 assistant 正文确实改了方向（不看 user 回显）。 */
+export function judgeSteer(record: TaskRecord | undefined, childLog: string): Verdict {
+  const steer = record?.steers?.[0];
+  if (!steer) return { ok: false, detail: "没有转向收据" };
+  if (steer.state !== "seen") return { ok: false, detail: `state=${steer.state}` };
+  const text = parseChildStream(childLog).text;
+  if (!text.includes("STEERED")) return { ok: false, detail: "最后一条 assistant 没有 STEERED" };
+  return { ok: true, detail: `seq=${steer.seq} state=seen` };
+}
+
 /** 账上有数：无论孩子交没交报告，宿主观测的用量都要非零。 */
 export function judgeChildReport(record: TaskRecord | undefined): Verdict {
   const channel = record?.reportChannel;

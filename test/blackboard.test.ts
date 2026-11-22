@@ -347,6 +347,18 @@ test("黑板：owner 四象限（新建 / 已存在不覆盖 / 关板补 closedA
   });
 });
 
+test("黑板：关板后写入被拒，读取仍可看证据", () => {
+  withBoard((store, root) => {
+    const notesDir = join(root, BOARD_ID, "notes");
+    store.ensureOwner({ pid: 1, startMs: 1 });
+    store.append("t1", "关前");
+    store.close(1700000000000);
+    assert.throws(() => store.append("t1", "关后"), /关闭/);
+    assert.equal(readdirSync(notesDir).length, 1, "关后写入不落盘");
+    assert.equal(store.read().notes[0]!.text, "关前");
+  });
+});
+
 test("黑板：关板不删笔记（证据留着）", () => {
   withBoard((store, root) => {
     store.ensureOwner({ pid: 1, startMs: 2 });

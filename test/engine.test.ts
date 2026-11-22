@@ -28,6 +28,7 @@
 //     （默认谓词 `() => false` → `true` 不等价，已由「没注入 isGitRepo ⇒ 默认不许开隔离」杀掉。）
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
@@ -39,7 +40,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   TaskEngine,
   boardIsActive,
@@ -113,6 +114,8 @@ function freshEngine(
     git?: GitRunner;
     repoRoot?: string;
     isGitRepo?: () => boolean;
+    childExtensionPath?: string;
+    now?: () => number;
   } = {},
 ) {
   const registry = new TaskRegistry();
@@ -129,6 +132,8 @@ function freshEngine(
     git: opts.git,
     repoRoot: opts.repoRoot,
     isGitRepo: opts.isGitRepo,
+    childExtensionPath: opts.childExtensionPath,
+    now: opts.now,
   });
   return { registry, engine };
 }
@@ -1724,6 +1729,28 @@ test("通知：未核实的交付带标记，已验证的不带", async () => {
   );
 });
 
+test("通知：reportStale 只在 true 时出现，false 不留键", async () => {
+  const registry = new TaskRegistry();
+  const nc = new NotificationCenter();
+  nc.attach(registry as never);
+  const finish = async (id: string, stale: boolean): Promise<void> => {
+    await registry.submit({ kind: "spawn", record: { id, status: "queued", task: "t" } });
+    await registry.submit({ kind: "transition", id, to: "running" });
+    await registry.submit({
+      kind: "attach-steer",
+      id,
+      steers: [{ seq: 1, text: "改", at: 1, state: "delivered" }],
+      reportStale: stale,
+    });
+    await registry.submit({ kind: "resolve-exit", id, exitCode: 0 });
+  };
+  await finish("stale", true);
+  await finish("fresh", false);
+  const flat = nc.drain().flat();
+  assert.equal(flat.find((n) => n.taskId === "stale")?.reportStale, true);
+  assert.ok(!("reportStale" in flat.find((n) => n.taskId === "fresh")!));
+});
+
 test("分批：切批后字节计数要归零（不是从 1 起算）", () => {
   const one = { id: "x", status: "ok", at: 1 };
   const size = Buffer.byteLength(JSON.stringify(one), "utf8");
@@ -1840,6 +1867,37 @@ test("引擎：不是 git 仓 ⇒ 隔离被退回，不留记录", async () => {
   const outcome = await engine.dispatch({ task: "干活", isolation: "worktree" });
   assert.equal((outcome as { status: string }).status, "rejected");
   assert.equal(registry.list().length, 0, "被退回不留记录");
+});
+
+test("隔离+转向：两个隔离孩子各有 worktree/seq，互不串线", async () => {
+  const { project, storage } = isolationStorage();
+  const { runner } = fakeGit({ "rev-parse --verify": { code: 0, stdout: "base123\n" } });
+  const { registry, engine } = freshEngine({
+    storage,
+    git: runner,
+    repoRoot: project,
+    isGitRepo: () => true,
+    childExtensionPath: "x",
+    spawn: fakeSpawn({ delayMs: 300 }),
+  });
+  const a = (await engine.dispatch({ task: "A", isolation: "worktree" })) as { taskId: string };
+  const b = (await engine.dispatch({ task: "B", isolation: "worktree" })) as { taskId: string };
+  await waitForStatus(registry, a.taskId, "running");
+  await waitForStatus(registry, b.taskId, "running");
+  const [ra, rb] = await Promise.all([engine.steer(a.taskId, "甲"), engine.steer(b.taskId, "乙")]);
+  assert.equal(ra.ok ? ra.seq : -1, 1);
+  assert.equal(rb.ok ? rb.seq : -1, 1, "每个任务独立 seq");
+  assert.notEqual(
+    registry.get(a.taskId)!.worktree!.path,
+    registry.get(b.taskId)!.worktree!.path,
+    "worktree 不共享",
+  );
+  assert.match(storage.readSteer(a.taskId), /甲/);
+  assert.match(storage.readSteer(b.taskId), /乙/);
+  await waitFor(registry, a.taskId);
+  await waitFor(registry, b.taskId);
+  await engine.shutdown();
+  rmSync(project, { recursive: true, force: true });
 });
 
 test("引擎：钉不住 base ⇒ 退回，不留记录", async () => {
@@ -2511,4 +2569,423 @@ test("引擎：boot 清扫黑板——活板一条不动，死板的过期笔记
   assert.equal(readdirSync(join(liveDir, "notes")).length, 1, "活板一条都不清");
   assert.equal(readdirSync(join(busyDir, "notes")).length, 1, "有人在用的板一条都不清");
   assert.equal(existsSync(join(deadDir, "notes")), false, "死板的过期笔记清掉了");
+});
+
+// ── 引擎：运行中转向 ────────────────────────────────────────────────────
+
+function steerStorage(): { dir: string; storage: Storage } {
+  const dir = mkdtempSync(join(tmpdir(), "dispatch-steer-"));
+  return { dir, storage: new Storage(join(dir, "dispatch"), join(dir, "proj")) };
+}
+
+test("转向：建盘等待期间（running 但还没 spawn）仍可受理", async () => {
+  const git = gatedGit();
+  const { storage, dir } = steerStorage();
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    git: git.runner,
+    repoRoot: "/repo",
+    isGitRepo: () => true,
+    spawn: fakeSpawn({ delayMs: 50 }),
+  });
+  const out = await engine.dispatch({ task: "干活", isolation: "worktree" });
+  assert.ok("taskId" in out);
+  const taskId = (out as { taskId: string }).taskId;
+  await waitForStatus(registry, taskId, "running");
+  await git.waitForAdds(1);
+  const result = await engine.steer(taskId, "早一点");
+  assert.equal(result.ok, true, "spawn 之前不该拒");
+  await git.releaseNextAdd();
+  await waitFor(registry, taskId);
+  assert.equal(storage.readSteer(taskId).trim().length > 0, true);
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：append 失败不记 sent，也不留下半条收据", async () => {
+  const { storage, dir } = steerStorage();
+  storage.appendSteer = () => {
+    throw new Error("disk full");
+  };
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fakeSpawn({ delayMs: 200 }),
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  const taskId = (out as { taskId: string }).taskId;
+  await waitForStatus(registry, taskId, "running");
+  const result = await engine.steer(taskId, "改");
+  assert.equal(result.ok, false);
+  assert.equal(registry.get(taskId)?.steers, undefined);
+  await waitFor(registry, taskId);
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：信箱末尾半行时，新转向另起一行仍可解析", async () => {
+  const { storage, dir } = steerStorage();
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fakeSpawn({ delayMs: 200 }),
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  const taskId = (out as { taskId: string }).taskId;
+  await waitForStatus(registry, taskId, "running");
+  const path = storage.steerPath(taskId);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, '{"seq":1,"text":"旧","at":1}\n{"seq":2,"text":"半');
+  const result = await engine.steer(taskId, "新");
+  assert.equal(result.ok, true);
+  assert.equal(result.ok ? result.seq : -1, 2, "半行不被当成已存在的 seq 2");
+  const lines = storage.readSteer(taskId).split("\n").filter(Boolean);
+  assert.equal(lines.length, 3, "旧行 + 空行 + 新行");
+  assert.equal(JSON.parse(lines[2]!).text, "新");
+  await waitFor(registry, taskId);
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：信箱是 FIFO/目录时不阻塞，直接报错", async () => {
+  if (process.platform === "win32") return;
+  const { storage, dir } = steerStorage();
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fakeSpawn({ delayMs: 200 }),
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  const taskId = (out as { taskId: string }).taskId;
+  await waitForStatus(registry, taskId, "running");
+  const path = storage.steerPath(taskId);
+  mkdirSync(dirname(path), { recursive: true });
+  execFileSync("mkfifo", [path]);
+  const result = await engine.steer(taskId, "改");
+  assert.equal(result.ok, false);
+  assert.match(!result.ok ? result.error : "", /regular file/);
+  await waitFor(registry, taskId);
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：信箱不可读或超限时返回错误，不把父方带崩", async () => {
+  const { storage, dir } = steerStorage();
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fakeSpawn({ delayMs: 200 }),
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  const taskId = (out as { taskId: string }).taskId;
+  await waitForStatus(registry, taskId, "running");
+  const path = storage.steerPath(taskId);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, "x".repeat(257 * 1024));
+  const result = await engine.steer(taskId, "改");
+  assert.equal(result.ok, false);
+  assert.match(!result.ok ? result.error : "", /exceeds/);
+  await waitFor(registry, taskId);
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：进入退出对账后拒绝，不把 sent 留在终态之后", async () => {
+  const { storage, dir } = steerStorage();
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fakeSpawn({ delayMs: 30 }),
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  const taskId = (out as { taskId: string }).taskId;
+  await waitForStatus(registry, taskId, "running");
+  await waitFor(registry, taskId);
+  const result = await engine.steer(taskId, "太晚");
+  assert.equal(result.ok, false);
+  assert.match(!result.ok ? result.error : "", /finishing|not running/);
+  assert.equal(storage.readSteer(taskId), "");
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：running 两次并发得到 seq 1/2，文件两行，记录 sent", async () => {
+  const { storage, dir } = steerStorage();
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fakeSpawn({ delayMs: 300 }),
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  assert.ok("taskId" in out);
+  const taskId = (out as { taskId: string }).taskId;
+  await waitForStatus(registry, taskId, "running");
+
+  const [a, b] = await Promise.all([engine.steer(taskId, "甲"), engine.steer(taskId, "乙")]);
+  assert.deepEqual(
+    [a, b].map((r) => (r.ok ? r.seq : r)),
+    [1, 2],
+  );
+  assert.deepEqual(
+    registry.get(taskId)!.steers!.map((s) => [s.seq, s.state]),
+    [
+      [1, "sent"],
+      [2, "sent"],
+    ],
+  );
+  const lines = readFileSync(storage.steerPath(taskId), "utf8").trim().split("\n");
+  assert.equal(lines.length, 2);
+  assert.deepEqual(
+    lines.map((line) => (JSON.parse(line) as { seq: number }).seq),
+    [1, 2],
+  );
+  await waitFor(registry, taskId);
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：退出按真机证据把 sent 对成 seen，报告在回显后不 stale", async () => {
+  const { storage, dir } = steerStorage();
+  const stream = [
+    JSON.stringify({ type: "queue_update", steering: ["[pi-dispatch-steer #1]\n改"] }),
+    JSON.stringify({
+      type: "message_end",
+      message: { role: "user", content: "[pi-dispatch-steer #1]\n改" },
+    }),
+    JSON.stringify({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "好" }] },
+    }),
+    JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "toolResult",
+        toolName: "child_report",
+        details: { report: { summary: "完", why: "", assessment: "有风险" } },
+      },
+    }),
+  ].join("\n");
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fakeSpawn({ stdout: stream, delayMs: 100 }),
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  const taskId = (out as { taskId: string }).taskId;
+  await waitForStatus(registry, taskId, "running");
+  assert.equal((await engine.steer(taskId, "改")).ok, true);
+  await waitFor(registry, taskId);
+  const record = registry.get(taskId)!;
+  assert.equal(record.steers![0]!.state, "seen");
+  assert.ok(!("reportStale" in record), "报告不早于转向时不留键");
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：报告早于回显时 reportStale 为 true", async () => {
+  const { storage, dir } = steerStorage();
+  const stream = [
+    JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "toolResult",
+        toolName: "child_report",
+        details: { report: { summary: "早", why: "", assessment: "有风险" } },
+      },
+    }),
+    JSON.stringify({ type: "queue_update", steering: ["[pi-dispatch-steer #1]\n改"] }),
+    JSON.stringify({
+      type: "message_end",
+      message: { role: "user", content: "[pi-dispatch-steer #1]\n改" },
+    }),
+  ].join("\n");
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fakeSpawn({ stdout: stream, delayMs: 100 }),
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  const taskId = (out as { taskId: string }).taskId;
+  await waitForStatus(registry, taskId, "running");
+  await engine.steer(taskId, "改");
+  await waitFor(registry, taskId);
+  assert.equal(registry.get(taskId)!.reportStale, true);
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：17MB 输出砍头后，头部证据仍把 sent 对成 seen", async () => {
+  const { storage, dir } = steerStorage();
+  const stream = [
+    JSON.stringify({ type: "queue_update", steering: ["[pi-dispatch-steer #1]\n改"] }),
+    JSON.stringify({
+      type: "message_end",
+      message: { role: "user", content: "[pi-dispatch-steer #1]\n改" },
+    }),
+    JSON.stringify({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "好" }] },
+    }),
+    "x".repeat(17 * 1024 * 1024),
+  ].join("\n");
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fakeSpawn({ stdout: stream, delayMs: 100 }),
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  const taskId = (out as { taskId: string }).taskId;
+  await waitForStatus(registry, taskId, "running");
+  await engine.steer(taskId, "改");
+  await waitFor(registry, taskId);
+  assert.equal(registry.get(taskId)!.steers![0]!.state, "seen");
+  assert.equal(registry.get(taskId)!.outputTruncated, true);
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：没有证据的 sent 退出时标 undelivered", async () => {
+  const { storage, dir } = steerStorage();
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fakeSpawn({ delayMs: 100 }),
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  const taskId = (out as { taskId: string }).taskId;
+  await waitForStatus(registry, taskId, "running");
+  await engine.steer(taskId, "改");
+  await waitFor(registry, taskId);
+  assert.equal(registry.get(taskId)!.steers![0]!.state, "undelivered");
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：只有 queue_update 证据时退出保留 queued，不并进 undelivered", async () => {
+  const { storage, dir } = steerStorage();
+  const stream = JSON.stringify({
+    type: "queue_update",
+    steering: ["[pi-dispatch-steer #1]\n改"],
+  });
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fakeSpawn({ stdout: stream, delayMs: 200 }),
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  const taskId = (out as { taskId: string }).taskId;
+  await waitForStatus(registry, taskId, "running");
+  assert.equal((await engine.steer(taskId, "改")).ok, true);
+  await waitFor(registry, taskId);
+  assert.equal(registry.get(taskId)!.steers![0]!.state, "queued");
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：非 running、空、超长、无扩展都拒绝且不落盘", async () => {
+  const { storage, dir } = steerStorage();
+  const { registry, engine } = freshEngine({
+    storage,
+    spawn: fakeSpawn({ delayMs: 200 }),
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  const taskId = (out as { taskId: string }).taskId;
+  await waitForStatus(registry, taskId, "running");
+
+  assert.equal((await engine.steer(taskId, "  ")).ok, false);
+  assert.equal((await engine.steer(taskId, "x".repeat(4097))).ok, false);
+  assert.equal((await engine.steer(taskId, "没扩展")).ok, false);
+  assert.equal(existsSync(storage.steerPath(taskId)), false, "拒绝不落盘");
+  await waitFor(registry, taskId);
+  assert.equal((await engine.steer(taskId, "晚了")).ok, false);
+  assert.equal(existsSync(storage.steerPath(taskId)), false, "终态拒绝也不落盘");
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：4096 字符放行，4097 字符拒绝", async () => {
+  const { storage, dir } = steerStorage();
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fakeSpawn({ delayMs: 300 }),
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  const taskId = (out as { taskId: string }).taskId;
+  await waitForStatus(registry, taskId, "running");
+  assert.equal((await engine.steer(taskId, "x".repeat(4096))).ok, true);
+  assert.equal((await engine.steer(taskId, "x".repeat(4097))).ok, false);
+  assert.equal(registry.get(taskId)!.steers!.length, 1);
+  await waitFor(registry, taskId);
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：已有信箱最后一行 seq=7 时下一条写 8", async () => {
+  const { storage, dir } = steerStorage();
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fakeSpawn({ delayMs: 300 }),
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  const taskId = (out as { taskId: string }).taskId;
+  await waitForStatus(registry, taskId, "running");
+  mkdirSync(join(storage.steerPath(taskId), ".."), { recursive: true });
+  writeFileSync(storage.steerPath(taskId), JSON.stringify({ seq: 7, text: "旧", at: 1 }) + "\n");
+  const result = await engine.steer(taskId, "新");
+  assert.deepEqual(result.ok ? result.seq : result, 8);
+  await waitFor(registry, taskId);
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：第 16 条接受，第 17 条拒绝且前 16 条不被清", async () => {
+  const { storage, dir } = steerStorage();
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fakeSpawn({ delayMs: 1200 }),
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  const taskId = (out as { taskId: string }).taskId;
+  await waitForStatus(registry, taskId, "running");
+  for (let i = 1; i <= 16; i++) assert.equal((await engine.steer(taskId, `第${i}条`)).ok, true);
+  const before = readFileSync(storage.steerPath(taskId), "utf8");
+  const rejected = await engine.steer(taskId, "第17条");
+  assert.equal(rejected.ok, false);
+  assert.equal(readFileSync(storage.steerPath(taskId), "utf8"), before);
+  assert.equal(registry.get(taskId)!.steers!.length, 16);
+  await waitFor(registry, taskId);
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：终态任务即使有扩展也拒绝且不落盘", async () => {
+  const { storage, dir } = steerStorage();
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fakeSpawn({ delayMs: 30 }),
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  const taskId = (out as { taskId: string }).taskId;
+  await waitFor(registry, taskId);
+  assert.equal((await engine.steer(taskId, "晚了")).ok, false);
+  assert.equal(existsSync(storage.steerPath(taskId)), false);
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("转向：孩子环境擦掉继承信箱，注入本任务路径", () => {
+  const env = childEnvFor(
+    { PI_DISPATCH_STEER_FILE: "/old/steer.jsonl", PI_DISPATCH_DEPTH: "1" },
+    "t1",
+    undefined,
+    "/new/steer.jsonl",
+  );
+  assert.equal(env.PI_DISPATCH_STEER_FILE, "/new/steer.jsonl");
+  const cleared = childEnvFor({ PI_DISPATCH_STEER_FILE: "/old/steer.jsonl" }, "t1");
+  assert.equal(cleared.PI_DISPATCH_STEER_FILE, undefined);
 });

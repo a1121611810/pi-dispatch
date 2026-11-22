@@ -3,7 +3,7 @@
 
 import type { TaskRegistry } from "./core/registry.ts";
 import { processStartMs } from "./core/storage.ts";
-import type { TaskRecord, TaskStatus } from "./core/types.ts";
+import type { SteerOutcome, TaskRecord, TaskStatus } from "./core/types.ts";
 
 export const TUI_WIDGET_KEY = "pi-dispatch";
 export const TUI_STATUS_KEY = "pi-dispatch";
@@ -95,6 +95,95 @@ export function renderStatusText(
     : `派单 在飞${flying} · 排队${queued}`;
 }
 
+/** 面板与 /steer 用同一个 owner 戳；不一致会互相看不见任务。 */
+export function currentOwner(): TuiOwner {
+  return { pid: process.pid, startMs: processStartMs(process.pid) ?? 0 };
+}
+
+/** 可被 /steer 选中的任务：本会话 + running；按派发时间升序，同刻按 id。 */
+export function runningSteerTargets(records: readonly TaskRecord[], owner: TuiOwner): TaskRecord[] {
+  return records
+    .filter((record) => isSessionRecord(record, owner) && record.status === "running")
+    .sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0) || a.id.localeCompare(b.id));
+}
+
+export function steerChoiceLabel(record: TaskRecord): string {
+  return `#${record.id.slice(0, 8)} ${snippet(record.task)}`;
+}
+
+/** 序号让选项字符串唯一；调用方用 index 回映记录，绝不解析字符串当 id。 */
+export function renderSteerOptions(targets: readonly TaskRecord[]): string[] {
+  return targets.map((record, index) => `${index + 1}) ${steerChoiceLabel(record)}`);
+}
+
+export function steerReceipt(outcome: Extract<SteerOutcome, { ok: true }>): {
+  text: string;
+  level: "info";
+} {
+  return {
+    text: `已受理 #${outcome.taskId.slice(0, 8)} · seq ${outcome.seq} · state=sent（只代表写进信箱；送达与生效看任务结束通知）`,
+    level: "info",
+  };
+}
+
+export interface SteerUi {
+  select(title: string, options: string[]): Promise<string | undefined>;
+  input(title: string, placeholder?: string): Promise<string | undefined>;
+  notify(message: string, level: "info" | "warning" | "error"): void;
+}
+
+export interface SteerDeps {
+  hasUI: boolean;
+  args: string;
+  owner: TuiOwner;
+  records: readonly TaskRecord[];
+  ui: SteerUi;
+  steer(taskId: string, text: string): Promise<SteerOutcome>;
+}
+
+/** 人直接转向的唯一状态机：0/1/多任务、args、Esc、空输入、任务退出都在这里。 */
+export async function runSteerCommand(deps: SteerDeps): Promise<void> {
+  if (!deps.hasUI) return;
+  const targets = runningSteerTargets(deps.records, deps.owner);
+  if (targets.length === 0) {
+    deps.ui.notify("没有在飞任务（排队中的先 dispatch_stop 再重派）", "warning");
+    return;
+  }
+  let target = targets[0]!;
+  if (targets.length > 1) {
+    const options = renderSteerOptions(targets);
+    const choice = await deps.ui.select("转向哪个在飞任务？", options);
+    if (choice === undefined) return;
+    const index = options.indexOf(choice);
+    if (index < 0) {
+      deps.ui.notify("选择器返回了未知选项，没发", "error");
+      return;
+    }
+    target = targets[index]!;
+  }
+  let text = deps.args.trim();
+  if (text === "") {
+    const answer = await deps.ui.input(`转向 #${target.id.slice(0, 8)}：`, "一句话，下一回合生效");
+    if (answer === undefined) return;
+    text = answer.trim();
+  }
+  if (text === "") {
+    deps.ui.notify("空转向，没发", "warning");
+    return;
+  }
+  try {
+    const outcome = await deps.steer(target.id, text);
+    if (outcome.ok) {
+      const receipt = steerReceipt(outcome);
+      deps.ui.notify(receipt.text, receipt.level);
+    } else {
+      deps.ui.notify(outcome.error, "error");
+    }
+  } catch (error) {
+    deps.ui.notify(`转向失败：${error instanceof Error ? error.message : String(error)}`, "error");
+  }
+}
+
 /** 接线用的最小 ui 面（ctx.ui 结构兼容）。 */
 export interface TuiUi {
   setWidget(key: string, content: string[] | undefined): void;
@@ -112,10 +201,7 @@ export function attachTuiSurface(opts: {
   owner?: TuiOwner;
 }): () => void {
   // shortcut: ps 读不到本进程启动时刻时面板静默空白；engine 判活同依赖 ps，残宿主下不是面板独有的问题
-  const owner = opts.owner ?? {
-    pid: process.pid,
-    startMs: processStartMs(process.pid) ?? 0,
-  };
+  const owner = opts.owner ?? currentOwner();
   const update = (): void => {
     try {
       const records = opts.registry.list();

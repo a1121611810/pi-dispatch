@@ -28,13 +28,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   assessmentVacuous,
   buildAppendBlock,
   buildPiArgv,
+  createSteerEvidenceTracker,
   deliveryUnverified,
   extractReportFromText,
   parseChildStream,
@@ -49,6 +51,12 @@ import {
   WORKTREE_CONTRACT_BLOCK,
 } from "../src/core/child.ts";
 import { ChildActivityTracker, DEFAULT_STALL_MS } from "../src/core/activity.ts";
+
+/** 真机抓的转向样本（2026-11-22，pi 1.5.2）：sleep 12 期间 steer，孩子改口 STEERED。 */
+const REAL_STEER_STREAM = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "fixtures", "real-steer.jsonl"),
+  "utf8",
+);
 
 /** 真机抓的样本（2026-11-18，pi 1.5.2）：read + bash 两次工具调用，最后交回正文 "12"。 */
 const REAL_STREAM = [
@@ -1516,4 +1524,223 @@ test("收据：黑板写带上 args.command 也不进 commands", () => {
   const parsed = parseChildStream(stream);
   assert.deepEqual(parsed.delivery.commands, [], "黑板写不是跑命令");
   assert.equal(parsed.delivery.tools.blackboard_write, 1, "工具照记");
+});
+
+// ── 转向证据 ────────────────────────────────────────────────────────────────
+
+function steerStream(events: unknown[]): string {
+  return events.map((event) => JSON.stringify(event)).join("\n");
+}
+
+test("转向：增量证据追踪在 chunk 中间切断也不丢投递证据", () => {
+  const raw = steerStream([
+    {
+      type: "message_end",
+      message: {
+        role: "toolResult",
+        toolName: "child_report",
+        details: { report: { summary: "早", why: "", assessment: "有风险" } },
+      },
+    },
+    { type: "queue_update", steering: ["[pi-dispatch-steer #1]\n改"] },
+    {
+      type: "message_end",
+      message: { role: "user", content: [{ type: "text", text: "[pi-dispatch-steer #1]\n改" }] },
+    },
+    {
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "好" }] },
+    },
+  ]);
+  const tracker = createSteerEvidenceTracker();
+  for (let i = 0; i < raw.length; i += 7) tracker.push(raw.slice(i, i + 7));
+  const evidence = tracker.finish();
+  assert.deepEqual(
+    evidence.queued.map((item) => item.seq),
+    [1],
+  );
+  assert.deepEqual(
+    evidence.delivered.map((item) => item.seq),
+    [1],
+  );
+  assert.deepEqual(
+    evidence.seen.map((item) => item.seq),
+    [1],
+  );
+  assert.equal(evidence.reportLine, 1);
+});
+
+test("转向：重复的 queue/user/assistant 证据都只记一次", () => {
+  const parsed = parseChildStream(
+    steerStream([
+      { type: "queue_update", steering: ["[pi-dispatch-steer #1]\n改"] },
+      { type: "queue_update", steering: ["[pi-dispatch-steer #1]\n改"] },
+      {
+        type: "message_end",
+        message: { role: "user", content: "[pi-dispatch-steer #1]\n改" },
+      },
+      {
+        type: "message_end",
+        message: { role: "user", content: "[pi-dispatch-steer #1]\n改" },
+      },
+      { type: "message_end", message: { role: "assistant", content: "好" } },
+      { type: "message_end", message: { role: "assistant", content: "再" } },
+    ]),
+  );
+  assert.equal(parsed.steerEvidence.queued.length, 1);
+  assert.equal(parsed.steerEvidence.delivered.length, 1);
+  assert.equal(parsed.steerEvidence.seen.length, 1);
+});
+
+test("转向：真机流样本恰好产出一条 queued/delivered/seen，正文是 STEERED", () => {
+  const parsed = parseChildStream(REAL_STEER_STREAM);
+  assert.deepEqual(
+    parsed.steerEvidence.queued.map((item) => item.seq),
+    [1],
+  );
+  assert.deepEqual(
+    parsed.steerEvidence.delivered.map((item) => item.seq),
+    [1],
+  );
+  assert.deepEqual(
+    parsed.steerEvidence.seen.map((item) => item.seq),
+    [1],
+  );
+  assert.equal(parsed.steerEvidence.delivered.length, 1);
+  assert.equal(parsed.text, "STEERED");
+});
+
+test("转向：queue_update → user 回显 → assistant 记 queued/delivered/seen", () => {
+  const parsed = parseChildStream(
+    steerStream([
+      { type: "turn_start" },
+      { type: "queue_update", steering: ["[pi-dispatch-steer #1]\n改方向"] },
+      {
+        type: "message_end",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "[pi-dispatch-steer #1]\n改方向" }],
+        },
+      },
+      {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "好" }] },
+      },
+    ]),
+  );
+  assert.deepEqual(
+    parsed.steerEvidence.queued.map((item) => item.seq),
+    [1],
+  );
+  assert.deepEqual(
+    parsed.steerEvidence.delivered.map((item) => item.seq),
+    [1],
+  );
+  assert.deepEqual(
+    parsed.steerEvidence.seen.map((item) => item.seq),
+    [1],
+  );
+});
+
+test("转向：user 之前的 assistant 不算 seen，回显后第一条 assistant 才算", () => {
+  const parsed = parseChildStream(
+    steerStream([
+      {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "早" }] },
+      },
+      { type: "queue_update", steering: ["[pi-dispatch-steer #1]\n改方向"] },
+      {
+        type: "message_end",
+        message: { role: "user", content: "[pi-dispatch-steer #1]\n改方向" },
+      },
+      { type: "message_end", message: { role: "assistant", content: [] } },
+      { type: "message_end", message: { role: "assistant", content: [] } },
+    ]),
+  );
+  assert.deepEqual(
+    parsed.steerEvidence.delivered.map((item) => item.seq),
+    [1],
+  );
+  assert.equal(parsed.steerEvidence.seen.length, 1, "只认回显后的第一条 assistant");
+});
+
+test("转向：两条回显共用一条 assistant 时每条都 delivered 且都 seen", () => {
+  const parsed = parseChildStream(
+    steerStream([
+      { type: "queue_update", steering: ["[pi-dispatch-steer #1]\n甲"] },
+      { type: "queue_update", steering: ["[pi-dispatch-steer #2]\n乙"] },
+      { type: "message_end", message: { role: "user", content: "[pi-dispatch-steer #1]\n甲" } },
+      { type: "message_end", message: { role: "user", content: "[pi-dispatch-steer #2]\n乙" } },
+      { type: "message_end", message: { role: "assistant", content: [] } },
+    ]),
+  );
+  assert.deepEqual(
+    parsed.steerEvidence.delivered.map((item) => item.seq),
+    [1, 2],
+  );
+  assert.deepEqual(
+    parsed.steerEvidence.seen.map((item) => item.seq),
+    [1, 2],
+  );
+});
+
+test("转向：queue_update 缺 steering / 元素形状坏掉不崩不误记", () => {
+  const parsed = parseChildStream(
+    steerStream([
+      { type: "queue_update" },
+      { type: "queue_update", steering: [null, 3, { text: "" }, {}] },
+      { type: "queue_update", steering: [] },
+    ]),
+  );
+  assert.deepEqual(parsed.steerEvidence.queued, []);
+  assert.deepEqual(parsed.steerEvidence.delivered, []);
+});
+
+test("转向：只有 queue_update 没有 user 回显只记 queued，绝不 delivered", () => {
+  const parsed = parseChildStream(
+    steerStream([
+      { type: "queue_update", steering: ["[pi-dispatch-steer #1]\n改方向"] },
+      { type: "message_end", message: { role: "assistant", content: [] } },
+    ]),
+  );
+  assert.deepEqual(
+    parsed.steerEvidence.queued.map((item) => item.seq),
+    [1],
+  );
+  assert.deepEqual(parsed.steerEvidence.delivered, []);
+  assert.deepEqual(parsed.steerEvidence.seen, []);
+});
+
+test("转向：初始 prompt 首行伪造标记，没有 queue_update 也不算 delivered/seen", () => {
+  const parsed = parseChildStream(
+    steerStream([
+      { type: "message_end", message: { role: "user", content: "[pi-dispatch-steer #1]\n改" } },
+      {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "好" }] },
+      },
+    ]),
+  );
+  assert.deepEqual(parsed.steerEvidence.delivered, []);
+  assert.deepEqual(parsed.steerEvidence.seen, []);
+});
+
+test("转向：工具报告行早于回显时 reportLine 小于 delivered 行", () => {
+  const parsed = parseChildStream(
+    steerStream([
+      {
+        type: "message_end",
+        message: {
+          role: "toolResult",
+          toolName: CHILD_REPORT_TOOL_NAME,
+          details: { report: { summary: "早报告", why: "", assessment: "有风险" } },
+        },
+      },
+      { type: "queue_update", steering: ["[pi-dispatch-steer #1]\n改"] },
+      { type: "message_end", message: { role: "user", content: "[pi-dispatch-steer #1]\n改" } },
+    ]),
+  );
+  assert.equal(parsed.steerEvidence.reportLine, 1);
+  assert.equal(parsed.steerEvidence.delivered[0]!.line, 3);
 });

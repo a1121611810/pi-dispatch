@@ -1,8 +1,12 @@
 import { execFileSync } from "node:child_process";
 import {
+  appendFileSync,
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   readdirSync,
   renameSync,
   rmSync,
@@ -54,6 +58,21 @@ export interface StoragePaths {
   /** 受管黑板的根目录。默认不建（黑板没开就不该有这个目录）。 */
   blackboardsDir: string;
 }
+
+/** 只读文件最后一个字节，判断是否以换行结尾（不整文件读进内存）。 */
+function endsWithNewline(path: string): boolean {
+  const fd = openSync(path, "r");
+  try {
+    const last = Buffer.alloc(1);
+    const read = readSync(fd, last, 0, 1, statSync(path).size - 1);
+    return read === 1 && last[0] === 0x0a;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** 信箱读取上限：16 条 × 4KB 正文 + JSON 外壳，留足余量；防孩子写坏文件撑爆父方内存。 */
+export const MAX_STEER_INBOX_BYTES = 256 * 1024;
 
 export class Storage {
   readonly #bucket: string;
@@ -138,6 +157,37 @@ export class Storage {
     if (!isSafeTaskId(taskId)) return undefined;
     const path = join(this.#paths.tasksDir, taskId, "output.log");
     return existsSync(path) ? readFileSync(path, "utf8") : undefined;
+  }
+
+  /** 转向信箱：<桶>/tasks/<id>/steer.jsonl。目录默认不建（写第一条时才建）。 */
+  steerPath(taskId: string): string {
+    if (!isSafeTaskId(taskId)) throw new Error(`invalid task id: ${taskId}`);
+    return join(this.#paths.tasksDir, taskId, "steer.jsonl");
+  }
+
+  /** 追加一条转向。同步写：父方要在孩子下一个 turn_end 前看到它。 */
+  appendSteer(taskId: string, line: string): string {
+    if (!isSafeTaskId(taskId)) throw new Error(`invalid task id: ${taskId}`);
+    this.#ensureDirs();
+    const path = this.steerPath(taskId);
+    mkdirSync(join(this.#paths.tasksDir, taskId), { recursive: true });
+    // 父方崩溃可能留下半行；先补换行，别把新 JSON 粘进坏行里一起丢掉。
+    const needsNewline = existsSync(path) && statSync(path).size > 0 && !endsWithNewline(path);
+    appendFileSync(path, `${needsNewline ? "\n" : ""}${line}\n`, "utf8");
+    return path;
+  }
+
+  readSteer(taskId: string): string {
+    if (!isSafeTaskId(taskId)) return "";
+    const path = this.steerPath(taskId);
+    if (!existsSync(path)) return "";
+    // 信箱由父方写，但文件落在孩子可写的任务目录里：读前限长，坏文件不拖垮整个任务。
+    const info = statSync(path);
+    if (!info.isFile()) throw new Error("steering inbox is not a regular file");
+    if (info.size > MAX_STEER_INBOX_BYTES) {
+      throw new Error(`steering inbox exceeds ${MAX_STEER_INBOX_BYTES} bytes`);
+    }
+    return readFileSync(path, "utf8");
   }
 
   /** 读 records/*.json 装回内存。一个坏文件不许拖垮启动——跳过它继续。 */

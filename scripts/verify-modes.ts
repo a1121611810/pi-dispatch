@@ -20,12 +20,17 @@ import {
   judgeJsonStream,
   judgeReject,
   judgeRpc,
+  judgeSteer,
   judgeVerifyAudit,
   judgeWorktreeIsolation,
   judgeWorktreeRejected,
   type BoardNoteFact,
 } from "./verdicts.ts";
-import type { TaskRecord } from "../src/core/types.ts";
+import { isTerminal, type TaskRecord } from "../src/core/types.ts";
+import { TaskRegistry } from "../src/core/registry.ts";
+import { TaskEngine } from "../src/core/engine.ts";
+import { Storage } from "../src/core/storage.ts";
+import { scrubbedEnv } from "./test-env.ts";
 
 const EXT = join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "index.js");
 const RESULTS: Array<{
@@ -451,12 +456,10 @@ async function caseRpcDispatch(): Promise<void> {
     });
     let stdout = "";
     let sawToolEnd = false;
-    let sawNotification = false;
     child.stdout.on("data", (c) => {
       const text = String(c);
       stdout += text;
       if (text.includes('"type":"tool_execution_end"')) sawToolEnd = true;
-      if (text.includes("dispatch-notifications")) sawNotification = true;
     });
     let stderr = "";
     child.stderr.on("data", (c) => (stderr += String(c)));
@@ -471,32 +474,129 @@ async function caseRpcDispatch(): Promise<void> {
     });
     child.stdin.write(prompt + "\n");
 
-    // 等父方工具往返（dispatch_task 返回，子代理已起）
+    // 等父方首个 run 与孩子终态，再开 drain run；固定 sleep 会低估真模型的排队与工具时间。
     await waitUntil(() => sawToolEnd, 60_000);
-
-    // 子代理在后台跑（"Say hi" 约 8 秒）。等它真的进终态——
-    // 终态通知那时才进队列。给足时间，别在子代理没跑完时发 drain prompt。
-    await new Promise((r) => setTimeout(r, 25_000));
-
-    // 子代理在后台跑（"Say hi" 约 2 秒）。它可能在第二个 prompt 的 turn 里才结束——
-    // 终态通知那时进队列，要在**再下一个** turn 边界才被 drain。
-    // 实测：两个 prompt 不够（通知在 turn 2 结束才进队列，turn 2 的 turn_end 已过了），
-    // 三个 prompt 稳。多发一个确保通知被投递。
+    await waitUntil(() => stdout.includes('"type":"agent_end"'), 60_000);
+    await waitUntil(() => readRecords(dir).some((record) => isTerminal(record.status)), 90_000);
     child.stdin.write(
       JSON.stringify({ id: "v2", type: "prompt", message: "Now just reply with the word: ok" }) +
         "\n",
     );
-    await new Promise((r) => setTimeout(r, 12_000));
-    child.stdin.write(
-      JSON.stringify({ id: "v3", type: "prompt", message: "Now just reply with the word: done" }) +
-        "\n",
-    );
+    await waitUntil(() => (stdout.match(/"type":"agent_end"/g)?.length ?? 0) >= 2, 60_000);
 
-    // 等终态通知（dispatch-notifications custom 消息）
-    const done = await waitUntil(() => sawNotification, 60_000);
+    // 正常只需 v2：孩子已在它开始前终态。若通知仍未到，再用下一回合诊断性 drain 一次。
+    if (!stdout.includes("dispatch-notifications")) {
+      child.stdin.write(
+        JSON.stringify({
+          id: "v3",
+          type: "prompt",
+          message: "Now just reply with the word: done",
+        }) + "\n",
+      );
+    }
+
+    // 等终态通知（dispatch-notifications custom 消息）；跨 chunk 到达也能看见。
+    const done = await waitUntil(() => stdout.includes("dispatch-notifications"), 60_000);
     child.kill("SIGKILL");
     const v = judgeRpc(sawToolEnd, done);
     report("rpc", "异步派发 + 工具往返 + 终态通知送达", v.ok, v.detail);
+  });
+}
+
+/** 引擎腿：真 pi 孩子 sleep 时直接调 engine.steer，证据走真实 stdout 对账。 */
+async function caseEngineSteer(): Promise<void> {
+  await withTempProject(async (dir) => {
+    const storage = new Storage(join(dir, ".pi-dispatch"), dir);
+    const registry = new TaskRegistry();
+    const engine = new TaskEngine({
+      registry,
+      storage,
+      childExtensionPath: EXT,
+      hostMode: "long-lived",
+    });
+    const handle = await engine.dispatch({
+      task: "Run the bash command `sleep 12`, then reply with exactly the word DONE",
+    });
+    if (!("taskId" in handle)) {
+      report("steer", "引擎腿拿到任务", false, "派发被拒");
+      return;
+    }
+    const taskId = handle.taskId;
+    const running = await waitUntil(() => registry.get(taskId)?.status === "running", 30_000);
+    report("steer", "引擎腿任务进入 running", running, taskId);
+    const planned = await engine.steer(
+      taskId,
+      "After the sleep finishes, reply exactly STEERED instead of DONE.",
+    );
+    report(
+      "steer",
+      "引擎腿受理转向",
+      planned.ok,
+      planned.ok ? `seq=${planned.seq}` : planned.error,
+    );
+    await waitUntil(() => {
+      const status = registry.get(taskId)?.status;
+      return status === "succeeded" || status === "failed" || status === "lost";
+    }, 90_000);
+    const record = registry.get(taskId);
+    const v = judgeSteer(record, readChildLog(record));
+    report("steer", "引擎腿转向送达并生效", v.ok, v.detail);
+    await engine.shutdown();
+  });
+}
+
+/** 隔离 + 转向：真 worktree 孩子的 sleep 中途 steer，父仓保持干净。 */
+async function caseSteerIsolated(): Promise<void> {
+  await withGitProject(async (dir, _base, git) => {
+    // 留痕放仓外：父仓必须保持干净，否则隔离腿自己把父仓弄脏。
+    const store = join(dir, "..", `${dir.split("/").pop()}-store`);
+    const storage = new Storage(store, dir);
+    const registry = new TaskRegistry();
+    const engine = new TaskEngine({
+      registry,
+      storage,
+      childExtensionPath: EXT,
+      hostMode: "long-lived",
+      repoRoot: dir,
+      isGitRepo: () => true,
+    });
+    const handle = await engine.dispatch({
+      task: "Run the bash command `sleep 12`, then reply with exactly the word DONE",
+      isolation: "worktree",
+    });
+    if (!("taskId" in handle)) {
+      report("steer-iso", "隔离腿拿到任务", false, "派发被拒");
+      return;
+    }
+    const taskId = handle.taskId;
+    const running = await waitUntil(() => registry.get(taskId)?.status === "running", 30_000);
+    report("steer-iso", "隔离腿任务进入 running", running, taskId);
+    const planned = await engine.steer(
+      taskId,
+      "After the sleep finishes, reply exactly STEERED instead of DONE.",
+    );
+    report(
+      "steer-iso",
+      "隔离腿受理转向",
+      planned.ok,
+      planned.ok ? `seq=${planned.seq}` : planned.error,
+    );
+    await waitUntil(() => {
+      const status = registry.get(taskId)?.status;
+      return status === "succeeded" || status === "failed" || status === "lost";
+    }, 120_000);
+    const record = registry.get(taskId);
+    const steer = judgeSteer(record, readChildLog(record));
+    const worktreePath = record?.worktree?.path ?? "";
+    const worktreeOk = worktreePath !== "" && existsSync(worktreePath);
+    const parentClean = git(["status", "--porcelain"]).trim() === "";
+    report(
+      "steer-iso",
+      "隔离腿转向送达且父仓干净",
+      steer.ok && worktreeOk && parentClean,
+      `${steer.detail}; worktree=${worktreeOk} parentClean=${parentClean}`,
+    );
+    await engine.shutdown();
   });
 }
 
@@ -601,6 +701,121 @@ function runTuiDriver(
   });
 }
 
+/** TUI /steer 腿：真 pty 里跑斜杠命令，屏幕出现回执后再看真实收据。 */
+const TUI_STEER_DRIVER = String.raw`import fcntl, json, os, pty, select, struct, subprocess, sys, termios, time
+
+import pyte
+
+ext, cwd = sys.argv[1], sys.argv[2]
+ROWS, COLS = 40, 120
+master, slave = pty.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
+proc = subprocess.Popen(
+    ["pi", "--no-session", "-ne", "-e", ext],
+    cwd=cwd, stdin=slave, stdout=slave, stderr=slave, close_fds=True,
+)
+os.close(slave)
+screen = pyte.Screen(COLS, ROWS)
+stream = pyte.Stream(screen)
+saw_accepted = False
+tail = b""
+sent_prompt = sent_cr = sent_steer = sent_steer_cr = False
+start = time.time()
+while time.time() - start < 180:
+    r, _, _ = select.select([master], [], [], 0.5)
+    if r:
+        try:
+            data = os.read(master, 65536)
+        except OSError:
+            break
+        if not data:
+            break
+        tail = (tail + data)[-65536:]
+        stream.feed(data.decode("utf-8", "ignore"))
+    elapsed = time.time() - start
+    if not sent_prompt and elapsed >= 3:
+        text = 'Use the dispatch_task tool with taskDescription "Run the bash command sleep 12, then reply with exactly the word DONE". Report the taskId it returned.'
+        os.write(master, text.encode("utf-8")); sent_prompt = True
+    if not sent_cr and elapsed >= 5:
+        os.write(master, b"\r"); sent_cr = True
+    if not sent_steer and elapsed >= 9:
+        os.write(master, b"/steer After the sleep finishes, reply exactly STEERED instead of DONE.")
+        sent_steer = True
+    if not sent_steer_cr and elapsed >= 10:
+        os.write(master, b"\r"); sent_steer_cr = True
+    screen_text = "\n".join(screen.display)
+    if "已受理" in screen_text:
+        saw_accepted = True
+    if saw_accepted and elapsed >= 30:
+        break
+try:
+    proc.terminate(); proc.wait(timeout=3)
+except Exception:
+    try: proc.kill()
+    except Exception: pass
+try: os.close(master)
+except Exception: pass
+print(json.dumps({"sawAccepted": saw_accepted, "tail": tail.decode("utf-8", "ignore")[-2000:]}))
+`;
+
+function runTuiSteerDriver(cwd: string): Promise<{ sawAccepted: boolean; tail: string }> {
+  return new Promise((resolve) => {
+    const child = spawn("python3", ["-c", TUI_STEER_DRIVER, EXT, cwd], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (c) => (stdout += String(c)));
+    child.stderr.on("data", (c) => (stderr += String(c)));
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve({ sawAccepted: false, tail: `[driver 超时] ${stderr.slice(-400)}` });
+    }, 240_000);
+    child.on("close", () => {
+      clearTimeout(timer);
+      const line = stdout.trim().split("\n").at(-1) ?? "";
+      try {
+        const parsed = JSON.parse(line) as { sawAccepted: boolean; tail: string };
+        resolve({ ...parsed, tail: `${parsed.tail}${stderr.slice(-400)}` });
+      } catch {
+        resolve({ sawAccepted: false, tail: `${stdout.slice(-800)}${stderr.slice(-400)}` });
+      }
+    });
+  });
+}
+
+async function caseTuiSteer(): Promise<void> {
+  await withTempProject(async (dir) => {
+    try {
+      execFileSync("python3", ["-c", "import pyte"], { stdio: "ignore" });
+    } catch {
+      report("tui-steer", "TUI /steer 真机腿", true, "跳过：python3 缺 pyte", true);
+      return;
+    }
+    const result = await runTuiSteerDriver(dir);
+    report(
+      "tui-steer",
+      "斜杠命令回执上屏",
+      result.sawAccepted,
+      result.sawAccepted ? "" : result.tail.slice(-400),
+    );
+    const record = readRecords(dir)
+      .filter((item) => item.task.includes("sleep 12"))
+      .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))[0];
+    if (!record) {
+      report("tui-steer", "真机转向收据", false, "没找到任务记录");
+      return;
+    }
+    await waitUntil(() => {
+      const status = readRecords(dir).find((item) => item.id === record.id)?.status;
+      return status === "succeeded" || status === "failed" || status === "lost";
+    }, 90_000);
+    const latest = readRecords(dir).find((item) => item.id === record.id);
+    const verdict = judgeSteer(latest, readChildLog(latest));
+    report("tui-steer", "真机转向收据", verdict.ok, verdict.detail);
+  });
+}
+
 /** TUI 模式：真 pty 起 pi TUI，pyte 重建屏幕帧，断言常驻面板「出现过、跑完清掉」。 */
 async function caseTuiDispatch(): Promise<void> {
   await withTempProject(async (dir) => {
@@ -630,6 +845,12 @@ async function caseTuiDispatch(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // 从派发子代理里启动时，继承深度会把所有父 pi 误装成孩子，全部只留下“无记录”。
+  const env = scrubbedEnv();
+  for (const key of Object.keys(process.env)) {
+    if (!(key in env)) delete process.env[key];
+  }
+  Object.assign(process.env, env);
   console.log("pi-dispatch 真机验收（print/json/rpc/tui + 隔离/黑板/非 git 拒绝）\n");
   // 确认扩展已构建
   if (!existsSync(EXT)) {
@@ -642,6 +863,34 @@ async function main(): Promise<void> {
   } catch {
     console.error("pi 不在 PATH 上");
     process.exit(2);
+  }
+
+  if (process.argv.includes("--tui-steer-only")) {
+    await caseTuiSteer();
+    const failed = RESULTS.filter((r) => !r.ok);
+    if (failed.length > 0) process.exit(3);
+    return;
+  }
+
+  if (process.argv.includes("--steer-iso-only")) {
+    await caseSteerIsolated();
+    const failed = RESULTS.filter((r) => !r.ok);
+    if (failed.length > 0) process.exit(3);
+    return;
+  }
+
+  if (process.argv.includes("--steer-only")) {
+    await caseEngineSteer();
+    const failed = RESULTS.filter((r) => !r.ok);
+    if (failed.length > 0) process.exit(3);
+    return;
+  }
+
+  if (process.argv.includes("--rpc-only")) {
+    await caseRpcDispatch();
+    const failed = RESULTS.filter((r) => !r.ok);
+    if (failed.length > 0) process.exit(3);
+    return;
   }
 
   await caseDispatch("print");
@@ -663,9 +912,15 @@ async function main(): Promise<void> {
   console.log();
   await caseIsolationRejected();
   console.log();
+  await caseEngineSteer();
+  console.log();
+  await caseSteerIsolated();
+  console.log();
   await caseRpcDispatch();
   console.log();
   await caseTuiDispatch();
+  console.log();
+  await caseTuiSteer();
   console.log();
 
   const failed = RESULTS.filter((r) => !r.ok);

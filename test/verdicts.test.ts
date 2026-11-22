@@ -11,6 +11,7 @@ import {
   judgeJsonStream,
   judgeReject,
   judgeRpc,
+  judgeSteer,
   judgeVerifyAudit,
   judgeWorktreeIsolation,
   judgeWorktreeRejected,
@@ -389,4 +390,57 @@ test("判断·黑板：板号不同 / trust 被改 / canary 缺失 / 收据为 0
 test("判断·隔离退回：零记录 ⇒ 绿，有记录 ⇒ 红", () => {
   assert.equal(judgeWorktreeRejected([]).ok, true);
   assert.equal(judgeWorktreeRejected([isolated]).ok, false);
+});
+
+test("判断·转向：seen 且最后一条 assistant 正文出现 STEERED ⇒ 绿", () => {
+  const record: TaskRecord = {
+    id: "task_steer_ok",
+    status: "succeeded",
+    task: "t",
+    steers: [{ seq: 1, text: "改", at: 1, state: "seen" }],
+  };
+  const log = [
+    { type: "message_end", message: { role: "user", content: "请回答 STEERED" } },
+    {
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "STEERED" }] },
+    },
+  ]
+    .map((event) => JSON.stringify(event))
+    .join("\n");
+  assert.equal(judgeSteer(record, log).ok, true);
+});
+
+test("判断·转向：sent/undelivered 或正文没改 ⇒ 红", () => {
+  const base: TaskRecord = { id: "task_steer_bad", status: "succeeded", task: "t" };
+  assert.equal(judgeSteer(undefined, "STEERED").ok, false, "没有记录不崩");
+  assert.equal(judgeSteer({ ...base }, "STEERED").ok, false, "没有 steers 键不崩");
+  assert.equal(judgeSteer({ ...base, steers: [] }, "STEERED").ok, false);
+  const spoken = JSON.stringify({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text: "STEERED" }] },
+  });
+  assert.equal(
+    judgeSteer({ ...base, steers: [{ seq: 1, text: "改", at: 1, state: "undelivered" }] }, spoken)
+      .ok,
+    false,
+  );
+  assert.equal(
+    judgeSteer({ ...base, steers: [{ seq: 1, text: "改", at: 1, state: "seen" }] }, "DONE").ok,
+    false,
+  );
+  const echoOnly = [
+    { type: "message_end", message: { role: "user", content: "请回答 STEERED" } },
+    {
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "DONE" }] },
+    },
+  ]
+    .map((event) => JSON.stringify(event))
+    .join("\n");
+  assert.equal(
+    judgeSteer({ ...base, steers: [{ seq: 1, text: "改", at: 1, state: "seen" }] }, echoOnly).ok,
+    false,
+    "user 回显里的 STEERED 不能冒充孩子改向",
+  );
 });

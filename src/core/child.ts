@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { constants as osConstants } from "node:os";
 import { BLACKBOARD_READ, BLACKBOARD_WRITE } from "./blackboard.ts";
+import { steerSeqFromText, textOfContent, type SteerEvidence } from "./steer.ts";
 import type { ChildDelivery, ChildReport, ChildUsage, Isolation, ReportChannel } from "./types.ts";
 
 // 起子代理：拼命令 + spawn。
@@ -313,6 +314,8 @@ export interface ParsedChildStream {
   observedProvider: string | null;
   /** 孩子的真实工具轨迹——父核对结论用，不靠模型自述 */
   delivery: ChildDelivery;
+  /** 运行中转向的投递证据（queue_update → user 回显 → assistant） */
+  steerEvidence: SteerEvidence;
 }
 
 /** 路径清单上限：父面只看前几条，超出部分不记。 */
@@ -336,6 +339,12 @@ interface StreamAcc {
   paths: string[];
   commands: string[];
   errors: number;
+  queuedSteers: Array<{ seq: number; line: number }>;
+  deliveredSteers: Array<{ seq: number; line: number }>;
+  seenSteers: Array<{ seq: number; line: number }>;
+  /** user 回显后还没等到 assistant 的 seq */
+  pendingSeen: number[];
+  reportLine?: number;
 }
 
 /** 事件流里只关心这几种形状。 */
@@ -361,6 +370,35 @@ interface StreamEvent {
   args?: { path?: unknown; command?: unknown };
   isError?: boolean;
   result?: { isError?: boolean };
+  steering?: unknown;
+}
+
+function emptyStreamAcc(): StreamAcc {
+  return {
+    text: "",
+    toolReport: null,
+    observedUsage: null,
+    usageTotal: null,
+    observedModel: null,
+    observedProvider: null,
+    tools: {},
+    paths: [],
+    commands: [],
+    errors: 0,
+    queuedSteers: [],
+    deliveredSteers: [],
+    seenSteers: [],
+    pendingSeen: [],
+  };
+}
+
+function evidenceOf(acc: StreamAcc): SteerEvidence {
+  return {
+    queued: acc.queuedSteers,
+    delivered: acc.deliveredSteers,
+    seen: acc.seenSteers,
+    ...(acc.reportLine !== undefined ? { reportLine: acc.reportLine } : {}),
+  };
 }
 
 /** 记一条碰过的路径：只收文件类工具给的 args.path，去重、有上限。 */
@@ -444,14 +482,117 @@ function addUsage(total: ChildUsage | null, next: ChildUsage): ChildUsage {
   };
 }
 
+/** queue_update / steering 元素：字符串或 {text}；其余形状忽略。 */
+function steerText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object" && typeof (value as { text?: unknown }).text === "string")
+    return (value as { text: string }).text;
+  return textOfContent(value);
+}
+
+/** queue_update：只记带标记的 seq；空队列不清已有证据。 */
+function takeQueueUpdate(event: StreamEvent, acc: StreamAcc, line: number): void {
+  const items = Array.isArray(event.steering) ? event.steering : [];
+  for (const item of items) {
+    const seq = steerSeqFromText(steerText(item));
+    if (seq === undefined) continue;
+    if (!acc.queuedSteers.some((entry) => entry.seq === seq)) acc.queuedSteers.push({ seq, line });
+  }
+}
+
+/** user 回显：首行精确标记 + 该 seq 已进过 steering 队列才算送达（初始 prompt 伪造不算）。 */
+function takeUserSteer(
+  message: NonNullable<StreamEvent["message"]>,
+  acc: StreamAcc,
+  line: number,
+): void {
+  const seq = steerSeqFromText(textOfContent(message.content));
+  if (seq === undefined) return;
+  if (!acc.queuedSteers.some((entry) => entry.seq === seq)) return;
+  if (!acc.deliveredSteers.some((entry) => entry.seq === seq)) {
+    acc.deliveredSteers.push({ seq, line });
+    acc.pendingSeen.push(seq);
+  }
+}
+
+/** assistant 回合：回显后的第一条 assistant 记 seen；再后面的不重复记。 */
+function takeAssistantSeen(acc: StreamAcc, line: number): void {
+  for (const seq of acc.pendingSeen) {
+    if (!acc.seenSteers.some((entry) => entry.seq === seq)) acc.seenSteers.push({ seq, line });
+  }
+  acc.pendingSeen = [];
+}
+
 /** 工具通道的报告：structuredContent > details.report > details 本体。 */
-function takeToolReport(message: NonNullable<StreamEvent["message"]>, acc: StreamAcc): void {
+function takeToolReport(
+  message: NonNullable<StreamEvent["message"]>,
+  acc: StreamAcc,
+  line: number,
+): void {
   if (message.role !== "toolResult" || message.toolName !== CHILD_REPORT_TOOL_NAME) return;
   const candidate = (message.structuredContent ??
     (message.details as { report?: unknown })?.report ??
     message.details) as ChildReport | undefined;
-  if (candidate && typeof candidate.summary === "string")
+  if (candidate && typeof candidate.summary === "string") {
     acc.toolReport = normalizeReport(candidate);
+    acc.reportLine = line;
+  }
+}
+
+/** 只处理转向证据；返回是否已消费该事件。 */
+function takeSteerEvent(event: StreamEvent, acc: StreamAcc, line: number): boolean {
+  if (event.type === "queue_update") {
+    takeQueueUpdate(event, acc, line);
+    return true;
+  }
+  if (event.type !== "message_end" || !event.message) return false;
+  if (event.message.role === "user") {
+    takeUserSteer(event.message, acc, line);
+    return true;
+  }
+  if (event.message.role === "assistant") {
+    takeAssistantSeen(acc, line);
+    return true;
+  }
+  return false;
+}
+
+/** 增量证据追踪：长任务 stdout 会被 #pump 砍头，证据必须在流式阶段先留下。 */
+export interface SteerEvidenceTracker {
+  push(chunk: string): void;
+  finish(): SteerEvidence;
+}
+
+export function createSteerEvidenceTracker(): SteerEvidenceTracker {
+  const acc = emptyStreamAcc();
+  let buffer = "";
+  let lineNo = 0;
+  const consume = (line: string): void => {
+    const event = parseLine(line);
+    if (!event) return;
+    takeSteerEvent(event, acc, lineNo);
+    if (event.type === "message_end" && event.message) takeToolReport(event.message, acc, lineNo);
+  };
+  return {
+    push(chunk) {
+      buffer += chunk;
+      let index = buffer.indexOf("\n");
+      while (index >= 0) {
+        lineNo += 1;
+        consume(buffer.slice(0, index));
+        buffer = buffer.slice(index + 1);
+        index = buffer.indexOf("\n");
+      }
+    },
+    finish() {
+      if (buffer) {
+        lineNo += 1;
+        consume(buffer);
+        buffer = "";
+      }
+      return evidenceOf(acc);
+    },
+  };
 }
 
 /** 一行 JSON 变成一个事件；畸形行返回 undefined（不许毒化整次解析）。 */
@@ -470,28 +611,29 @@ function parseLine(line: string): StreamEvent | undefined {
  * 单个畸形事件不许毒化整次解析——content 形状随 pi 版本变。
  */
 export function parseChildStream(stdout: string): ParsedChildStream {
-  const acc: StreamAcc = {
-    text: "",
-    toolReport: null,
-    observedUsage: null,
-    usageTotal: null,
-    observedModel: null,
-    observedProvider: null,
-    tools: {},
-    paths: [],
-    commands: [],
-    errors: 0,
-  };
-  for (const line of stdout.split("\n")) {
+  const acc = emptyStreamAcc();
+  for (const [index, line] of stdout.split("\n").entries()) {
     const event = parseLine(line);
     if (!event) continue;
+    const lineNo = index + 1;
+    if (event.type === "queue_update") {
+      takeSteerEvent(event, acc, lineNo);
+      continue;
+    }
     if (event.type?.startsWith("tool_execution_")) {
       takeToolEvent(event, acc);
       continue;
     }
     if (event.type !== "message_end" || !event.message) continue;
-    takeAssistant(event.message, acc);
-    takeToolReport(event.message, acc);
+    if (event.message.role === "user") {
+      takeSteerEvent(event, acc, lineNo);
+      continue;
+    }
+    if (event.message.role === "assistant") {
+      takeAssistant(event.message, acc);
+      takeSteerEvent(event, acc, lineNo);
+    }
+    takeToolReport(event.message, acc, lineNo);
   }
   return {
     text: acc.text,
@@ -507,6 +649,7 @@ export function parseChildStream(stdout: string): ParsedChildStream {
       errors: acc.errors,
       textChars: acc.text.length,
     },
+    steerEvidence: evidenceOf(acc),
   };
 }
 

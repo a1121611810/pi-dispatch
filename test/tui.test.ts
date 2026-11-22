@@ -1,7 +1,7 @@
 // TUI 常驻面：渲染纯函数 + registry 订阅接线。
 //
 // 等价变异（mutator 杀不掉，且在可达输入上确实等价）：
-//   src/tui.ts 剩 10 个 ?? / ?. / 兜底字面量变异点——
+//   src/tui.ts 剩 14 个 ?? / ?. / 兜底字面量变异点：
 //   · snippet（41 行）：split("\n", 1) 恒有 [0]（?. 无意义）；trim() 只回 string，
 //     "" 时 ?? 与 || 都得 ""（?? -> || 等价）。
 //   · byAge 排序（67 行）：(startedAt ?? 0) 对数字 ?? 与 || 等价；?? 1 只在 startedAt
@@ -9,20 +9,27 @@
 //     缺失输入只存在于手搓测试夹具，不经 registry 的可达路径。
 //   · ACTIVE_TEXT（69 行）：值全非空串；未知 status 时 undefined ?? r.status
 //     与 undefined || r.status 同值。
-//   · attachTuiSurface（115/117 行）：opts.owner 类型上无 null（?? 与 || 等价）；
-//     processStartMs 的 ps 失败兜底同理，且要触达需 mock 模块导入，非可达路径。
-//   其余变异点全部被杀（49 个里 39 个，见 mutator 输出）。
+//   · currentOwner（100 行）：processStartMs 对活进程返回毫秒时间戳（非 0），
+//     ?? 与 || 同值；兜底 0 -> 1 只在 ps 失败时可达，要 mock 模块导入，非可达路径。
+//   · attachTuiSurface（204 行）：opts.owner 类型上无 null（?? 与 || 等价）；
+//     processStartMs 的 ps 失败兜底同上，非可达路径。
+//   其余变异点全部被杀（74 个里 14 个存活；runSteerCommand 13/13，见 mutator 输出）。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { TaskRegistry } from "../src/core/registry.ts";
-import type { TaskRecord, TaskStatus } from "../src/core/types.ts";
+import type { SteerOutcome, TaskRecord, TaskStatus } from "../src/core/types.ts";
 import {
   attachTuiSurface,
   isSessionRecord,
   renderStatusText,
+  renderSteerOptions,
   renderWidgetLines,
+  runSteerCommand,
+  runningSteerTargets,
+  steerReceipt,
   TUI_STATUS_KEY,
   TUI_WIDGET_KEY,
+  type SteerDeps,
   type TuiOwner,
 } from "../src/tui.ts";
 
@@ -110,6 +117,33 @@ test("tui：任务描述取首行并截断", () => {
   assert.equal(lines[1], `#1111aaaa 在飞 ${"一".repeat(36)}…`);
   // # + 8 位 id + 空格 + 状态两字 + 空格 + 截断片段（36 字 + …）
   assert.ok(lines[1].length <= 1 + 8 + 1 + 2 + 1 + 36 + 1);
+  // 边界：恰好 36 字不加省略号，37 字才截（> 不是 >=）
+  assert.equal(
+    renderWidgetLines(
+      [rec({ id: "1111aaaa", status: "running", task: "二".repeat(36) })],
+      OWNER,
+    )?.[1],
+    `#1111aaaa 在飞 ${"二".repeat(36)}`,
+  );
+  assert.equal(
+    renderWidgetLines(
+      [rec({ id: "1111aaaa", status: "running", task: "二".repeat(37) })],
+      OWNER,
+    )?.[1],
+    `#1111aaaa 在飞 ${"二".repeat(36)}…`,
+  );
+});
+
+test("tui：1 在飞 + 1 排队仍在场（相加不是相减）", () => {
+  const lines = renderWidgetLines(
+    [
+      rec({ id: "1111aaaa", status: "running", task: "飞", startedAt: 1 }),
+      rec({ id: "2222bbbb", status: "queued", task: "排" }),
+    ],
+    OWNER,
+  );
+  assert.ok(lines, "active+queued 相减会让面板整体消失");
+  assert.equal(lines.length, 3);
 });
 
 test("tui：行预算 10 行——超了汇总打头、尾行报还有几个", () => {
@@ -150,6 +184,9 @@ test("tui：footer 报败/丢合计", () => {
   ];
   // 1 running + 1 stopping = 在飞2；单个 failed 也要报（>0 不是 >1）
   assert.equal(renderStatusText(records, OWNER), "派单 在飞2 · 排队0 · 败/丢1");
+  // 败与丢是相加不是相减：各有 1 个时合计 2
+  records.push(rec({ id: "4444dddd", status: "lost", task: "丢", startedAt: 6, finishedAt: 9 }));
+  assert.equal(renderStatusText(records, OWNER), "派单 在飞2 · 排队0 · 败/丢2");
 });
 
 test("tui：attach 订阅 registry——spawn 上面板，终态清面板", async () => {
@@ -212,4 +249,418 @@ test("tui：ui 抛错不冒泡（best-effort）", async () => {
     kind: "spawn",
     record: rec({ id: "1111aaaa", status: "running", task: "在飞", startedAt: 10 }),
   });
+});
+
+// ── /steer 人入口 ─────────────────────────────────────────────────────────
+
+function steerOutcome(ok: boolean, taskId = "1111aaaa", seq = 1): SteerOutcome {
+  return ok
+    ? { ok: true, taskId, seq, state: "sent", path: "/tmp/x" }
+    : { ok: false, taskId, error: "task is succeeded, not running" };
+}
+
+function fakeSteerUi(answers: { select?: string | undefined; input?: string | undefined } = {}) {
+  const calls: string[] = [];
+  return {
+    calls,
+    ui: {
+      async select(title: string, options: string[]): Promise<string | undefined> {
+        calls.push(`select:${title}:${options.join("|")}`);
+        return answers.select;
+      },
+      async input(title: string): Promise<string | undefined> {
+        calls.push(`input:${title}`);
+        return answers.input;
+      },
+      notify(message: string, level: string): void {
+        calls.push(`notify:${level}:${message}`);
+      },
+    },
+  };
+}
+
+/**
+ * 假绿元测试钩子：只由 test/test-runner.test.ts 的子进程注入。
+ * 正常环境恒等；sabotage 时故意让 fake 说假话，验证断言真在盯实现而不是 fake 自己。
+ *   no-steer  —— 只回 ok，不调真正的 steer（模拟「只 notify 不调引擎」）
+ *   wrong-id  —— 转向错误的 taskId
+ *   label-id  —— 把选项文案当 id 传下去
+ */
+const SABOTAGE = process.env.PI_DISPATCH_SABOTAGE ?? "";
+
+function sabotageSteer(steer: SteerDeps["steer"]): SteerDeps["steer"] {
+  switch (SABOTAGE) {
+    case "no-steer":
+      return async (taskId) => steerOutcome(true, taskId);
+    case "wrong-id":
+      return (taskId, text) => steer(`wrong-${taskId}`, text);
+    case "label-id":
+      return (taskId, text) => steer(`1) #${taskId.slice(0, 8)}`, text);
+    default:
+      return steer;
+  }
+}
+
+function steerDeps(
+  records: TaskRecord[],
+  ui: ReturnType<typeof fakeSteerUi>["ui"],
+  args = "",
+  overrides: Partial<SteerDeps> = {},
+): SteerDeps {
+  const deps: SteerDeps = {
+    hasUI: true,
+    args,
+    owner: OWNER,
+    records,
+    ui,
+    steer: async () => steerOutcome(true),
+    ...overrides,
+  };
+  return { ...deps, steer: sabotageSteer(deps.steer) };
+}
+
+test("steer：0 个在飞只 warning，不弹窗不调引擎", async () => {
+  const { calls, ui } = fakeSteerUi();
+  let steered = 0;
+  await runSteerCommand(
+    steerDeps([rec({ id: "1111aaaa", status: "queued", task: "排队" })], ui, "", {
+      steer: async () => {
+        steered++;
+        return steerOutcome(true);
+      },
+    }),
+  );
+  assert.equal(steered, 0);
+  assert.equal(calls.filter((c) => c.startsWith("select")).length, 0);
+  assert.match(calls[0]!, /^notify:warning:/);
+});
+
+test("steer：单任务跳过 select，引擎收到完整 id 与原文", async () => {
+  const { calls, ui } = fakeSteerUi({ input: "  改成先跑测试  " });
+  const seen: Array<[string, string]> = [];
+  await runSteerCommand(
+    steerDeps([rec({ id: "1111aaaa", status: "running", task: "干活" })], ui, "", {
+      steer: async (id, text) => {
+        seen.push([id, text]);
+        return steerOutcome(true, id, 3);
+      },
+    }),
+  );
+  assert.deepEqual(seen, [["1111aaaa", "改成先跑测试"]]);
+  assert.equal(calls.filter((c) => c.startsWith("select")).length, 0);
+  assert.match(calls.at(-1)!, /^notify:info:.*seq 3.*sent/);
+});
+
+test("steer：多任务按 index 回映真实 id，不把 label 当 id", async () => {
+  const records = [
+    rec({ id: "1111aaaa", status: "running", task: "甲", startedAt: 30 }),
+    rec({ id: "2222bbbb", status: "running", task: "乙", startedAt: 10 }),
+  ];
+  const options = renderSteerOptions(runningSteerTargets(records, OWNER));
+  const { calls, ui } = fakeSteerUi({ select: options[1], input: "改乙" });
+  const seen: string[] = [];
+  await runSteerCommand(
+    steerDeps(records, ui, "", {
+      steer: async (id) => {
+        seen.push(id);
+        return steerOutcome(true, id);
+      },
+    }),
+  );
+  assert.deepEqual(seen, ["1111aaaa"]);
+  assert.equal(seen[0]!.includes(")"), false, "select 的文案不是 id");
+  assert.equal(
+    calls.some((c) => c.startsWith("select")),
+    true,
+  );
+});
+
+test("steer：args 非空跳过 input，多任务仍先选", async () => {
+  const records = [
+    rec({ id: "1111aaaa", status: "running", task: "甲", startedAt: 1 }),
+    rec({ id: "2222bbbb", status: "running", task: "乙", startedAt: 2 }),
+  ];
+  const options = renderSteerOptions(runningSteerTargets(records, OWNER));
+  const { calls, ui } = fakeSteerUi({ select: options[0] });
+  const seen: string[] = [];
+  await runSteerCommand(
+    steerDeps(records, ui, "直接改", {
+      steer: async (id, text) => {
+        seen.push(`${id}:${text}`);
+        return steerOutcome(true, id);
+      },
+    }),
+  );
+  assert.deepEqual(seen, ["1111aaaa:直接改"]);
+  assert.equal(
+    calls.some((c) => c.startsWith("input")),
+    false,
+  );
+});
+
+test("steer：Esc/空输入不写盘", async () => {
+  const one = [rec({ id: "1111aaaa", status: "running", task: "活" })];
+  for (const answer of [undefined, "   "]) {
+    const { calls, ui } = fakeSteerUi({ input: answer });
+    let steered = 0;
+    await runSteerCommand(
+      steerDeps(one, ui, "", {
+        steer: async () => {
+          steered++;
+          return steerOutcome(true);
+        },
+      }),
+    );
+    assert.equal(steered, 0);
+    assert.equal(
+      calls.some((c) => c.startsWith("notify:error")),
+      false,
+    );
+  }
+});
+
+test("steer：select 取消/未知项不发送", async () => {
+  const records = [
+    rec({ id: "1111aaaa", status: "running", task: "甲", startedAt: 1 }),
+    rec({ id: "2222bbbb", status: "running", task: "乙", startedAt: 2 }),
+  ];
+  for (const answer of [undefined, "9) 不存在"]) {
+    const { calls, ui } = fakeSteerUi({ select: answer });
+    let steered = 0;
+    await runSteerCommand(
+      steerDeps(records, ui, "", {
+        steer: async () => {
+          steered++;
+          return steerOutcome(true);
+        },
+      }),
+    );
+    assert.equal(steered, 0);
+    if (answer === undefined) {
+      assert.equal(
+        calls.some((c) => c.includes("未知选项")),
+        false,
+        "Esc 是取消，不是错误",
+      );
+    }
+  }
+});
+
+test("steer：失败回红字原文，不冒充已受理", async () => {
+  const { calls, ui } = fakeSteerUi({ input: "改" });
+  await runSteerCommand(
+    steerDeps([rec({ id: "1111aaaa", status: "running", task: "活" })], ui, "", {
+      steer: async () => steerOutcome(false),
+    }),
+  );
+  assert.match(calls.at(-1)!, /^notify:error:task is succeeded/);
+  assert.equal(
+    calls.some((c) => c.includes("已受理")),
+    false,
+  );
+});
+
+test("steer：引擎抛异常不冒泡", async () => {
+  const { calls, ui } = fakeSteerUi({ input: "改" });
+  await runSteerCommand(
+    steerDeps([rec({ id: "1111aaaa", status: "running", task: "活" })], ui, "", {
+      steer: async () => {
+        throw new Error("engine torn down");
+      },
+    }),
+  );
+  assert.match(calls.at(-1)!, /^notify:error:转向失败：engine torn down/);
+});
+
+test("steer：hasUI=false 全静默", async () => {
+  const { calls, ui } = fakeSteerUi({ input: "改" });
+  let steered = 0;
+  await runSteerCommand(
+    steerDeps([rec({ id: "1111aaaa", status: "running", task: "活" })], ui, "", {
+      hasUI: false,
+      steer: async () => {
+        steered++;
+        return steerOutcome(true);
+      },
+    }),
+  );
+  assert.equal(steered, 0);
+  assert.deepEqual(calls, []);
+});
+
+test("steer：选项从 1 开始编号，标签用 id 前 8 位", () => {
+  const records = [
+    rec({ id: "abcdef123456", status: "running", task: "甲", startedAt: 1 }),
+    rec({ id: "1234567890ab", status: "running", task: "乙", startedAt: 2 }),
+  ];
+  assert.deepEqual(renderSteerOptions(records), ["1) #abcdef12 甲", "2) #12345678 乙"]);
+});
+
+test("steer：回执用完整 id 前 8 位，不写 path", () => {
+  const receipt = steerReceipt(steerOutcome(true, "abcdef123456", 2));
+  assert.match(receipt.text, /#abcdef12/);
+  assert.doesNotMatch(receipt.text, /abcde123/);
+});
+
+test("steer：只列 running，stopping/queued/终态都不列", () => {
+  const records = [
+    rec({ id: "1111aaaa", status: "running", task: "在飞" }),
+    rec({ id: "2222bbbb", status: "stopping", task: "收队" }),
+    rec({ id: "3333cccc", status: "queued", task: "排队" }),
+    rec({ id: "4444dddd", status: "succeeded", task: "完成" }),
+  ];
+  assert.deepEqual(
+    runningSteerTargets(records, OWNER).map((r) => r.id),
+    ["1111aaaa"],
+  );
+});
+
+test("steer：owner 不同的在飞任务不列出", () => {
+  const records = [
+    rec({ id: "1111aaaa", status: "running", task: "自家" }),
+    rec({ id: "2222bbbb", status: "running", task: "别家", ownerPid: 1 }),
+  ];
+  assert.deepEqual(
+    runningSteerTargets(records, OWNER).map((r) => r.id),
+    ["1111aaaa"],
+  );
+});
+
+test("steer：成功回执只写 sent，不带 path", () => {
+  const receipt = steerReceipt(steerOutcome(true, "abcdef123456", 7));
+  assert.equal(
+    receipt.text,
+    "已受理 #abcdef12 · seq 7 · state=sent（只代表写进信箱；送达与生效看任务结束通知）",
+  );
+  assert.equal(receipt.level, "info");
+  // 只承诺 sent：不得出现送达/已读/路径等更强口径
+  for (const forbidden of ["delivered", "seen", "http", "path", "/tmp"]) {
+    assert.equal(receipt.text.includes(forbidden), false, `回执里不该有 ${forbidden}`);
+  }
+});
+
+// ── 方案补口：排序/owner 三类/args 单任务/Esc 零副作用/退出竞态/重复 label ──
+
+test("steer：多任务按 startedAt 升序给选项，不保留输入序", () => {
+  const records = [
+    rec({ id: "3333cccc", status: "running", task: "丙", startedAt: 30 }),
+    rec({ id: "1111aaaa", status: "running", task: "甲", startedAt: 10 }),
+    rec({ id: "2222bbbb", status: "running", task: "乙", startedAt: 20 }),
+  ];
+  assert.deepEqual(renderSteerOptions(runningSteerTargets(records, OWNER)), [
+    "1) #1111aaaa 甲",
+    "2) #2222bbbb 乙",
+    "3) #3333cccc 丙",
+  ]);
+});
+
+test("steer：别 pid/缺戳/restore 的在飞任务都不列出", async () => {
+  const records = [
+    rec({ id: "1111aaaa", status: "running", task: "自家" }),
+    rec({ id: "2222bbbb", status: "running", task: "别 pid", ownerPid: 1 }),
+    rec({ id: "3333cccc", status: "running", task: "缺戳", ownerPid: undefined }),
+    rec({
+      id: "4444dddd",
+      status: "running",
+      task: "restore 装回",
+      ownerStartMs: OWNER.startMs - 1,
+    }),
+  ];
+  assert.deepEqual(
+    runningSteerTargets(records, OWNER).map((r) => r.id),
+    ["1111aaaa"],
+  );
+
+  // 只剩异己记录 ⇒ 0 targets：只 warning，不弹选择
+  const { calls, ui } = fakeSteerUi();
+  let steered = 0;
+  await runSteerCommand(
+    steerDeps(records.slice(1), ui, "改", {
+      steer: async () => {
+        steered++;
+        return steerOutcome(true);
+      },
+    }),
+  );
+  assert.equal(steered, 0);
+  assert.equal(
+    calls.some((c) => c.startsWith("select")),
+    false,
+  );
+  assert.deepEqual(calls, ["notify:warning:没有在飞任务（排队中的先 dispatch_stop 再重派）"]);
+});
+
+test("steer：单任务 args 非空跳过 input，原文直达引擎", async () => {
+  const { calls, ui } = fakeSteerUi({ input: "不该被用到" });
+  const seen: Array<[string, string]> = [];
+  await runSteerCommand(
+    steerDeps([rec({ id: "1111aaaa", status: "running", task: "活" })], ui, "直接改", {
+      steer: async (id, text) => {
+        seen.push([id, text]);
+        return steerOutcome(true, id);
+      },
+    }),
+  );
+  assert.deepEqual(seen, [["1111aaaa", "直接改"]]);
+  assert.equal(calls.filter((c) => c.startsWith("input")).length, 0);
+});
+
+test("steer：input Esc 静默，零副作用", async () => {
+  const { calls, ui } = fakeSteerUi({ input: undefined });
+  let steered = 0;
+  await runSteerCommand(
+    steerDeps([rec({ id: "1111aaaa", status: "running", task: "活" })], ui, "", {
+      steer: async () => {
+        steered++;
+        return steerOutcome(true);
+      },
+    }),
+  );
+  assert.equal(steered, 0);
+  assert.equal(calls.length, 1, `只该有 input 调用，实际：${calls.join("|")}`);
+  assert.match(calls[0]!, /^input:转向 #1111aaaa：/);
+});
+
+test("steer：select 后任务退出，透传 engine 原文且不重试", async () => {
+  const records = [
+    rec({ id: "1111aaaa", status: "running", task: "甲", startedAt: 1 }),
+    rec({ id: "2222bbbb", status: "running", task: "乙", startedAt: 2 }),
+  ];
+  const options = renderSteerOptions(runningSteerTargets(records, OWNER));
+  const { calls, ui } = fakeSteerUi({ select: options[1] });
+  const seen: string[] = [];
+  await runSteerCommand(
+    steerDeps(records, ui, "改", {
+      steer: async (id) => {
+        seen.push(id);
+        return { ok: false, taskId: id, error: "task is succeeded, not running" };
+      },
+    }),
+  );
+  assert.deepEqual(seen, ["2222bbbb"], "只发一次，且是选中项");
+  assert.equal(calls.filter((c) => c.startsWith("select")).length, 1, "退出后不许二次选择/重试");
+  assert.match(calls.at(-1)!, /^notify:error:task is succeeded, not running$/);
+  assert.equal(
+    calls.some((c) => c.includes("已受理")),
+    false,
+  );
+});
+
+test("steer：重复 label 仍按序号映射到第二项", async () => {
+  const records = [
+    rec({ id: "abcdef120001", status: "running", task: "同名", startedAt: 1 }),
+    rec({ id: "abcdef120002", status: "running", task: "同名", startedAt: 2 }),
+  ];
+  assert.deepEqual(renderSteerOptions(records), ["1) #abcdef12 同名", "2) #abcdef12 同名"]);
+  const { ui } = fakeSteerUi({ select: "2) #abcdef12 同名" });
+  const seen: string[] = [];
+  await runSteerCommand(
+    steerDeps(records, ui, "改", {
+      steer: async (id) => {
+        seen.push(id);
+        return steerOutcome(true, id);
+      },
+    }),
+  );
+  assert.deepEqual(seen, ["abcdef120002"]);
 });

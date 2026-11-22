@@ -1,4 +1,5 @@
 import type { TaskRegistry } from "./registry.ts";
+import { tallySteers, type SteerTally } from "./steer.ts";
 
 // 通知：后台任务完成的消息按批发给父方。
 // 事件源 = registry 的终态变迁。100 KB 一批切开，别刷屏。
@@ -11,6 +12,10 @@ export interface TaskNotification {
   deliveryUnverified?: boolean;
   /** 谎报自检（声称的命令没观测到） */
   verifyUnverified?: boolean;
+  /** 工具通道报告早于最后一次转向送达（以最终正文为准） */
+  reportStale?: true;
+  /** 转向收据计数（只在任务真的被转向过时出现） */
+  steers?: SteerTally;
 }
 
 export const NOTIFICATION_BATCH_MAX_BYTES = 100 * 1024;
@@ -52,6 +57,8 @@ export class NotificationCenter {
         at: next.finishedAt ?? Date.now(),
         ...(next.deliveryUnverified ? { deliveryUnverified: true } : {}),
         ...(next.verifyUnverified ? { verifyUnverified: true } : {}),
+        ...(next.reportStale ? { reportStale: true as const } : {}),
+        ...(next.steers && next.steers.length > 0 ? { steers: tallySteers(next.steers) } : {}),
       });
     });
   }

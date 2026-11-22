@@ -1,7 +1,22 @@
-import { isTerminal, type TaskRecord, type TaskStatus, type WorktreeInfo } from "./types.ts";
+import {
+  isTerminal,
+  type SteerState,
+  type TaskRecord,
+  type TaskStatus,
+  type WorktreeInfo,
+} from "./types.ts";
 
 // 状态机：queued 入队即存在；终态没有出边。
 // 往终态上写的迟到消息静默丢弃——竞态下这是常事，不报错。
+
+/** 收据只能前进：迟到的 sent 不许把 seen 降回去。 */
+const STEER_ORDER: Readonly<Record<SteerState, number>> = {
+  sent: 0,
+  undelivered: 1,
+  queued: 2,
+  delivered: 3,
+  seen: 4,
+};
 
 const ALLOWED_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
   queued: ["running", "canceled", "lost"],
@@ -40,6 +55,12 @@ export type TaskCommand =
       /** assessment 空转（小窗资格粗筛） */
       vacuous?: boolean;
     }
+  | {
+      kind: "attach-steer";
+      id: string;
+      steers: NonNullable<TaskRecord["steers"]>;
+      reportStale?: boolean;
+    }
   | { kind: "attach-output"; id: string; outputPath: string; truncated?: boolean };
 
 export interface CommandResult {
@@ -50,6 +71,7 @@ export interface CommandResult {
 }
 
 type AttachWorktreeCommand = Extract<TaskCommand, { kind: "attach-worktree" }>;
+type AttachSteerCommand = Extract<TaskCommand, { kind: "attach-steer" }>;
 type ResolveExitCommand = Extract<TaskCommand, { kind: "resolve-exit" }>;
 
 /**
@@ -106,6 +128,33 @@ export function compareTerminal(a: TaskRecord, b: TaskRecord): number {
   if (at !== bt) return at - bt;
   if (a.id === b.id) return 0;
   return a.id < b.id ? -1 : 1;
+}
+
+/**
+ * 转向收据：按 seq upsert，保留第一次写入的正文与时刻，只补 state 与时间。
+ * 终态上的迟到写入静默丢弃（与报告/产出同一姿态）。
+ */
+export function applyAttachSteer(current: TaskRecord, command: AttachSteerCommand): CommandResult {
+  if (isTerminal(current.status))
+    return { record: current, fromStatus: current.status, changed: false };
+  const bySeq = new Map((current.steers ?? []).map((steer) => [steer.seq, steer]));
+  for (const steer of command.steers) {
+    const previous = bySeq.get(steer.seq);
+    const state =
+      previous && STEER_ORDER[previous.state] > STEER_ORDER[steer.state]
+        ? previous.state
+        : steer.state;
+    bySeq.set(
+      steer.seq,
+      previous ? { ...previous, ...steer, state, text: previous.text, at: previous.at } : steer,
+    );
+  }
+  const next: TaskRecord = {
+    ...current,
+    steers: [...bySeq.values()].sort((a, b) => a.seq - b.seq),
+    ...(command.reportStale ? { reportStale: true as const } : {}),
+  };
+  return { record: next, fromStatus: current.status, changed: true };
 }
 
 /** 记录的唯一合法写入者。判定在写锁内做，命令不点名目标终态。 */
@@ -213,6 +262,15 @@ export class TaskRegistry {
         const next = applyAttachWorktree(current, command);
         this.#records.set(command.id, next.record);
         this.#emit(next.record, current);
+        return next;
+      }
+      case "attach-steer": {
+        const current = this.#require(command.id);
+        const next = applyAttachSteer(current, command);
+        if (next.changed) {
+          this.#records.set(command.id, next.record);
+          this.#emit(next.record, current);
+        }
         return next;
       }
       case "attach-output": {

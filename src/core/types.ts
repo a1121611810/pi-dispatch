@@ -126,6 +126,21 @@ export interface ChildUsage {
 /** 报告的到达通道。none = 什么都没交，要说出来，不要装成交了。 */
 export type ReportChannel = "tool" | "prompt-json" | "none";
 
+/** 一条转向的收据状态。sent = 只写了盘；queued = 孩子队列见过；delivered = user 回显；seen = 回显后有过 assistant 回合；undelivered = 退出时无证据。 */
+export type SteerState = "sent" | "queued" | "delivered" | "seen" | "undelivered";
+
+/** 运行中转向的收据。运行中只写 sent；退出时按事件流证据补终态。 */
+export interface SteerRecord {
+  seq: number;
+  /** 父方原文（不含首行标记） */
+  text: string;
+  at: number;
+  state: SteerState;
+  queuedAt?: number;
+  deliveredAt?: number;
+  seenAt?: number;
+}
+
 /** 孩子交回的结构化报告。三段式：summary=是什么，why=为什么，assessment=怎么样；后两段是判断，findings 是证据，files_touched/usage 是回执。 */
 export interface ChildReport {
   summary: string;
@@ -175,6 +190,10 @@ export interface TaskRecord {
   worktree?: WorktreeInfo;
   /** 黑板信息（只在开了黑板时写） */
   blackboard?: BlackboardInfo;
+  /** 转向收据（只在写过转向时出现） */
+  steers?: SteerRecord[];
+  /** 工具通道报告早于最后一次送达的转向——小窗资格失效 */
+  reportStale?: true;
 }
 
 /** 派发的结果。长驻模式返回 handle，一次性模式返回完整结果。 */
@@ -215,6 +234,15 @@ export interface DispatchResult {
   worktree?: WorktreeInfo;
   /** 黑板信息（只在开了黑板时带出） */
   blackboard?: BlackboardInfo;
+  /** 转向收据（只在写过转向时带出） */
+  steers?: SteerRecord[];
+  /** 工具通道报告早于最后一次送达的转向 */
+  reportStale?: true;
 }
+
+/** 转向受理结果。 */
+export type SteerOutcome =
+  | { ok: true; taskId: string; seq: number; state: "sent"; path: string }
+  | { ok: false; taskId: string; error: string };
 
 export type DispatchOutcome = DispatchHandle | TaskRejection | DispatchResult;

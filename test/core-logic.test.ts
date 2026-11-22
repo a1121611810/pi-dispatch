@@ -6,6 +6,8 @@
 //   两向恒同值（0 ?? 0 与 0 || 0 都是 0，undefined 都是 0，非零都是原值）；NaN 不是合法时刻。
 //   同刻编号 tiebreak 已抽成 compareTerminal，由「比较器同刻按编号双向定序」直接钉住
 //   （只经 Array.sort 观察时，返回 0 与 1 在互异 id 上会得到同一个序，变异杀不掉）。
+//   src/core/registry.ts 的 `current.steers ?? []` → `||`——空数组是真值，两向同值 ⇒ 等价。
+//   compareTerminal 的 `id < id` → `<=`——同 id 已在上一行返回 0，可达输入上只比异 id ⇒ 等价。
 //   src/core/gates.ts 的 `deps.isGitRepo ?? (() => false)` → `||`——isGitRepo 的类型是
 //   `() => boolean`，函数恒真 ⇒ ?? 与 || 在可达输入上给同一个谓词 ⇒ 等价。
 import { test } from "node:test";
@@ -24,6 +26,7 @@ import {
   defaultGates,
 } from "../src/core/gates.ts";
 import {
+  applyAttachSteer,
   applyAttachWorktree,
   applyResolveExit,
   compareTerminal,
@@ -601,4 +604,72 @@ test("纯函数：applyAttachWorktree——只写元数据，不改 status、不
   assert.equal(result.record.status, "running", "不改 status");
   assert.equal(result.record.worktree?.path, "/wt/w");
   assert.equal(current.worktree, undefined, "旧记录不受影响（不可变）");
+});
+
+test("状态机：attach-steer 按 seq upsert，保留正文/时刻，终态静默丢弃", () => {
+  const current: TaskRecord = {
+    id: "s",
+    status: "running",
+    task: "t",
+    steers: [{ seq: 1, text: "甲", at: 10, state: "sent" }],
+  };
+  const merged = applyAttachSteer(current, {
+    kind: "attach-steer",
+    id: "s",
+    steers: [{ seq: 1, text: "被改", at: 99, state: "seen" }],
+  });
+  assert.equal(merged.changed, true);
+  assert.equal(merged.record.status, "running", "不改 status");
+  assert.deepEqual(merged.record.steers, [{ seq: 1, text: "甲", at: 10, state: "seen" }]);
+  assert.equal(current.steers![0]!.state, "sent", "旧记录不变");
+
+  const terminal = applyAttachSteer(
+    { ...current, status: "succeeded" },
+    { kind: "attach-steer", id: "s", steers: [{ seq: 2, text: "乙", at: 20, state: "sent" }] },
+  );
+  assert.equal(terminal.changed, false, "终态上的迟到写入静默丢弃");
+  assert.deepEqual(terminal.record.steers, current.steers);
+});
+
+test("状态机：attach-steer 迟到的 sent 不许把 seen 降级", () => {
+  const current: TaskRecord = {
+    id: "s3",
+    status: "running",
+    task: "t",
+    steers: [{ seq: 1, text: "甲", at: 1, state: "seen" }],
+  };
+  const merged = applyAttachSteer(current, {
+    kind: "attach-steer",
+    id: "s3",
+    steers: [{ seq: 1, text: "甲", at: 1, state: "sent" }],
+  });
+  assert.equal(merged.record.steers![0]!.state, "seen");
+  const undelivered = applyAttachSteer(
+    { ...current, steers: [{ seq: 1, text: "甲", at: 1, state: "seen" }] },
+    {
+      kind: "attach-steer",
+      id: "s3",
+      steers: [{ seq: 1, text: "甲", at: 1, state: "undelivered" }],
+    },
+  );
+  assert.equal(undelivered.record.steers![0]!.state, "seen", "迟到的 undelivered 也不许降级");
+});
+
+test("状态机：attach-steer 输出按 seq 升序，不靠输入顺序", () => {
+  const merged = applyAttachSteer(
+    {
+      id: "s2",
+      status: "running",
+      task: "t",
+      steers: [
+        { seq: 2, text: "乙", at: 2, state: "delivered" },
+        { seq: 1, text: "甲", at: 1, state: "seen" },
+      ],
+    },
+    { kind: "attach-steer", id: "s2", steers: [{ seq: 3, text: "丙", at: 3, state: "sent" }] },
+  );
+  assert.deepEqual(
+    merged.record.steers!.map((steer) => steer.seq),
+    [1, 2, 3],
+  );
 });

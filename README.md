@@ -13,23 +13,26 @@ Programmable subagent dispatch for [pi](https://github.com/earendil-works/pi).
 - **派子代理** —— `dispatch_task` 递一段任务，立刻拿编号（长驻宿主 rpc/tui）或等它跑完拿交付物（一次性宿主 print/json）
 - **排队** —— 座位是从内存池切出来的份额，满了 FIFO 排队等，**永远不拒绝**
 - **管住** —— 盯卡住（静默 5 分钟 + 无在飞工具）、超时收掉、能停（排队中的抽掉，在跑的 SIGTERM→SIGKILL）
+- **转向** —— 孩子还在跑时 `dispatch_steer` 插一句话，它在下一个回合边界看到后调整方向继续干；不打断在飞工具，收据分 `sent` / `queued` / `delivered` / `seen` / `undelivered`；终态通知汇总「转向 N 条：送达 D / 生效 S（未送达 U）」
 - **留痕** —— 每次派发一条记录，落 `~/.pi/dispatch/<项目桶>/`，原子写、压缩归档、重启恢复
 - **核对** —— 收据从子代理的动作抽（不依赖它自述）；报告三种通道（tool / prompt-json / none）；自述的文件和收据一个都对不上时标 `deliveryUnverified`（后缀匹配，相对/绝对路径都认）；谎报自检（`verified` 声称跑过的命令、收据 commands 里一条都没观测到）标 `verifyUnverified`——意思是「没有实测支撑」，不是「一定在撒谎」
 
 ## 父方工具
 
-| 工具                  | 作用                                                        |
-| --------------------- | ----------------------------------------------------------- |
-| `dispatch_task`       | 派任务（10 个参数：`taskDescription` 必填，其余可选）       |
-| `dispatch_list`       | 查记录（状态 / 时长 / 用量 / 报告 / 收据）                  |
-| `dispatch_blackboard` | 读本会话的共享黑板（只读；板上的话恒为 `trust=unverified`） |
-| `dispatch_stop`       | 停任务                                                      |
+| 工具                  | 作用                                                           |
+| --------------------- | -------------------------------------------------------------- |
+| `dispatch_task`       | 派任务（10 个参数：`taskDescription` 必填，其余可选）          |
+| `dispatch_list`       | 查记录（状态 / 时长 / 用量 / 报告 / 收据）                     |
+| `dispatch_blackboard` | 读本会话的共享黑板（只读；板上的话恒为 `trust=unverified`）    |
+| `dispatch_stop`       | 停任务                                                         |
+| `dispatch_steer`      | 运行中改方向（只受理 running；≤4096 字符，一个任务最多 16 条） |
 
 ## 设计要点
 
 - **核心层不 import pi** —— 全部业务规则在 `src/core/`，四个依赖（spawn / 读机器 / 时钟 / 存储目录）可注入
+- **转向不新增状态** —— 记录上的一组 `steers` 收据；信箱在任务目录，孩子扩展在 `turn_end` 读，argv / stdin / 退出语义零改动
 - **等待语义由宿主模式定** —— rpc/tui 异步（立刻编号 + 终态通知），print/json 同步等终态（一次性宿主进程会先退出，异步会丢交付物）
-- **TUI 人看面** —— tui 宿主挂常驻 widget + footer 状态（在飞/排队逐条 + 汇总，全部跑完即清）；只算本会话任务（主方戳双对），restore 的历史不上板；模型面通知不变
+- **TUI 人看面** —— tui 宿主挂常驻 widget + footer 状态（在飞/排队逐条 + 汇总，全部跑完即清）；只算本会话任务（主方戳双对），restore 的历史不上板；人可用 `/steer [消息]` 给在飞孩子插话，回执只承诺 `sent`
 - **座位 = 内存池份额** —— 池子量 = 可用 − 预留（总内存 10%），每座份额 = max(512 MiB, 总内存 2%)（实测校准：子代理峰值 RSS 约 148 MiB）
 - **`allowScripts`** —— 一个布尔透传到拼命令：宽档只加 `-e builtin:codemode`（不动工具表），只读档在 `--tools` 名单里补上 `codemode`——两处都要，漏一处能力就看不见
 
@@ -42,6 +45,10 @@ Programmable subagent dispatch for [pi](https://github.com/earendil-works/pi).
 
 ## 已知边界
 
+- **转向的送达点是回合边界** —— 孩子在跑的长工具不会被打断；消息在「工具批次跑完、下一次 LLM 调用前」才进上下文。`sent` 只表示写进了信箱，送到没送到看收据 `state`：`queued`（pi 队列见过）→ `delivered`（user 回显）→ `seen`（其后有过 assistant 回合）。只有 `queued` 证据的退出后保留 `queued`——**已入队、没进 transcript**，不是收据里的 `undelivered`（通知的「未送达」计数会把它算进去）。
+- **最后一个 `turn_end` 之后写进去的转向永远送不到** —— 孩子退出即结束，不重放、不复活；父方看到 `undelivered`，要补就重派。旧 pi 没有 `sendUserMessage` 时孩子不装收件箱，任务照跑，转向同样落 `undelivered`。
+- **报告可能早于最后一次转向** —— 工具通道的报告若早于最后一次送达，记 `reportStale`，失去小窗资格；以最终正文 + delivery 为准复核。
+- **一次性宿主没有插话窗口** —— print/json 里父方阻塞在 `dispatch_task`，转向只对 rpc/tui 有意义。
 - **通知在 turn 边界投递** —— rpc/tui 长驻宿主的终态通知 `deliverAs: "nextTurn"`，要等**下一个** turn 才到模型眼前。子代理在 turn N 结束时完成的通知，turn N 的 turn_end 已过了，最早 turn N+1 才投递。交互式使用没问题（用户会持续发消息）；纯脚本驱动要预期这一点。tui 里人的实时状态看常驻 widget，不依赖这条通道。
 - **print/json 同步等待可能很长** —— 子代理跑几分钟，父方工具调用就一直挂着。有 `timeoutMs` 与卡住判定兜底。
 - **座位 0 时一次性宿主直接退回** —— 机器太挤（可用低于预留）时 `seatCap` 是 0，这个进程里没有任何子代理能结束并腾出座位，因此不等、直接回「machine is too tight」，避免挂死父方。

@@ -4,6 +4,7 @@ import { ChildActivityTracker, DEFAULT_STALL_MS, STALL_CHECK_INTERVAL_MS } from 
 import {
   assessmentVacuous,
   buildPiArgv,
+  createSteerEvidenceTracker,
   deliveryUnverified,
   parseChildStream,
   extractReportFromText,
@@ -26,6 +27,7 @@ import {
   type MachineSpec,
 } from "./pool.ts";
 import { Storage, isPidAlive, processStartMs } from "./storage.ts";
+import { isReportStale, parseSteerLines, planSteer, reconcileSteerReceipts } from "./steer.ts";
 import {
   branchNameFor,
   createWorktree,
@@ -42,6 +44,7 @@ import type {
   DispatchOutcome,
   DispatchResult,
   HostMode,
+  SteerOutcome,
   TaskRecord,
   WorktreeInfo,
 } from "./types.ts";
@@ -203,19 +206,22 @@ export function childEnvFor(
   baseEnv: NodeJS.ProcessEnv,
   taskId: string,
   blackboard?: { boardId: string; path: string },
+  steerFile?: string,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...baseEnv,
     PI_DISPATCH_DEPTH: String(Number(baseEnv.PI_DISPATCH_DEPTH ?? 0) + 1),
     PI_DISPATCH_TASK_ID: taskId,
   };
-  // 继承来的黑板 env 一律擦掉：这块会话没开黑板就不该有板目录（G5）
+  // 继承来的黑板/转向 env 一律擦掉：这块会话没开就不该有对应目录
   delete env.PI_DISPATCH_BLACKBOARD_DIR;
   delete env.PI_DISPATCH_BLACKBOARD_ID;
+  delete env.PI_DISPATCH_STEER_FILE;
   if (blackboard) {
     env.PI_DISPATCH_BLACKBOARD_DIR = blackboard.path;
     env.PI_DISPATCH_BLACKBOARD_ID = blackboard.boardId;
   }
+  if (steerFile) env.PI_DISPATCH_STEER_FILE = steerFile;
   return env;
 }
 
@@ -339,6 +345,10 @@ export class TaskEngine {
   #wakeTimer?: NodeJS.Timeout;
   #ending = false;
   #teardown = false;
+  /** 转向串行尾：两次并发 steer 不许读到同一个 seq 再各写一行。 */
+  #steerTail: Promise<unknown> = Promise.resolve();
+  /** 已经进入退出对账的任务：不再受理新的转向（spawn 前仍可受理）。 */
+  readonly #steerClosed = new Set<string>();
 
   constructor(deps: EngineDeps) {
     this.#registry = deps.registry;
@@ -437,6 +447,68 @@ export class TaskEngine {
 
   dispatch(input: DispatchInput): Promise<DispatchOutcome> {
     return this.#ready.then(() => this.#dispatchReady(input));
+  }
+
+  /**
+   * 运行中转向：只受理 running；写一行、记 sent，孩子在下一个 turn_end 取走。
+   * 串行化是为了并发两次调用得到 seq 1/2，而不是都从文件尾读到同一个 seq。
+   */
+  steer(taskId: string, text: string): Promise<SteerOutcome> {
+    const run = this.#steerTail.then(() => this.#steerNow(taskId, text));
+    this.#steerTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  async #steerNow(taskId: string, text: string): Promise<SteerOutcome> {
+    await this.#ready;
+    const record = this.#registry.get(taskId);
+    if (!record) return { ok: false, taskId, error: "unknown task id" };
+    // 进入退出对账后不再收：避免终态 reconcile 之后再来一笔 sent 永久挂着。
+    // 不用 #children.has：spawn 前 status 已是 running，那个窗口里转向是合法的。
+    if (this.#steerClosed.has(taskId))
+      return { ok: false, taskId, error: "child is finishing; steer window closed" };
+    // 用户原话是「孩子还在跑的时候」；queued 还没开工，改任务应该 stop + 重派。
+    let existing;
+    try {
+      existing = this.#storage ? parseSteerLines(this.#storage.readSteer(taskId)) : [];
+    } catch (error) {
+      return {
+        ok: false,
+        taskId,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+    const plan = planSteer({
+      status: record.status,
+      text,
+      existing,
+      hasStorage: Boolean(this.#storage),
+      hasChildExtension: Boolean(this.#childExtensionPath),
+    });
+    if (!plan.ok) return { ok: false, taskId, error: plan.error };
+    const seq = plan.seq;
+    const trimmed = plan.text;
+    const at = this.#now();
+    let path: string;
+    try {
+      path = this.#storage!.appendSteer(taskId, JSON.stringify({ seq, text: trimmed, at }));
+    } catch (error) {
+      return {
+        ok: false,
+        taskId,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+    // 写盘成功才记 sent；写失败不能先在账上记一笔。
+    await this.#registry.submit({
+      kind: "attach-steer",
+      id: taskId,
+      steers: [{ seq, text: trimmed, at, state: "sent" }],
+    });
+    return { ok: true, taskId, seq, state: "sent", path };
   }
 
   async #dispatchReady(rawInput: DispatchInput): Promise<DispatchOutcome> {
@@ -719,7 +791,12 @@ export class TaskEngine {
   /** 深度 + 编号：孩子知道自己 depth 与父任务 id。 */
   #childEnv(taskId: string, input: DispatchInput): NodeJS.ProcessEnv {
     const board = this.#registry.get(taskId)?.blackboard;
-    return childEnvFor(process.env, taskId, input.blackboard === true ? board : undefined);
+    return childEnvFor(
+      process.env,
+      taskId,
+      input.blackboard === true ? board : undefined,
+      this.#storage?.steerPath(taskId),
+    );
   }
 
   /** 盯住已经起好的孩子：超时 / 卡住 / 收四样 / 定终态。 */
@@ -750,8 +827,10 @@ export class TaskEngine {
 
     let text = "";
     let outputTruncated = false;
+    const evidence = createSteerEvidenceTracker();
     child.onOutput((chunk) => {
       activity.push(chunk);
+      evidence.push(chunk);
       text += chunk;
       if (text.length > STDOUT_KEEP_CHARS) {
         text = text.slice(-STDOUT_KEEP_CHARS); // 砍头留尾：报告/usage 在最末尾
@@ -768,11 +847,24 @@ export class TaskEngine {
     });
     if (timer) clearTimeout(timer);
     if (stallGuard) clearInterval(stallGuard);
+    this.#steerClosed.add(taskId);
     this.#children.delete(taskId);
+    // 先把已受理的转向落账，再做唯一一次终态对账：否则刚过线的 steer 会被静默丢掉。
+    await this.#steerTail;
 
     const outputPath = this.#storage ? this.#storage.persistOutput(taskId, text) : "";
     const parsed = parseChildStream(text);
     const finalText = parsed.text || text;
+    const steerEvidence = evidence.finish();
+
+    // 转向：运行中只记了 sent；退出时按真机事件证据补终态。
+    // 先于 resolve-exit 写，终态记录和一次性宿主的结果都能看到。
+    const currentSteers = this.#registry.get(taskId)?.steers;
+    if (currentSteers && currentSteers.length > 0) {
+      const steers = reconcileSteerReceipts(currentSteers, steerEvidence, this.#now());
+      const reportStale = isReportStale(steerEvidence);
+      await this.#registry.submit({ kind: "attach-steer", id: taskId, steers, reportStale });
+    }
 
     // 报告四通道：tool 优先；退 prompt；都没有 = none（明说没交）
     let report = parsed.toolReport ?? undefined;
@@ -873,6 +965,8 @@ export class TaskEngine {
       ...(record.isolation ? { isolation: record.isolation } : {}),
       ...worktreeReceipt(record.worktree),
       ...(record.blackboard ? { blackboard: record.blackboard } : {}),
+      ...(record.steers ? { steers: record.steers } : {}),
+      ...(record.reportStale ? { reportStale: true as const } : {}),
     };
   }
 

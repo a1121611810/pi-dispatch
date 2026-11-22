@@ -18,6 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { plan } from "../scripts/test.ts";
+import { check } from "../scripts/breakpoints.ts";
 import {
   INHERITED_DISPATCH_DEPTH,
   INHERITED_TEST_CONTEXT,
@@ -174,4 +175,54 @@ test("破坏点跑器：子代理环境里也真判红（擦掉继承来的测�
   const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
   assert.match(output, /✅ killed/, `跑器必须真判红，实际输出：\n${output}`);
   assert.equal(result.status, 0, output);
+});
+
+test("破坏点：red 标题写错必须判 bad-title，不能当 killed", () => {
+  const result = check({
+    feature: "元测试：写错标题",
+    file: "scripts/test.ts",
+    from: "export function isDirectInvocation",
+    to: "export function isDirectInvocationBROKEN",
+    test: "test/test-runner.test.ts",
+    red: "这条标题根本不存在：元测试",
+    why: "标题写错时 node 输出 ok 1 - <文件名>、退出 0，必须归到 bad-title",
+  });
+  assert.equal(result.outcome, "bad-title");
+});
+
+// ── 假绿元测试：转向用例必须真的盯实现，而不是盯 fake 自己 ────────────────
+const TUI_TEST = fileURLToPath(new URL("./tui.test.ts", import.meta.url));
+
+function runTuiPattern(
+  pattern: string,
+  sabotage?: string,
+): { status: number | null; output: string } {
+  const env = { ...process.env };
+  if (sabotage) env.PI_DISPATCH_SABOTAGE = sabotage;
+  else delete env.PI_DISPATCH_SABOTAGE;
+  const result = spawnSync(process.execPath, [RUNNER, `--test-name-pattern=${pattern}`, TUI_TEST], {
+    encoding: "utf8",
+    timeout: 60_000,
+    env,
+  });
+  return { status: result.status, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
+}
+
+test("假绿元测试：坏 fake（只回 ok/错 id/把 label 当 id）必须让转向用例变红", () => {
+  const single = "steer：单任务跳过 select";
+  const multi = "steer：多任务按 index 回映";
+
+  // 对照：不 sabotage 时必须绿且真跑到了 1 条——零命中也是退出 0，只看退出码会假绿
+  const control = runTuiPattern(single);
+  assert.equal(control.status, 0, control.output);
+  assert.match(control.output, /pass 1\b/, "对照必须真跑到 1 条");
+
+  for (const [mode, pattern] of [
+    ["no-steer", single],
+    ["wrong-id", single],
+    ["label-id", multi],
+  ] as const) {
+    const run = runTuiPattern(pattern, mode);
+    assert.notEqual(run.status, 0, `${mode} 下用例还是绿的 ⇒ 断言没盯住实现\n${run.output}`);
+  }
 });

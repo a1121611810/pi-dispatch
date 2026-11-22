@@ -523,6 +523,27 @@
             <td><b>通知</b></td>
             <td>跑完了的消息，按批发给父方。</td>
           </tr>
+          <tr>
+            <td><b>转向</b></td>
+            <td>
+              子代理还在跑的时候，父方插进去的一句话。孩子在下一个回合边界看到它，调整方向继续干；<b>不打断正在跑的工具</b>。
+            </td>
+          </tr>
+          <tr>
+            <td><b>信箱</b></td>
+            <td>转向落盘的那个 JSONL 文件。父方往里追加，子代理在每个回合边界读新增的行。</td>
+          </tr>
+          <tr>
+            <td><b>送达证据</b></td>
+            <td>
+              从子代理的事件流里认出来的投递痕迹（进队列 / 进 transcript /
+              下一轮真的带着它跑了）。<b>不听子代理自述。</b>
+            </td>
+          </tr>
+          <tr>
+            <td><b>未送达</b></td>
+            <td>退出时只有一个证据都没有的 <code>sent</code>。明说没送到，不装成功。</td>
+          </tr>
         </tbody>
       </table>
 
@@ -1555,8 +1576,14 @@
             槽全局共享、会被别家扩展顶掉，不用于内容送达。
           </li>
           <li>
-            真机验收：pty + pyte 重建屏幕帧断言「出现过、跑完清掉」（scripts/verify-modes.ts tui
-            腿）。
+            <code>/steer [消息]</code>：人可在 TUI/RPC 给在飞孩子插话。0 个在飞只警告；1
+            个跳过选择； 多个用 <code>select</code> 后按选项下标回映真实任务 id；带参不再弹
+            input。回执只承诺 <code>state=sent</code>，送达/生效看终态通知。
+          </li>
+          <li>
+            真机验收：pty + pyte 重建屏幕帧断言「出现过、跑完清掉」；另有
+            <code>--tui-steer-only</code> 腿断言
+            <code>/steer</code> 回执上屏且孩子正文改口（scripts/verify-modes.ts tui 腿）。
           </li>
         </ul>
       </div>
@@ -1995,7 +2022,10 @@
         </div>
         <div class="node act">
           <span class="t">收据</span>
-          <span class="d">调了哪些工具各几次 · 碰了哪些路径 · 错了几次 · 正文多长。</span>
+          <span class="d"
+            >调了哪些工具各几次 · 碰了哪些路径 · 错了几次 · 正文多长。转向过的任务另带
+            <code>steers</code>（见第 16 节）。</span
+          >
         </div>
       </div>
 
@@ -2434,7 +2464,210 @@
         </p>
       </div>
 
-      <h2><span class="n">16</span>别踩的坑</h2>
+      <h2><span class="n">16</span>运行中转向</h2>
+
+      <p>
+        需求只有一句：孩子还在跑的时候，父方插一句话，孩子看到后调整方向继续干——不是等它跑完，也不是杀掉重来。
+        父方工具是
+        <code>dispatch_steer { taskId, message }</code
+        >。转向<b>不新增任务状态</b>：它就是记录上的一组收据（<code>steers</code>），和
+        <code>worktree</code>
+        一样，用过才出现。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>边界</th>
+            <th>怎么定</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><b>方向</b></td>
+            <td>只做父 → 子，单向、纯文本。不做广播、优先级、撤回、图片。</td>
+          </tr>
+          <tr>
+            <td><b>受理</b></td>
+            <td>
+              只 <code>running</code>；排队中的任务要改方向就
+              <code>dispatch_stop</code> 后重派，终态一律拒。判据收在纯函数
+              <code>planSteer</code>（<code>src/core/steer.ts</code>）一处：只 running、trim
+              后非空、1–4096 字符、至多 16 条、seq 接着信箱最后一条续号；引擎
+              <code>steer()</code> 串行调用它，只负责落盘与记账。
+            </td>
+          </tr>
+          <tr>
+            <td><b>送达点</b></td>
+            <td>
+              pi 的回合边界：当前 assistant 轮的工具调用全跑完、下一次 LLM
+              调用前。<b>不打断在飞的长工具</b>（那是
+              <code>dispatch_stop</code> 的事）。
+            </td>
+          </tr>
+          <tr>
+            <td><b>宿主</b></td>
+            <td>
+              一次性宿主（print/json）里父方正阻塞在
+              <code>dispatch_task</code>，正常没有插话窗口——但<b>不做硬门</b>：状态是
+              <code>running</code> 就受理，调到了就应当生效。主要场景是长驻宿主（rpc/tui）。
+            </td>
+          </tr>
+          <tr>
+            <td><b>上限</b></td>
+            <td>一个任务 16 条；单条正文 trim 后 1–4096 字符。超了明确拒绝，<b>不落文件</b>。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="card">
+        <h3>机制：文件信箱 + 孩子扩展的 turn_end 钩子</h3>
+        <p>父方不碰孩子的 stdin：它只往任务目录追加一行，孩子扩展在每个回合边界自己读。</p>
+        <table style="margin: 0">
+          <thead>
+            <tr>
+              <th>东西</th>
+              <th>形状</th>
+              <th>为什么</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><b>信箱</b></td>
+              <td>
+                <code>&lt;桶&gt;/tasks/&lt;taskId&gt;/steer.jsonl</code>，一行一个 JSON：
+                <code>{"seq":1,"text":"…","at":1763700000000}</code>
+              </td>
+              <td>追加写；父方写成功才算 <code>sent</code>。信箱在任务目录里，不进 worktree。</td>
+            </tr>
+            <tr>
+              <td><b>seq</b></td>
+              <td>父方分配，接着信箱里最后一条 +1；两次并发 steer 在引擎里串行分配，不会撞号。</td>
+              <td>孩子按「seq &gt; 上次游标」增量读，撞号会丢信。</td>
+            </tr>
+            <tr>
+              <td><b>环境变量</b></td>
+              <td>
+                <code>PI_DISPATCH_STEER_FILE</code> 注入完整路径；继承来的同名变量一律擦掉（与黑板的
+                G5 同规矩）。
+              </td>
+              <td>孙代理不能继承父信箱，否则读到别人的转向。</td>
+            </tr>
+            <tr>
+              <td><b>投递</b></td>
+              <td>
+                孩子扩展在 <code>turn_end</code> 读新增整行，逐条
+                <code>sendUserMessage(wire, { deliverAs: "steer" })</code
+                >；<b>发送成功才推进游标</b>。
+              </td>
+              <td>走的是 pi 原生转向队列；失败或半行下一回合重试，不毒化整批。</td>
+            </tr>
+            <tr>
+              <td><b>降级</b></td>
+              <td>旧 pi 没有 <code>sendUserMessage</code> ⇒ 孩子不装收件箱，任务照跑。</td>
+              <td>父方看到 <code>undelivered</code>，不是崩溃。</td>
+            </tr>
+          </tbody>
+        </table>
+        <p style="margin-bottom: 0">
+          注入文本的首行是标记
+          <code>[pi-dispatch-steer #N]</code>，第二行说明「这是父方的补充/修正，不是新任务」，
+          正文再另起一行（原样，不转义）。<b>只认整行精确标记</b>——正文/前后缀伪造的标记不算； user
+          回显还必须能对上同 seq 的 <code>queue_update</code>，初始任务正文里写标记不能伪造送达。
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>收据阶梯：从「写了」到「模型带着它跑了」</h3>
+        <table style="margin: 0">
+          <thead>
+            <tr>
+              <th>state</th>
+              <th>证据从哪来</th>
+              <th>证明什么</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>sent</code></td>
+              <td>父方 <code>appendSteer</code> 成功</td>
+              <td>字节进了信箱。<b>不是孩子看到了。</b></td>
+            </tr>
+            <tr>
+              <td><code>queued</code></td>
+              <td><code>queue_update</code> 的 <code>steering</code> 元素里有该 seq 的标记</td>
+              <td>孩子扩展读到了，pi 收进转向队列。</td>
+            </tr>
+            <tr>
+              <td><code>delivered</code></td>
+              <td><code>message_end</code> 且 <code>role: "user"</code> 的正文首行有标记</td>
+              <td>消息进了 transcript。</td>
+            </tr>
+            <tr>
+              <td><code>seen</code></td>
+              <td>该 user 消息之后的<b>第一条</b> assistant <code>message_end</code></td>
+              <td>下一次 LLM 调用确实带着它发生了。</td>
+            </tr>
+            <tr>
+              <td><code>undelivered</code></td>
+              <td>退出时仍是 <code>sent</code>（一个证据都没有）</td>
+              <td>没送到。<b>明说，不装。</b></td>
+            </tr>
+          </tbody>
+        </table>
+        <p>
+          对账在退出时做（先于终态写记录）：证据只升不降，终态不降级；<code>queued</code>
+          是合法终态——已入队、没进 transcript，<b>不改成 undelivered</b
+          >（通知里的「未送达」是计数口径： sent / queued / undelivered 一起算作没送到）。<code
+            >delivered</code
+          >
+          但之后没再出 assistant 的保留 <code>delivered</code>，不谎报 <code>seen</code>。同一 seq
+          只保留第一次的正文与时刻， 对账只补 state 与时间。assistant 的复述不算送达——证据只认 user
+          回显。
+        </p>
+        <p style="margin-bottom: 0">
+          <b>报告可能早于转向：</b
+          >孩子若在最后一次送达之前就交了工具通道的报告，之后继续干活但不再交， 记
+          <code>reportStale</code
+          >，失去小窗资格（回大窗，暗示父方复核）。没有报告行或没有送达证据就不判。
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>父方看到的</h3>
+        <ul style="margin-bottom: 0">
+          <li>
+            <code>dispatch_steer { taskId, message }</code> →
+            <code>{ok, taskId, seq, state:"sent", path}</code>；拒绝时 <code>ok:false</code>
+            并说清原因（不在 running / 未知编号 / 空 / 超长 / 满 16 条 / 无存储 / 无孩子扩展），
+            <b>不落文件、不进记录</b>。并发两次调用串行受理，得到 seq 1/2，不会撞号。
+          </li>
+          <li>
+            运行中只报 <code>sent</code>；终态看 <code>dispatch_list</code> 的
+            <code>steers</code
+            >——只回收据字段（<code>seq/at/state/queuedAt/deliveredAt/seenAt</code>），
+            <b>不回正文</b>；<code>reportStale</code> 只在 true
+            时出现。一次性宿主的终态结果同样带出。
+          </li>
+          <li>
+            终态通知带一行「转向 N 条：送达 D / 生效 S（未送达 U）」（<code>U = N − D</code>）；
+            一条都没进 transcript 时写「未观测到送达」，<b>不写「送达 0」</b
+            >。没转向过的任务没有这一行；<code>reportStale</code> 为 true
+            时另加一句「工具报告早于最后一次转向」。
+          </li>
+        </ul>
+      </div>
+
+      <div class="card warn">
+        <h3>一个字都不动的地方</h3>
+        <p style="margin-bottom: 0">
+          任务状态机、argv、stdin（仍是 ignore）、退出语义、stop、超时与停滞判定、worktree 与黑板、
+          <code>readOnly: "strict"</code> 的白名单——转向全不碰。孩子扩展读信箱用的是 Node 的
+          <code>fs</code>，不是工具，所以只读档也能收到转向。
+        </p>
+      </div>
+
+      <h2><span class="n">17</span>别踩的坑</h2>
 
       <div class="card red">
         <ol style="margin-bottom: 0">
@@ -2469,6 +2702,20 @@
             <b>用重算后的池子去收已经在跑的</b> ⇒ 中途杀子代理。<b>重算只管「还能不能开新的」。</b>
           </li>
           <li><b>重算了却没人叫醒排队的</b> ⇒ 池子松了队列还卡着。<b>要有人定时叫醒。</b></li>
+          <li>
+            <b>转向用 followUp / nextTurn 投递</b> ⇒ 孩子本轮看不到，等于跑完才读。要
+            <code>deliverAs: "steer"</code>。
+          </li>
+          <li>
+            <b>最后一个 turn_end 之后写的转向</b> ⇒ 永远送不到。收据必须是
+            <code>undelivered</code>；<b>不重放、不复活已结束的 run</b>。
+          </li>
+          <li><b>发送失败也推进游标</b> ⇒ 那条永久丢。要成功才推进。</li>
+          <li><b>assistant 复述标记也算送达</b> ⇒ 证据造假。只认 user 回显。</li>
+          <li>
+            <b>旧 pi 没有 sendUserMessage 还硬装收件箱</b> ⇒ 孩子崩在
+            turn_end。先探测能力，没有就不装。
+          </li>
         </ol>
       </div>
     </div>

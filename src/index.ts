@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { basename, dirname } from "node:path";
 import { BLACKBOARD_READ, BLACKBOARD_WRITE, BlackboardStore } from "./core/blackboard.ts";
@@ -9,8 +10,9 @@ import { TaskEngine } from "./core/engine.ts";
 import { TaskRegistry } from "./core/registry.ts";
 import { NotificationCenter } from "./core/notifications.ts";
 import { Storage, findProjectRoot } from "./core/storage.ts";
-import type { DispatchInput, DispatchResult, HostMode } from "./core/types.ts";
-import { attachTuiSurface } from "./tui.ts";
+import { parseSteerLines, steerWire, type SteerTally } from "./core/steer.ts";
+import type { DispatchInput, DispatchResult, HostMode, SteerRecord } from "./core/types.ts";
+import { attachTuiSurface, currentOwner, runSteerCommand } from "./tui.ts";
 
 // pi 适配层：注册工具、装事件、投递通知。
 // 不写任何业务规则——业务规则全在 src/core/。
@@ -48,7 +50,8 @@ function hasReliableReport(result: DispatchResult): boolean {
     result.reportChannel !== "none" &&
     !result.assessmentVacuous &&
     !result.deliveryUnverified &&
-    !result.verifyUnverified,
+    !result.verifyUnverified &&
+    !result.reportStale,
   );
 }
 
@@ -199,12 +202,19 @@ export default function piDispatchEntry(pi: ExtensionAPI): void {
   // 不清理上一轮的 handler 与引擎，就会累积引擎、留下没人收的子代理。
   let cleanup: (() => void) | undefined;
   let engine: TaskEngine | undefined;
+  // 孩子的转向信箱：游标与退订跟进程走——session_start 再来一次也不叠加 turn_end handler，
+  // 否则同一封信被两个 handler 各投一次。
+  let offSteerInbox: (() => void) | undefined;
+  const steerCursor = { lastSeq: 0 };
   // 工具只在 session_start 之后被调用；重注册同名工具时 pi 保留首个闭包，
   // 所以工具必须读这个外层变量而不是捕获某个会话的实例。
   const current = (): TaskEngine => {
     if (!engine) throw new Error("dispatch engine is not ready（没有活动会话）");
     return engine;
   };
+
+  // 命令在工厂层注册一次；放 session_start 会随 /new/resume 重复注册。
+  if (Number(process.env.PI_DISPATCH_DEPTH ?? 0) === 0) registerSteerCommand(pi, current);
 
   // 注册必须发生在 session_start——factory 阶段 getActiveTools() 是 throw 的桩。
   pi.on("session_start", (_event, ctx) => {
@@ -216,6 +226,8 @@ export default function piDispatchEntry(pi: ExtensionAPI): void {
     if (Number(process.env.PI_DISPATCH_DEPTH ?? 0) > 0) {
       registerChildReportTool(pi);
       registerBlackboardTools(pi);
+      offSteerInbox?.();
+      offSteerInbox = registerSteerInbox(pi, steerCursor);
       return;
     }
 
@@ -325,6 +337,8 @@ export function deliver(pi: ExtensionAPI, notifications: NotificationCenter): vo
         const hint = [
           n.deliveryUnverified ? "｜报告里的改动没有实测支撑（查 dispatch_list 复核）" : "",
           n.verifyUnverified ? "｜报告声称的自检没有实测支撑（查 dispatch_list 复核）" : "",
+          n.reportStale ? "｜工具报告早于最后一次转向（以最终正文为准）" : "",
+          n.steers ? steerHint(n.steers) : "",
         ].join("");
         return `· 任务 ${n.taskId.slice(0, 8)}… ${n.status}（${new Date(n.at).toLocaleTimeString()}）${hint}`;
       })
@@ -340,7 +354,53 @@ export function deliver(pi: ExtensionAPI, notifications: NotificationCenter): vo
   }
 }
 
+/**
+ * 列表里的转向只回收据字段：正文留在记录里供审计，不随每轮列表重发。
+ * 未发生的时刻不留键（与记录里的可选字段同口径）。
+ */
+export function steerRows(steers: readonly SteerRecord[]) {
+  return steers.map((steer) => ({
+    seq: steer.seq,
+    at: steer.at,
+    state: steer.state,
+    ...(steer.queuedAt !== undefined ? { queuedAt: steer.queuedAt } : {}),
+    ...(steer.deliveredAt !== undefined ? { deliveredAt: steer.deliveredAt } : {}),
+    ...(steer.seenAt !== undefined ? { seenAt: steer.seenAt } : {}),
+  }));
+}
+
+/** 通知里的转向收据：送达 = 进了孩子 transcript；一条都没到就明说没观测到。 */
+export function steerHint(tally: SteerTally): string {
+  if (tally.delivered === 0) return `｜转向 ${tally.total} 条：未观测到送达`;
+  return `｜转向 ${tally.total} 条：送达 ${tally.delivered} / 生效 ${tally.seen}（未送达 ${tally.undelivered}）`;
+}
+
 /** 父方的三个工具。与会话生命周期分开：注册一次，闭包读 current()。 */
+/** 人类在 TUI/RPC 里直接转向；只做交互，校验全交给 engine.steer / planSteer。 */
+export function registerSteerCommand(pi: ExtensionAPI, current: () => TaskEngine): void {
+  pi.registerCommand("steer", {
+    description: "给在飞子代理插一句话（只承诺 sent）",
+    handler: async (args, ctx) => {
+      if (!ctx.hasUI) return;
+      let engine: TaskEngine;
+      try {
+        engine = current();
+      } catch {
+        ctx.ui.notify("派单引擎未就绪", "error");
+        return;
+      }
+      await runSteerCommand({
+        hasUI: ctx.hasUI,
+        args,
+        owner: currentOwner(),
+        records: engine.registry.list(),
+        ui: ctx.ui,
+        steer: (taskId, text) => engine.steer(taskId, text),
+      });
+    },
+  });
+}
+
 function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
   pi.registerTool({
     name: "dispatch_task",
@@ -402,6 +462,8 @@ function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
           isolation: r.isolation,
           worktree: r.worktree,
           blackboard: r.blackboard,
+          ...(r.steers && r.steers.length > 0 ? { steers: steerRows(r.steers) } : {}),
+          ...(r.reportStale ? { reportStale: r.reportStale } : {}),
         }));
       return textResult({ total: records.length, records });
     },
@@ -461,6 +523,25 @@ function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
   });
 
   pi.registerTool({
+    name: "dispatch_steer",
+    label: "转向",
+    description:
+      "孩子还在跑时插一句话，它在下一个回合看到后调整方向继续干（不打断在飞工具）。只受理 running；≤4096 字符，一个任务最多 16 条。sent 只代表已写进信箱，送达/生效的证据看 dispatch_list 的 steers。",
+    parameters: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "任务编号" },
+        message: { type: "string", description: "要插给孩子的方向（≤4096 字符）" },
+      },
+      required: ["taskId", "message"],
+    } as never,
+    execute: async (_id, args) => {
+      const a = args as { taskId: string; message: string };
+      return textResult(await current().steer(a.taskId, a.message));
+    },
+  });
+
+  pi.registerTool({
     name: "dispatch_stop",
     label: "停任务",
     description: "停一个任务：排队中的抽掉；在跑的 SIGTERM→SIGKILL。",
@@ -501,6 +582,49 @@ function registerChildReportTool(pi: ExtensionAPI): void {
       details: { report: args },
     }),
   });
+}
+
+/** 同一 pi 只允许一个转向收件箱 handler；重装前先退订旧的。 */
+const steerInboxOff = new WeakMap<object, () => void>();
+/** shutdown 只注册一次：多个 session_start 不能叠加 shutdown handler。 */
+const steerShutdownInstalled = new WeakSet<object>();
+
+/** 孩子的转向收件箱：turn_end 读新增整行，交给 pi 的 steer 队列。返回退订句柄。 */
+function registerSteerInbox(
+  pi: ExtensionAPI,
+  cursor: { lastSeq: number },
+): (() => void) | undefined {
+  const file = process.env.PI_DISPATCH_STEER_FILE;
+  // 旧 pi 没有 sendUserMessage：不启动，父方会看到 undelivered，而不是崩。
+  if (!file || typeof pi.sendUserMessage !== "function") return undefined;
+  steerInboxOff.get(pi)?.();
+  const flush = (): void => {
+    let raw = "";
+    try {
+      raw = readFileSync(file, "utf8");
+    } catch {
+      return; // 没有信箱 = 没有转向
+    }
+    for (const line of parseSteerLines(raw, cursor.lastSeq)) {
+      try {
+        pi.sendUserMessage(steerWire(line.seq, line.text), { deliverAs: "steer" });
+        // 只在成功入队后推进游标；失败下轮重试同一条。
+        cursor.lastSeq = line.seq;
+      } catch {
+        break;
+      }
+    }
+  };
+  const off = pi.on("turn_end", flush);
+  steerInboxOff.set(pi, off);
+  if (!steerShutdownInstalled.has(pi)) {
+    pi.on("session_shutdown", () => {
+      steerInboxOff.get(pi)?.();
+      steerInboxOff.delete(pi);
+    });
+    steerShutdownInstalled.add(pi);
+  }
+  return off;
 }
 
 /** 孩子的黑板工具：只有开了黑板（env 里有板目录）才注册——默认关时孩子的工具表不变。 */

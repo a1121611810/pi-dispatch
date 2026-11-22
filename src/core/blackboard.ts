@@ -213,6 +213,8 @@ export class BlackboardStore {
    * 文件名是 `<createdAt13位补零>-<noteId>.json`：文件名序 = 时间序。
    */
   append(author: string, text: string): BlackboardNote {
+    if (this.ownerInfo(this.#boardId)?.closedAt !== undefined)
+      throw new Error("黑板已关闭，不能再写");
     if (typeof text !== "string" || text.trim() === "") throw new Error("黑板笔记不能是空白");
     if (Buffer.byteLength(text, "utf8") > NOTE_MAX_BYTES) {
       throw new Error(`黑板笔记超上限（${NOTE_MAX_BYTES} 字节）`);
