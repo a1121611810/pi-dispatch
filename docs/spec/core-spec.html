@@ -575,7 +575,9 @@
       <div class="card">
         <h3>一句话的设计立场</h3>
         <p style="margin-bottom: 0">
-          子代理的<b>话</b>不可信，子代理的<b>动作</b>可信。核心只信动作。
+          子代理的<b>话</b>不可信——报告、黑板留言、自述的自检都只是线索。但<b>父方看到的「动作」也只是字节</b>：
+          闸能保证的只有 <b>spawn 之前</b>的输入形状；spawn 之后，同 UID
+          的孩子能写记录、信箱、产出与黑板。 所以判据是「有没有实测证据」，不是「是谁说的」。
         </p>
       </div>
 
@@ -1376,8 +1378,8 @@
         <h3>安检有哪几道</h3>
 
         <p>
-          <b>按这个顺序问。第一道不过就退回，后面的一概不问。</b>（第 2、3
-          问在同一个纯函数里，顺序同表。）
+          <b>按这个顺序问。第一道不过就退回，后面的一概不问。</b>（第 2
+          问里的四个判断是同一个纯函数，顺序同上。）
         </p>
 
         <table>
@@ -1399,33 +1401,75 @@
             </tr>
             <tr>
               <td>2</td>
-              <td>任务是空的吗</td>
-              <td>空的退回</td>
+              <td>任务的正文能安全进命令行吗</td>
+              <td>
+                四种都退回：<b>空的</b>；<b>以横线开头</b>（纵深防御：
+                <code>buildPiArgv</code> 用 <code>--</code> 分隔，pi
+                不会当选项；留着防宿主解析变化）；<b>以 <code>@</code> 开头</b>（pi
+                把原始位置参数当文件读：正文被丢弃、文件内容变成指令）；<b>含 C0 控制字符</b>（NUL
+                进 argv 会让 spawn 同步抛，绕过「拒绝不留痕」）；<b>超过 64 KiB（UTF-8 字节）</b
+                >（argv 装不下 ⇒ spawn 抛 E2BIG ⇒ 记 failed 而不是 rejected）
+              </td>
             </tr>
             <tr>
               <td>3</td>
-              <td>任务以横线开头吗</td>
-              <td>退回——子代理的命令行会把它当成选项，可能假装成功</td>
+              <td><code>timeoutMs</code> 是整数毫秒吗</td>
+              <td>
+                给了就计时，不给 = 不设限；必须是 1..2<sup>31</sup>-1 的整数（Node
+                定时器上限，超了不是「很久」而是立刻溢出）
+              </td>
             </tr>
             <tr>
               <td>4</td>
-              <td><code>timeoutMs</code> 是正数吗</td>
-              <td>给了就计时，不给 = 不设限；非数或 ≤ 0 退回</td>
-            </tr>
-            <tr>
-              <td>5</td>
-              <td>派发开关开着吗</td>
-              <td>关了就不接新任务。在跑的不动</td>
-            </tr>
-            <tr>
-              <td>6</td>
               <td>会话要收尾了吗</td>
               <td>要收尾了就不接</td>
             </tr>
             <tr>
-              <td>7</td>
+              <td>5</td>
               <td>递归太深了吗</td>
               <td>子代理再派子代理，层数有上限</td>
+            </tr>
+            <tr>
+              <td>6</td>
+              <td>隔离档位的值合法吗</td>
+              <td>
+                只认
+                <code>worktree</code>。<b>写错值不要改成别的档</b>——那是把「隔离」偷偷变成「共享」
+              </td>
+            </tr>
+            <tr>
+              <td>7</td>
+              <td>黑板开关是布尔吗</td>
+              <td>写错值不猜：猜出来的开关会写错父方的意图</td>
+            </tr>
+            <tr>
+              <td>8</td>
+              <td>要隔离时有 git 仓吗</td>
+              <td>非 git 目录里开隔离，worktree 到运行时才炸</td>
+            </tr>
+            <tr>
+              <td>9</td>
+              <td><code>allowScripts</code> 是布尔吗</td>
+              <td>写错值不猜：truthy 就当开了 codemode，那是把「不许写脚本」变成「能写脚本」</td>
+            </tr>
+            <tr>
+              <td>10</td>
+              <td>
+                进 argv / 附加块的文本字段（<code>model</code> / <code>thinkingLevel</code> /
+                <code>why</code>）合法吗
+              </td>
+              <td>
+                必须是字符串、且不含控制字符：非字符串会在铸编号之后抛错，让「拒绝」变成「记一条
+                failed」。单个字段上限 64 KiB（UTF-8 字节，同任务正文）
+              </td>
+            </tr>
+            <tr>
+              <td>11</td>
+              <td>项目上下文档位的值合法吗</td>
+              <td>
+                只认 <code>auto</code> / <code>none</code>。拼错了不该悄悄当成
+                <code>auto</code>：加载量会变多
+              </td>
             </tr>
           </tbody>
         </table>
@@ -1434,6 +1478,21 @@
           <h3>安检是纯函数</h3>
           <p style="margin-bottom: 0">
             给它输入，它只回答「过」或「不过加理由」。<b>它不碰记录、不碰座位、不碰子代理。</b>而且<b>被拒了不留任何痕迹</b>——这是「先安检、后铸编号」的原因。
+          </p>
+        </div>
+
+        <div class="card warn">
+          <h3>闸的保证范围到 spawn 为止</h3>
+          <p>
+            闸保证：输入形状合规、错值不 coerce、被拒不铸编号/不建记录/不占座位/不 spawn、同 (input,
+            facts) 同判决。
+          </p>
+          <p style="margin-bottom: 0">
+            闸不保证：spawn 之后。孩子与父方同 UID、带 bash，能写 <code>records/*.json</code>（伪造
+            succeeded）、
+            <code>tasks/&lt;id&gt;/steer.jsonl</code
+            >（伪造收据）、<code>tasks/&lt;id&gt;/output.log</code>（冒充产出 / 放 FIFO
+            挂死读）、<code>blackboards/*</code>（伪造作者）。父方读到的「收据」是字节，不是证明。
           </p>
         </div>
 
@@ -1963,6 +2022,18 @@
         </ul>
       </div>
 
+      <div class="card">
+        <h3>strict + allowScripts 不是 shell 逃逸</h3>
+        <p style="margin-bottom: 0">
+          codemode 只能调 <code>ctx.tools</code> 里的工具（宿主
+          <code>dist/extensions/codemode/execute.js</code> 的
+          <code>getCodemodeCallableTools(ctx.tools)</code>）；strict 的
+          <code>--tools</code> 白名单（<code>child.ts</code> 的 <code>strictToolsArgv</code>）里没有
+          bash。<b>能力边界的唯一出处是 <code>--tools</code></b
+          >，不是 allowScripts。
+        </p>
+      </div>
+
       <h2><span class="n">11</span>细看：怎么判卡住</h2>
 
       <div class="row">
@@ -2228,6 +2299,17 @@
         <p>所以编号要先查一遍：里面有斜杠、竖线、两个点，就拒绝。<b>不要</b>直接拼路径。</p>
       </div>
 
+      <div class="card warn">
+        <h3>留痕目录是同 UID 可写的</h3>
+        <p style="margin-bottom: 0">
+          读之前先当它是坏文件：<code>lstat</code> 必须是普通文件（<code>FIFO</code> / 设备 /
+          软链一律跳过，否则一次读就永久挂死启动），单文件有上限（记录 1 MiB、归档 产出 16 MiB + 64
+          KiB），见 <code>storage.ts</code> 的 <code>readRegularFile</code>。
+          <code>readOnly: strict</code> <b>不是沙箱</b>，<code>isolation</code>
+          只隔离工作目录——两者都不改 文件系统权限。
+        </p>
+      </div>
+
       <h3>启动时读回来</h3>
       <div class="row">
         <div class="node act">
@@ -2422,7 +2504,8 @@
               先写 <code>.tmp</code> 再 rename——崩了最多留一个没用的 .tmp，不留半个 JSON；读只认
               .json，坏文件计入 <code>errors</code> 跳过。读侧也守写侧的线：单条正文超 8KiB （兄弟用
               bash 绕过写工具）计入 <code>errors</code>；一次读正文累计 ≤32KiB， 超了截断并给
-              <code>nextAfter</code> 续读。
+              <code>nextAfter</code> 续读。读参数 <code>after</code> 是游标（noteId
+              <b>字符串</b>）：非字符串直接报错，<b>不从头读</b>——父方会以为读到的是新的一段。
             </td>
           </tr>
           <tr>
@@ -2493,7 +2576,7 @@
               只 <code>running</code>；排队中的任务要改方向就
               <code>dispatch_stop</code> 后重派，终态一律拒。判据收在纯函数
               <code>planSteer</code>（<code>src/core/steer.ts</code>）一处：只 running、trim
-              后非空、1–4096 字符、至多 16 条、seq 接着信箱最后一条续号；引擎
+              后非空、1–4096 字符、JSON 编码后 ≤ 15 KiB、至多 16 条、seq 接着信箱最后一条续号；引擎
               <code>steer()</code> 串行调用它，只负责落盘与记账。
             </td>
           </tr>
