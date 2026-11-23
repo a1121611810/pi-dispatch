@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  lstatSync,
   readFileSync,
   readSync,
   readdirSync,
@@ -15,7 +16,7 @@ import {
 } from "node:fs";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { join } from "node:path";
-import type { TaskRecord } from "./types.ts";
+import { hasC0, TASK_STATUSES, type TaskRecord } from "./types.ts";
 
 // 留痕：账本落在一个全局目录、按项目分桶。
 //   <rootDir>/<桶>/
@@ -43,9 +44,44 @@ export function findProjectRoot(start: string): string {
   }
 }
 
-/** 编号会拼进路径——有 / \ 或 .. 就拒绝。 */
+/** 编号上限：UUID 是 36 字符，留一倍余量。超长的编号一律拒。 */
+const MAX_TASK_ID_CHARS = 128;
+
+/**
+ * 编号会拼进路径——有 / \ .. 就拒绝。
+ * 空串、`.`、`..`、C0 控制字符、超长一律拒：
+ * 空编号会让 removeTrace 删掉 tasks 根目录（删光所有任务产出）。
+ */
 export function isSafeTaskId(taskId: string): boolean {
-  return !taskId.includes("/") && !taskId.includes("\\") && !taskId.includes("..");
+  if (typeof taskId !== "string") return false;
+  if (taskId === "" || taskId === "." || taskId === "..") return false;
+  if (taskId.length > MAX_TASK_ID_CHARS) return false;
+  if (taskId.includes("/") || taskId.includes("\\") || taskId.includes("..")) return false;
+  return !hasC0(taskId);
+}
+
+/**
+ * 恢复记录的结构闸：形状不对的记录不进账。
+ * 编号安全 + 状态是七个合法值之一 + 任务是字符串 + 时间戳是有限数。
+ */
+export function isRestorableRecord(value: unknown): value is TaskRecord {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Partial<TaskRecord>;
+  if (typeof record.id !== "string" || !isSafeTaskId(record.id)) return false;
+  if (typeof record.status !== "string") return false;
+  if (!(TASK_STATUSES as readonly string[]).includes(record.status)) return false;
+  if (typeof record.task !== "string") return false;
+  for (const field of [
+    "ownerPid",
+    "ownerStartMs",
+    "startedAt",
+    "finishedAt",
+    "exitCode",
+  ] as const) {
+    const number = record[field];
+    if (number !== undefined && !Number.isFinite(number)) return false;
+  }
+  return true;
 }
 
 /** 项目桶下的目录布局。 */
@@ -74,9 +110,37 @@ function endsWithNewline(path: string): boolean {
 /** 信箱读取上限：16 条 × 4KB 正文 + JSON 外壳，留足余量；防孩子写坏文件撑爆父方内存。 */
 export const MAX_STEER_INBOX_BYTES = 256 * 1024;
 
+/** 产出读取上限：16MB——与孩子 stdout 的内存上限（child.ts 的 STDOUT_KEEP_CHARS）同量级。 */
+export const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
+
+/** 超限时的截断标记——读到的不是完整产出，父方必须知道。 */
+export const OUTPUT_TRUNCATED_MARK = "…【产出超过 16MB，已截断】";
+
+/** 单条记录的文件上限：正常记录是几 KB 的 JSON，1 MiB 已是异常。 */
+export const MAX_RECORD_BYTES = 1024 * 1024;
+
+/** 归档文件上限：归档前的产出已被 MAX_OUTPUT_BYTES 截断，压缩后不会再大。 */
+export const MAX_ARCHIVE_BYTES = MAX_OUTPUT_BYTES + 64 * 1024;
+
+/**
+ * 只读普通文件；FIFO / 设备 / 符号链接 / 超大文件一律当「没有」。
+ * 裸 readFileSync 读 FIFO 会永久阻塞（同 UID 的孩子能造）⇒ 启动永远不落定。
+ */
+function readRegularFile(path: string, maxBytes: number): Buffer | undefined {
+  try {
+    const info = lstatSync(path);
+    if (!info.isFile() || info.size > maxBytes) return undefined;
+    return readFileSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
 export class Storage {
   readonly #bucket: string;
   #paths: StoragePaths;
+  /** 这次恢复里被结构闸挡下的记录数。 */
+  #skippedRecords = 0;
 
   constructor(rootDir: string, projectRoot: string) {
     this.#bucket = encodeBucket(projectRoot);
@@ -156,7 +220,23 @@ export class Storage {
   readOutput(taskId: string): string | undefined {
     if (!isSafeTaskId(taskId)) return undefined;
     const path = join(this.#paths.tasksDir, taskId, "output.log");
-    return existsSync(path) ? readFileSync(path, "utf8") : undefined;
+    if (!existsSync(path)) return undefined;
+    try {
+      // lstat：不跟符号链接，也看得出 FIFO/设备文件——readFileSync 读 FIFO 会永久阻塞。
+      const info = lstatSync(path);
+      if (!info.isFile()) return undefined;
+      if (info.size <= MAX_OUTPUT_BYTES) return readFileSync(path, "utf8");
+      const fd = openSync(path, "r");
+      try {
+        const buf = Buffer.alloc(MAX_OUTPUT_BYTES);
+        const read = readSync(fd, buf, 0, MAX_OUTPUT_BYTES, 0);
+        return `${buf.subarray(0, read).toString("utf8")}\n${OUTPUT_TRUNCATED_MARK}`;
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      return undefined;
+    }
   }
 
   /** 转向信箱：<桶>/tasks/<id>/steer.jsonl。目录默认不建（写第一条时才建）。 */
@@ -190,26 +270,44 @@ export class Storage {
     return readFileSync(path, "utf8");
   }
 
-  /** 读 records/*.json 装回内存。一个坏文件不许拖垮启动——跳过它继续。 */
+  /**
+   * 读 records/*.json 装回内存。一个坏文件不许拖垮启动——跳过它继续。
+   * 恢复的记录要过结构闸：编号安全、状态是七个合法值之一、任务是字符串。
+   * 只认 id 是 string 的话，假 succeeded / 假 task / 非法编号都能进账。
+   */
   restoreRecords(): TaskRecord[] {
+    this.#skippedRecords = 0;
     if (!existsSync(this.#paths.recordsDir)) return [];
     const records: TaskRecord[] = [];
     for (const file of readdirSync(this.#paths.recordsDir)) {
       if (!file.endsWith(".json")) continue;
       try {
-        const record = JSON.parse(
-          readFileSync(join(this.#paths.recordsDir, file), "utf8"),
-        ) as TaskRecord;
-        if (record && typeof record.id === "string") records.push(record);
+        // 只读普通文件：FIFO / 超大文件跳过（裸读 FIFO 会永久阻塞 ⇒ 启动永不落定）
+        const raw = readRegularFile(join(this.#paths.recordsDir, file), MAX_RECORD_BYTES);
+        if (raw === undefined) {
+          this.#skippedRecords += 1;
+          continue;
+        }
+        const record = JSON.parse(raw.toString("utf8")) as unknown;
+        // 文件名必须是 <id>.json：evil.json 里写 {"id":"other"} 不许装成别人的记录进账
+        if (isRestorableRecord(record) && file === `${record.id}.json`) records.push(record);
+        else this.#skippedRecords += 1;
       } catch {
         // 单条坏记录不拖垮启动
+        this.#skippedRecords += 1;
       }
     }
     return records;
   }
 
-  /** 删除一个任务的留痕（挤掉时）。 */
+  /** 这次恢复里被结构闸挡下的记录数（坏 JSON + 形状不对）。 */
+  get skippedRecords(): number {
+    return this.#skippedRecords;
+  }
+
+  /** 删除一个任务的留痕（挤掉时）。编号不安全 ⇒ 什么都不删（空编号会删掉整个 tasks 根）。 */
   removeTrace(taskId: string): void {
+    if (!isSafeTaskId(taskId)) return;
     try {
       rmSync(this.recordPath(taskId));
       rmSync(join(this.#paths.tasksDir, taskId), { recursive: true, force: true });
@@ -233,8 +331,10 @@ export class Storage {
       writeFileSync(recordGzTmp, recordGz);
       renameSync(recordGzTmp, join(this.#paths.archiveDir, `${id}.json.gz`));
       const outputPath = join(this.#paths.tasksDir, id, "output.log");
-      if (existsSync(outputPath)) {
-        const outputGz = gzipSync(readFileSync(outputPath));
+      // 只读普通文件：FIFO / 超过 16MB 的产出让归档跳过它（记录照常归档），不整份读进内存
+      const output = readRegularFile(outputPath, MAX_OUTPUT_BYTES);
+      if (output) {
+        const outputGz = gzipSync(output);
         const outputGzTmp = join(this.#paths.archiveDir, `${id}.output.gz.tmp`);
         writeFileSync(outputGzTmp, outputGz);
         renameSync(outputGzTmp, join(this.#paths.archiveDir, `${id}.output.gz`));
@@ -247,10 +347,12 @@ export class Storage {
 
   /** 从压缩归档拉回一条记录（决策 29 的冷存读者）；miss = undefined。 */
   readArchivedRecord(taskId: string): (TaskRecord & { archived: true }) | undefined {
+    if (!isSafeTaskId(taskId)) return undefined;
     const file = join(this.#paths.archiveDir, `${taskId}.json.gz`);
-    if (!existsSync(file)) return undefined;
+    const raw = readRegularFile(file, MAX_ARCHIVE_BYTES);
+    if (raw === undefined) return undefined;
     try {
-      const parsed = JSON.parse(gunzipSync(readFileSync(file)).toString("utf8")) as TaskRecord;
+      const parsed = JSON.parse(gunzipSync(raw).toString("utf8")) as TaskRecord;
       return { ...parsed, archived: true };
     } catch {
       return undefined;
@@ -258,10 +360,15 @@ export class Storage {
   }
 
   readArchivedOutput(taskId: string): string | undefined {
+    if (!isSafeTaskId(taskId)) return undefined;
     const file = join(this.#paths.archiveDir, `${taskId}.output.gz`);
-    if (!existsSync(file)) return undefined;
+    const raw = readRegularFile(file, MAX_ARCHIVE_BYTES);
+    if (raw === undefined) return undefined;
     try {
-      return gunzipSync(readFileSync(file)).toString("utf8");
+      const text = gunzipSync(raw).toString("utf8");
+      return text.length > MAX_OUTPUT_BYTES
+        ? `${text.slice(0, MAX_OUTPUT_BYTES)}\n${OUTPUT_TRUNCATED_MARK}`
+        : text;
     } catch {
       return undefined;
     }

@@ -17,6 +17,8 @@
 //   verifyUnverified 的 `report?.verified ?? []`——左值只可能是数组或 undefined，数组恒真 ⇒ 等价。
 //   commandSegments 的 `tokens.length > 0` 0→1——只影响「纯 VAR=value」段；claim 侧同样剥 env
 //   后成空段被滤掉，该段永无可匹配方 ⇒ 可达输入上等价。
+//   commandSegments 里剥 env 段的 while 条件 `tokens.length > 0` → `>= 0`——空数组时
+//   tokens[0] 是 undefined，正则拿 "undefined" 去比（没有 "="，不匹配）⇒ 循环照样退出 ⇒ 等价。
 //   tokensPrefix 的 `a.length === 0 || a.length > b.length` ||→&&——空段在段表里不可达
 //   （filter 已滤），非空时逐位比较兜底，结果相同 ⇒ 等价。
 //   tokensRunInOrder 的 `i < b.length && j < a.length` &&→||——j 到 a.length 后
@@ -42,6 +44,7 @@ import {
   parseChildStream,
   pathMatches,
   spawnChild,
+  normalizeReport,
   supportsNoMcp,
   verifyUnverified,
   CHILD_REPORT_SCHEMA,
@@ -933,7 +936,7 @@ test("交付核对：按分隔符对齐——a.ts 不能命中 xa.ts", () => {
 });
 
 test("交付核对：一个都对不上才报没有实测支撑", () => {
-  const report = { summary: "s", files_touched: ["src/a.ts"] };
+  const report = { summary: "s", why: "", assessment: "", files_touched: ["src/a.ts"] };
   const delivery = (paths: string[]) => ({
     tools: {},
     paths,
@@ -944,7 +947,11 @@ test("交付核对：一个都对不上才报没有实测支撑", () => {
   assert.equal(deliveryUnverified(report, delivery(["/repo/src/a.ts"])), false);
   assert.equal(deliveryUnverified(report, delivery(["/repo/b.ts"])), true);
   assert.equal(deliveryUnverified(report, delivery([])), true, "收据里没有路径 = 没有实测支撑");
-  assert.equal(deliveryUnverified({ summary: "s" }, delivery([])), false, "没自述就不判");
+  assert.equal(
+    deliveryUnverified({ summary: "s", why: "", assessment: "" }, delivery([])),
+    false,
+    "没自述就不判",
+  );
 });
 
 // ── 自检对质：声称的命令 vs 收据的命令 ──────────────────────────────────
@@ -959,7 +966,12 @@ const cmdDelivery = (commands: string[]) => ({
 });
 
 test("自检对质：声称的命令观测到了 ⇒ 不标", () => {
-  const report = { summary: "s", verified: [{ command: "pnpm test", exitCode: 0 }] };
+  const report = {
+    summary: "s",
+    why: "",
+    assessment: "",
+    verified: [{ command: "pnpm test", exitCode: 0 }],
+  };
   assert.equal(verifyUnverified(report, cmdDelivery(["pnpm test"])), false);
   assert.equal(
     verifyUnverified(report, cmdDelivery(["cd x && pnpm test --filter a"])),
@@ -974,85 +986,125 @@ test("自检对质：声称的命令观测到了 ⇒ 不标", () => {
 });
 
 test("自检对质：声称了但一条都没观测到 ⇒ 标", () => {
-  const report = { summary: "s", verified: [{ command: "pnpm test" }] };
+  const report = { summary: "s", why: "", assessment: "", verified: [{ command: "pnpm test" }] };
   assert.equal(verifyUnverified(report, cmdDelivery(["tsc"])), true);
   assert.equal(verifyUnverified(report, cmdDelivery([])), true, "收据里没有命令 = 没有实测支撑");
 });
 
 test("自检对质：没声称就不判（只读档孩子的正常形态）", () => {
   const delivery = cmdDelivery([]);
-  assert.equal(verifyUnverified({ summary: "s" }, delivery), false);
-  assert.equal(verifyUnverified({ summary: "s", verified: [] }, delivery), false);
+  assert.equal(verifyUnverified({ summary: "s", why: "", assessment: "" }, delivery), false);
+  assert.equal(
+    verifyUnverified({ summary: "s", why: "", assessment: "", verified: [] }, delivery),
+    false,
+  );
   assert.equal(verifyUnverified(undefined, delivery), false);
 });
 
 test("自检对质：只有空白的声称不算声称（不判）", () => {
   const delivery = cmdDelivery([]);
-  assert.equal(verifyUnverified({ summary: "s", verified: [{ command: "   " }] }, delivery), false);
+  assert.equal(
+    verifyUnverified(
+      { summary: "s", why: "", assessment: "", verified: [{ command: "   " }] },
+      delivery,
+    ),
+    false,
+  );
 });
 
 test("自检对质：一个字符的声称也算声称——过滤只丢空白，不丢短串", () => {
   const delivery = cmdDelivery([]);
-  assert.equal(verifyUnverified({ summary: "s", verified: [{ command: "x" }] }, delivery), true);
+  assert.equal(
+    verifyUnverified(
+      { summary: "s", why: "", assessment: "", verified: [{ command: "x" }] },
+      delivery,
+    ),
+    true,
+  );
 });
 
 test("自检对质：空白差异归一后命中", () => {
-  const report = { summary: "s", verified: [{ command: "  pnpm   test  " }] };
+  const report = {
+    summary: "s",
+    why: "",
+    assessment: "",
+    verified: [{ command: "  pnpm   test  " }],
+  };
   const delivery = cmdDelivery(["pnpm test"]);
   assert.equal(verifyUnverified(report, delivery), false);
 });
 
 test("自检对质：双向 contains——长声称对短观测也命中", () => {
-  const report = { summary: "s", verified: [{ command: "cd src && pnpm test --filter core" }] };
+  const report = {
+    summary: "s",
+    why: "",
+    assessment: "",
+    verified: [{ command: "cd src && pnpm test --filter core" }],
+  };
   const delivery = cmdDelivery(["pnpm test"]);
   assert.equal(verifyUnverified(report, delivery), false, "观测是声称的子串也认");
 });
 
 test("自检对质：截尾省略号当通配——声称与观测在不同边界截断仍咬合", () => {
   const long = "z".repeat(300);
-  const report = { summary: "s", verified: [{ command: `${"z".repeat(200)}…` }] };
+  const report = {
+    summary: "s",
+    why: "",
+    assessment: "",
+    verified: [{ command: `${"z".repeat(200)}…` }],
+  };
   const delivery = cmdDelivery([`${long} --flag`]);
   assert.equal(verifyUnverified(report, delivery), false, "200 与 500 两个截断边界能对上");
 });
 
 test("自检对质：单 token 截断声称对更长单 token 观测仍咬合", () => {
-  const report = { summary: "s", verified: [{ command: `${"z".repeat(200)}…` }] };
+  const report = {
+    summary: "s",
+    why: "",
+    assessment: "",
+    verified: [{ command: `${"z".repeat(200)}…` }],
+  };
   const delivery = cmdDelivery([`${"z".repeat(300)}`]);
   assert.equal(verifyUnverified(report, delivery), false, "单 token 前缀宽容要生效");
 });
 
 test("自检对质：首 token 相同但参数不齐——不算跑过", () => {
-  const report = { summary: "s", verified: [{ command: "pnpm test" }] };
+  const report = { summary: "s", why: "", assessment: "", verified: [{ command: "pnpm test" }] };
   const delivery = cmdDelivery(["pnpm x y"]);
   assert.equal(verifyUnverified(report, delivery), true, "只跑了同前缀的另一组参数");
 });
 
 test("自检对质：提到命令不算跑过——echo 不提行", () => {
-  const report = { summary: "s", verified: [{ command: "pnpm test", exitCode: 0 }] };
+  const report = {
+    summary: "s",
+    why: "",
+    assessment: "",
+    verified: [{ command: "pnpm test", exitCode: 0 }],
+  };
   const delivery = cmdDelivery(["echo pnpm test"]);
   assert.equal(verifyUnverified(report, delivery), true, "只是 echo 了命令原文，没真跑——必须标");
 });
 
 test("自检对质：同族逃逸——grep 正文里提到也算没跑", () => {
-  const report = { summary: "s", verified: [{ command: "pnpm test" }] };
+  const report = { summary: "s", why: "", assessment: "", verified: [{ command: "pnpm test" }] };
   const delivery = cmdDelivery(["grep -n pnpm test src/a.ts"]);
   assert.equal(verifyUnverified(report, delivery), true);
 });
 
 test("自检对质：heredoc 正文里的命令不算跑过", () => {
-  const report = { summary: "s", verified: [{ command: "pnpm test" }] };
+  const report = { summary: "s", why: "", assessment: "", verified: [{ command: "pnpm test" }] };
   const delivery = cmdDelivery(["cat <<EOF\npnpm test\nEOF"]);
   assert.equal(verifyUnverified(report, delivery), true);
 });
 
 test("自检对质：参数交错的基础命令仍算命中", () => {
-  const report = { summary: "s", verified: [{ command: "pnpm test" }] };
+  const report = { summary: "s", why: "", assessment: "", verified: [{ command: "pnpm test" }] };
   const delivery = cmdDelivery(["pnpm --filter core test"]);
   assert.equal(verifyUnverified(report, delivery), false);
 });
 
 test("自检对质：echo 别的词也不算跑过——首 token 不符就是没跑", () => {
-  const report = { summary: "s", verified: [{ command: "pnpm test" }] };
+  const report = { summary: "s", why: "", assessment: "", verified: [{ command: "pnpm test" }] };
   const delivery = cmdDelivery(["echo test"]);
   assert.equal(
     verifyUnverified(report, delivery),
@@ -1063,13 +1115,18 @@ test("自检对质：echo 别的词也不算跑过——首 token 不符就是�
 
 // 杀 651（j=1→0）：参数交错经「短侧在前」的序列匹配命中
 test("自检对质：参数交错两侧互认——长声称对短观测经序命中", () => {
-  const report = { summary: "s", verified: [{ command: "pnpm --filter core test" }] };
+  const report = {
+    summary: "s",
+    why: "",
+    assessment: "",
+    verified: [{ command: "pnpm --filter core test" }],
+  };
   const delivery = cmdDelivery(["pnpm test"]);
   assert.equal(verifyUnverified(report, delivery), false);
 });
 
 test("自检对质：环境变量前缀不影响命中", () => {
-  const report = { summary: "s", verified: [{ command: "pnpm test" }] };
+  const report = { summary: "s", why: "", assessment: "", verified: [{ command: "pnpm test" }] };
   const delivery = cmdDelivery(["CI=1 pnpm test"]);
   assert.equal(verifyUnverified(report, delivery), false);
 });
@@ -1353,6 +1410,7 @@ const FROZEN_ARGV = {
     FROZEN_APPEND_BLOCK,
     "--no-extensions",
     "--no-skills",
+    "--",
     "干活",
   ],
   strict: [
@@ -1367,6 +1425,7 @@ const FROZEN_ARGV = {
     "--no-skills",
     "--tools",
     "read,grep,find,ls,child_report",
+    "--",
     "干活",
   ],
   strict加脚本: [
@@ -1383,6 +1442,7 @@ const FROZEN_ARGV = {
     "read,grep,find,ls,child_report,codemode",
     "-e",
     "builtin:codemode",
+    "--",
     "干活",
   ],
   不带项目上下文: [
@@ -1396,6 +1456,7 @@ const FROZEN_ARGV = {
     "--no-extensions",
     "--no-skills",
     "--no-context-files",
+    "--",
     "干活",
   ],
   模型加思考档: [
@@ -1410,6 +1471,7 @@ const FROZEN_ARGV = {
     "--no-skills",
     "--model",
     "a/b:high",
+    "--",
     "干活",
   ],
 } as const;
@@ -1743,4 +1805,94 @@ test("转向：工具报告行早于回显时 reportLine 小于 delivered 行", 
   );
   assert.equal(parsed.steerEvidence.reportLine, 1);
   assert.equal(parsed.steerEvidence.delivered[0]!.line, 3);
+});
+
+test("收件：坏事件不许毒化整次解析（type 不是字符串 / content 里有 null）", () => {
+  const stream = [
+    '{"type":5,"message":{"role":"assistant","content":[]}}',
+    '{"type":"message_end","message":{"role":"assistant","content":[null,{"type":"text","text":"活着"}]}}',
+    '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"最后"}]}}',
+  ].join("\n");
+  const parsed = parseChildStream(stream);
+  assert.equal(parsed.text, "最后", "坏行跳过后好行照收");
+  assert.equal(parsed.delivery.malformed, 1, "type 不是字符串 = 畸形行");
+});
+
+test("收件：畸形行计数（不是事件的就是畸形），空行不算", () => {
+  const stream = [
+    "",
+    "not json",
+    '{"type":5}',
+    '{"type":"message_end","message":{"role":"assistant","content":[]}}',
+  ].join("\n");
+  const parsed = parseChildStream(stream);
+  assert.equal(parsed.delivery.malformed, 2, "not json 与 type:5 是畸形，空行不算");
+});
+
+test("收件：工具名 __proto__ / constructor 也能正常计数（不污染原型）", () => {
+  const stream = [
+    '{"type":"tool_execution_start","toolName":"__proto__","args":{}}',
+    '{"type":"tool_execution_start","toolName":"constructor","args":{}}',
+  ].join("\n");
+  const parsed = parseChildStream(stream);
+  assert.equal(parsed.delivery.tools["__proto__"], 1);
+  assert.equal(parsed.delivery.tools["constructor"], 1);
+  assert.equal(({} as Record<string, unknown>)["__proto__"], Object.prototype, "原型没被动过");
+});
+
+test("收件：system 消息里声明的工具名被记下来（父方事实，不是模型自述）", () => {
+  const stream = JSON.stringify({
+    type: "message_end",
+    message: {
+      role: "system",
+      sections: { tools: "<tools>\n- read: 读文件\n- codemode: 跑脚本\n</tools>" },
+    },
+  });
+  const parsed = parseChildStream(stream);
+  assert.deepEqual(parsed.declaredTools, ["read", "codemode"]);
+});
+
+test("收件：正文里写「- codemode」不算声明（散文冒充不了工具清单）", () => {
+  const stream = JSON.stringify({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text: "- codemode: 我能用脚本" }] },
+  });
+  const parsed = parseChildStream(stream);
+  assert.deepEqual(parsed.declaredTools, [], "散文不是声明");
+});
+
+test("拼命令：任务前面带 -- 分隔符（任务不会被当旗标）", () => {
+  const argv = buildPiArgv({ task: "干活" });
+  assert.equal(argv[argv.length - 2], "--");
+  assert.equal(argv[argv.length - 1], "干活");
+});
+
+test("报告：清单字段有条数上限，退出码只认 0..255 的整数", () => {
+  const report = normalizeReport({
+    summary: "s",
+    why: "w",
+    assessment: "a",
+    findings: Array.from({ length: 200 }, (_, i) => ({ what: `发现${i}` })),
+    files_touched: Array.from({ length: 200 }, (_, i) => `/f${i}.ts`),
+    verified: [
+      { command: "ok", exitCode: 0 },
+      { command: "bad", exitCode: 999 },
+      { command: "neg", exitCode: -1 },
+    ],
+  });
+  assert.equal(report.findings!.length, 50, "清单条数封顶");
+  assert.equal(report.files_touched!.length, 50);
+  assert.equal(report.verified![0]!.exitCode, 0);
+  assert.equal(report.verified![1]!.exitCode, undefined, "999 不是进程退出码");
+  assert.equal(report.verified![2]!.exitCode, undefined, "-1 不是进程退出码");
+});
+
+test("报告：自报用量里的 NaN / Infinity 一律丢掉", () => {
+  const report = normalizeReport({
+    summary: "s",
+    why: "w",
+    assessment: "a",
+    usage: { input: Number.NaN, output: Number.POSITIVE_INFINITY, cost: 0.5 },
+  });
+  assert.deepEqual(report.usage, { cost: 0.5 }, "只留有限数");
 });

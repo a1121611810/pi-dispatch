@@ -90,12 +90,12 @@ test("tui：在飞与排队给出汇总行和逐条行", () => {
   assert.ok(lines);
   assert.equal(lines.length, 4);
   // 在飞 = running + stopping，两个都要在场（差一个总数就错）
-  assert.match(lines[0], /在飞 2 · 排队 1/);
-  assert.match(lines[0], /成功 1 · 失败 0 · 取消 0 · 丢失 0/);
+  assert.match(lines[0]!, /在飞 2 · 排队 1/);
+  assert.match(lines[0]!, /成功 1 · 失败 0 · 取消 0 · 丢失 0/);
   // 在飞按开始时刻升序：先派的在上
-  assert.match(lines[1], /#2222bbbb 收队 收一半的活/);
-  assert.match(lines[2], /#1111aaaa 在飞 读日志/);
-  assert.match(lines[3], /#3333cccc 排队 写报告/);
+  assert.match(lines[1]!, /#2222bbbb 收队 收一半的活/);
+  assert.match(lines[2]!, /#1111aaaa 在飞 读日志/);
+  assert.match(lines[3]!, /#3333cccc 排队 写报告/);
   // 没有败/丢时 footer 是干净形态（不带败/丢后缀）
   assert.equal(renderStatusText(records, OWNER), "派单 在飞2 · 排队1");
   // 在飞 == 排队 时：和为 2（非零要显示），差为 0（漏了就当空闲清掉）
@@ -153,8 +153,8 @@ test("tui：行预算 10 行——超了汇总打头、尾行报还有几个", (
   const lines = renderWidgetLines(records, OWNER);
   assert.ok(lines);
   assert.equal(lines.length, 10);
-  assert.match(lines[9], /还有 5 个/);
-  assert.match(lines[0], /在飞 13/);
+  assert.match(lines[9]!, /还有 5 个/);
+  assert.match(lines[0]!, /在飞 13/);
 });
 
 test("tui：行预算边界——9 个任务不触发还有行", () => {
@@ -252,6 +252,9 @@ test("tui：ui 抛错不冒泡（best-effort）", async () => {
 });
 
 // ── /steer 人入口 ─────────────────────────────────────────────────────────
+
+/** steerReceipt 只接成功分支——收据要写 seq / state。 */
+type SteerOk = Extract<SteerOutcome, { ok: true }>;
 
 function steerOutcome(ok: boolean, taskId = "1111aaaa", seq = 1): SteerOutcome {
   return ok
@@ -497,7 +500,7 @@ test("steer：选项从 1 开始编号，标签用 id 前 8 位", () => {
 });
 
 test("steer：回执用完整 id 前 8 位，不写 path", () => {
-  const receipt = steerReceipt(steerOutcome(true, "abcdef123456", 2));
+  const receipt = steerReceipt(steerOutcome(true, "abcdef123456", 2) as SteerOk);
   assert.match(receipt.text, /#abcdef12/);
   assert.doesNotMatch(receipt.text, /abcde123/);
 });
@@ -527,7 +530,7 @@ test("steer：owner 不同的在飞任务不列出", () => {
 });
 
 test("steer：成功回执只写 sent，不带 path", () => {
-  const receipt = steerReceipt(steerOutcome(true, "abcdef123456", 7));
+  const receipt = steerReceipt(steerOutcome(true, "abcdef123456", 7) as SteerOk);
   assert.equal(
     receipt.text,
     "已受理 #abcdef12 · seq 7 · state=sent（只代表写进信箱；送达与生效看任务结束通知）",

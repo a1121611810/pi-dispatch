@@ -96,6 +96,15 @@ test("黑板：limit 0 / -1 / 非整数都拒", () => {
   });
 });
 
+test("黑板：after 非字符串要拒（不悄悄从头读）", () => {
+  withBoard((store) => {
+    store.ensureOwner({ pid: 1, startMs: 2 });
+    store.append("c", "一条");
+    assert.throws(() => store.read({ after: 123 as never }), /after/);
+    assert.throws(() => store.read({ after: {} as never }), /after/);
+  });
+});
+
 test("黑板：after 游标严格在那条之后", () => {
   let tick = 1700000000000;
   withBoard(

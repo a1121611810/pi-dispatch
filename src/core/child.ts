@@ -278,7 +278,9 @@ export function buildPiArgv(options: BuildArgvOptions): string[] {
   argv.push(...strictToolsArgv(options));
   // allowScripts：命令行显式给的扩展不受 --no-extensions 影响 ⇒ 减量效果不丢
   if (options.allowScripts) argv.push("-e", "builtin:codemode");
-  argv.push(options.task);
+  // `--` 分隔符：任务后面的一切都是位置参数，不许被当旗标
+  // （pi 的 args.js 有 `--` 分支：1.0.0 起就有，见 node_modules/@earendil-works/pi-coding-agent/dist/cli/args.js）
+  argv.push("--", options.task);
   return argv;
 }
 
@@ -314,6 +316,8 @@ export interface ParsedChildStream {
   observedProvider: string | null;
   /** 孩子的真实工具轨迹——父核对结论用，不靠模型自述 */
   delivery: ChildDelivery;
+  /** pi 在 system 消息里给孩子声明的工具名（父方事实，不是模型自述） */
+  declaredTools: string[];
   /** 运行中转向的投递证据（queue_update → user 回显 → assistant） */
   steerEvidence: SteerEvidence;
 }
@@ -339,6 +343,10 @@ interface StreamAcc {
   paths: string[];
   commands: string[];
   errors: number;
+  /** 畸形事件行数（不是合法事件）：好行照留，坏行计数。 */
+  malformed: number;
+  /** pi 给孩子声明的工具名（system 消息的 sections.tools） */
+  declaredTools: string[];
   queuedSteers: Array<{ seq: number; line: number }>;
   deliveredSteers: Array<{ seq: number; line: number }>;
   seenSteers: Array<{ seq: number; line: number }>;
@@ -356,6 +364,8 @@ interface StreamEvent {
     model?: string;
     provider?: string;
     content?: Array<{ type?: string; text?: string }>;
+    /** system 消息的段落（sections.tools = 声明的工具清单） */
+    sections?: unknown;
     usage?: {
       input?: number;
       output?: number;
@@ -381,10 +391,13 @@ function emptyStreamAcc(): StreamAcc {
     usageTotal: null,
     observedModel: null,
     observedProvider: null,
-    tools: {},
+    // 无原型对象：工具名 "__proto__" / "constructor" 也能正常计数
+    tools: Object.create(null) as Record<string, number>,
     paths: [],
     commands: [],
     errors: 0,
+    malformed: 0,
+    declaredTools: [],
     queuedSteers: [],
     deliveredSteers: [],
     seenSteers: [],
@@ -399,6 +412,23 @@ function evidenceOf(acc: StreamAcc): SteerEvidence {
     seen: acc.seenSteers,
     ...(acc.reportLine !== undefined ? { reportLine: acc.reportLine } : {}),
   };
+}
+
+/**
+ * pi 给孩子声明的工具名（system 消息的 sections.tools，形如 "- codemode: 跑脚本"）。
+ * 这是父方观测到的事实：codemode 在不在声明里，看的是 pi 打的工具清单，
+ * 不是孩子正文里复述的字符串。
+ */
+export function declaredToolNames(sections: unknown): string[] {
+  if (!sections || typeof sections !== "object" || !("tools" in sections)) return [];
+  const tools = sections.tools;
+  if (typeof tools !== "string") return [];
+  const names: string[] = [];
+  for (const line of tools.split("\n")) {
+    const match = /^\s*-\s+([A-Za-z0-9_.-]+)\s*:/.exec(line);
+    if (match && !names.includes(match[1]!)) names.push(match[1]!);
+  }
+  return names;
 }
 
 /** 记一条碰过的路径：只收文件类工具给的 args.path，去重、有上限。 */
@@ -438,16 +468,21 @@ function takeToolEvent(event: StreamEvent, acc: StreamAcc): void {
   }
 }
 
-/** 用量：自报的 cacheRead/cacheWrite/cost 缺省就不出键。 */
+/** 用量：自报的 cacheRead/cacheWrite/cost 缺省就不出键。逐字段 finite——NaN 会污染账。 */
 function takeUsage(usage: NonNullable<NonNullable<StreamEvent["message"]>["usage"]>): ChildUsage {
   const cost = typeof usage.cost === "number" ? usage.cost : usage.cost?.total;
   return {
-    input: usage.input,
-    output: usage.output,
-    ...(usage.cacheRead !== undefined ? { cacheRead: usage.cacheRead } : {}),
-    ...(usage.cacheWrite !== undefined ? { cacheWrite: usage.cacheWrite } : {}),
-    ...(cost !== undefined ? { cost } : {}),
+    input: finiteNumber(usage.input),
+    output: finiteNumber(usage.output),
+    ...(usage.cacheRead !== undefined ? { cacheRead: finiteNumber(usage.cacheRead) } : {}),
+    ...(usage.cacheWrite !== undefined ? { cacheWrite: finiteNumber(usage.cacheWrite) } : {}),
+    ...(cost !== undefined ? { cost: finiteNumber(cost) } : {}),
   };
+}
+
+/** 有限数才留（NaN / Infinity 一律当没给）。 */
+function finiteNumber(value: number | undefined): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 /** assistant 消息：正文「最后一段胜出」，顺带记模型与用量。 */
@@ -456,11 +491,14 @@ function takeAssistant(message: NonNullable<StreamEvent["message"]>, acc: Stream
   if (message.role !== "assistant") return;
   if (typeof message.model === "string") acc.observedModel = message.model;
   if (typeof message.provider === "string") acc.observedProvider = message.provider;
-  // content 形状随 pi 版本变：非数组按「没有文本」跳过
+  // content 形状随 pi 版本变：非数组按「没有文本」跳过；元素不是对象也跳过（content:[null] 不许炸）
   const parts = Array.isArray(message.content) ? message.content : [];
   acc.text = parts
-    .filter((part) => part.type === "text" && typeof part.text === "string")
-    .map((part) => part.text!)
+    .filter(
+      (part): part is { type?: string; text?: string } =>
+        Boolean(part) && typeof part === "object" && part.type === "text",
+    )
+    .map((part) => (typeof part.text === "string" ? part.text : ""))
     .join("\n");
   if (message.usage) {
     const usage = takeUsage(message.usage);
@@ -595,12 +633,19 @@ export function createSteerEvidenceTracker(): SteerEvidenceTracker {
   };
 }
 
-/** 一行 JSON 变成一个事件；畸形行返回 undefined（不许毒化整次解析）。 */
+/**
+ * 一行 JSON 变成一个事件；畸形行返回 undefined（不许毒化整次解析）。
+ * `type` 必须是字符串：`{"type":5}` 不是事件，是坏数据。
+ */
 function parseLine(line: string): StreamEvent | undefined {
   const trimmed = line.trim();
   if (!trimmed.startsWith("{")) return undefined;
   try {
-    return JSON.parse(trimmed) as StreamEvent;
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const event = parsed as StreamEvent;
+    if (event.type !== undefined && typeof event.type !== "string") return undefined;
+    return event;
   } catch {
     return undefined;
   }
@@ -614,7 +659,11 @@ export function parseChildStream(stdout: string): ParsedChildStream {
   const acc = emptyStreamAcc();
   for (const [index, line] of stdout.split("\n").entries()) {
     const event = parseLine(line);
-    if (!event) continue;
+    if (!event) {
+      // 坏行计数：不是坏 JSON（那是半行/噪声）也算——「这一行不是事件」就是畸形
+      if (line.trim() !== "") acc.malformed += 1;
+      continue;
+    }
     const lineNo = index + 1;
     if (event.type === "queue_update") {
       takeSteerEvent(event, acc, lineNo);
@@ -625,6 +674,13 @@ export function parseChildStream(stdout: string): ParsedChildStream {
       continue;
     }
     if (event.type !== "message_end" || !event.message) continue;
+    // system 消息里的 sections.tools = pi 给孩子声明的工具清单（父方事实）
+    if (event.message.role === "system") {
+      for (const name of declaredToolNames(event.message.sections)) {
+        if (!acc.declaredTools.includes(name)) acc.declaredTools.push(name);
+      }
+      continue;
+    }
     if (event.message.role === "user") {
       takeSteerEvent(event, acc, lineNo);
       continue;
@@ -648,7 +704,9 @@ export function parseChildStream(stdout: string): ParsedChildStream {
       commands: acc.commands,
       errors: acc.errors,
       textChars: acc.text.length,
+      ...(acc.malformed > 0 ? { malformed: acc.malformed } : {}),
     },
+    declaredTools: acc.declaredTools,
     steerEvidence: evidenceOf(acc),
   };
 }
@@ -687,30 +745,53 @@ function clipReportProse(text: string): string {
   return text.length > REPORT_PROSE_MAX_CHARS ? `${text.slice(0, REPORT_PROSE_MAX_CHARS)}…` : text;
 }
 
-function normalizeReport(parsed: ChildReport): ChildReport {
+export function normalizeReport(parsed: ChildReport): ChildReport {
   return {
     summary: clipReportProse(parsed.summary),
     why: typeof parsed.why === "string" ? clipReportProse(parsed.why) : "",
     assessment: typeof parsed.assessment === "string" ? clipReportProse(parsed.assessment) : "",
     findings: Array.isArray(parsed.findings)
-      ? parsed.findings.filter((f) => typeof f?.what === "string")
+      ? parsed.findings.filter((f) => typeof f?.what === "string").slice(0, MAX_REPORT_ITEMS)
       : undefined,
     files_touched: Array.isArray(parsed.files_touched)
-      ? parsed.files_touched.filter((f): f is string => typeof f === "string")
+      ? parsed.files_touched
+          .filter((f): f is string => typeof f === "string")
+          .slice(0, MAX_REPORT_ITEMS)
       : undefined,
     verified: Array.isArray(parsed.verified)
       ? parsed.verified
           .filter((v) => typeof v?.command === "string")
+          .slice(0, MAX_REPORT_ITEMS)
           .map((v) => ({
             command:
               v.command.length > VERIFIED_COMMAND_MAX_CHARS
                 ? `${v.command.slice(0, VERIFIED_COMMAND_MAX_CHARS)}…`
                 : v.command,
-            ...(typeof v.exitCode === "number" ? { exitCode: v.exitCode } : {}),
+            // 退出码只认 0..255 的整数：别的形状当没给（-1 / 999 / NaN 不是进程退出码）
+            ...(typeof v.exitCode === "number" &&
+            Number.isInteger(v.exitCode) &&
+            v.exitCode >= 0 &&
+            v.exitCode <= 255
+              ? { exitCode: v.exitCode }
+              : {}),
           }))
       : undefined,
-    usage: parsed.usage && typeof parsed.usage === "object" ? parsed.usage : undefined,
+    usage: normalizeUsage(parsed.usage),
   };
+}
+
+/** 报告里清单类字段的条数上限：孩子自报一万条也不许撑爆父方的内存与列表。 */
+const MAX_REPORT_ITEMS = 50;
+
+/** 自报用量逐字段必须是有限数：NaN / Infinity 会污染账。 */
+function normalizeUsage(usage: ChildUsage | undefined): ChildUsage | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const out: ChildUsage = {};
+  for (const field of ["input", "output", "cost", "turns", "cacheRead", "cacheWrite"] as const) {
+    const value = usage[field];
+    if (typeof value === "number" && Number.isFinite(value)) out[field] = value;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**

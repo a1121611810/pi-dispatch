@@ -14,7 +14,7 @@ import {
   type ChildHandle,
   type SpawnChild,
 } from "./child.ts";
-import { defaultGates, type Gate, rejection } from "./gates.ts";
+import { defaultGates, parseDepth, type Gate, rejection } from "./gates.ts";
 import { BlackboardStore, type BlackboardOwner, type BlackboardRead } from "./blackboard.ts";
 import {
   canOpenAnother,
@@ -60,8 +60,11 @@ import { isTerminal } from "./types.ts";
 
 export interface EngineDeps {
   registry: TaskRegistry;
-  /** 追加的安检（默认 6 道之外） */
-  gates?: Gate[];
+  /**
+   * 追加的安检。默认九道闸始终在最前面，自定义闸只能追加在后面——
+   * 注入不是替换：替换会让默认闸（只读档、超时、深度…）凭空消失。
+   */
+  extraGates?: Gate[];
   /** 起子进程（测试注入假 spawn） */
   spawnChild?: SpawnChild;
   /** 读机器（测试注入假读数） */
@@ -80,8 +83,6 @@ export interface EngineDeps {
   whyEnabled?: () => boolean;
   /** allowScripts 的会话默认值 */
   allowScriptsDefault?: () => boolean;
-  /** 派发开关。谓词不是值。 */
-  dispatchEnabled?: () => boolean;
   /** 宿主模式：长驻异步 / 一次性等终态。 */
   hostMode?: HostMode;
   /** pi 版本（拼命令时的 --no-mcp 版本门） */
@@ -379,15 +380,15 @@ export class TaskEngine {
     );
     this.#owner = { pid: process.pid, startMs: processStartMs(process.pid) ?? this.#now() };
     this.#gates = [
-      ...(deps.gates ??
-        defaultGates({
-          isEnabled: deps.dispatchEnabled ?? (() => true),
-          isEnding: () => this.#ending,
-          depth: () => Number(process.env.PI_DISPATCH_DEPTH ?? 0),
-          maxDepth: this.#maxDepth,
-          // 没注入就当不是 git 仓 ⇒ 不许开隔离（缺省配置不许做没把握的事）
-          isGitRepo: deps.isGitRepo ?? (() => false),
-        })),
+      ...defaultGates({
+        isEnding: () => this.#ending,
+        depth: () => parseDepth(process.env.PI_DISPATCH_DEPTH),
+        maxDepth: this.#maxDepth,
+        // 没注入就当不是 git 仓 ⇒ 不许开隔离（缺省配置不许做没把握的事）
+        isGitRepo: deps.isGitRepo ?? (() => false),
+      }),
+      // 自定义闸只能追加：默认闸始终在最前面，不许被注入抹掉
+      ...(deps.extraGates ?? []),
     ];
     this.#ready = this.#storage ? this.#restore() : Promise.resolve();
     this.#startWakeTimer();
@@ -526,10 +527,15 @@ export class TaskEngine {
     // 理由开关关掉时丢内容，但记一笔「理由被丢了」
     const whyEnabled = this.#whyEnabled();
     const whySuppressed = !whyEnabled && rawInput.why !== undefined;
+    const allowScripts = rawInput.allowScripts ?? this.#allowScriptsDefault();
+    // 默认值 provider 是 JS 可调的：非 boolean 的 truthy 会悄悄开 codemode（能力扩大）⇒ 退回
+    if (typeof allowScripts !== "boolean") {
+      return rejection(`allowScripts 默认值必须是 boolean：${String(allowScripts)}`);
+    }
     const input: DispatchInput = {
       ...rawInput,
       why: whyEnabled ? rawInput.why : undefined,
-      allowScripts: rawInput.allowScripts ?? this.#allowScriptsDefault(),
+      allowScripts,
     };
     // 闸后、铸 id 前：钉死 base（受理时的 HEAD）——排队期间父仓 HEAD 前进也不漂移。
     // 钉不住就退回：闸在铸 id 前，不留记录不占座位。
@@ -1036,6 +1042,11 @@ export class TaskEngine {
   /** 只读访问 registry（适配层查列表用） */
   get registry(): TaskRegistry {
     return this.#registry;
+  }
+
+  /** 恢复时被结构闸挡下的记录条数（坏 JSON / 形状不对 / 文件名与 id 对不上）。 */
+  get skippedRecords(): number {
+    return this.#storage?.skippedRecords ?? 0;
   }
 
   isEnding(): boolean {

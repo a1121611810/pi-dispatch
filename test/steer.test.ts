@@ -259,6 +259,45 @@ test("转向：受理计划只认 running、4096/4097 边界、16 条与续号",
   });
 });
 
+test("转向：C0 正文拒（JSON 转义会把信箱撑爆）", () => {
+  const base = {
+    status: "running" as const,
+    existing: [],
+    hasStorage: true,
+    hasChildExtension: true,
+  };
+  const bad = planSteer({ ...base, text: "前\u0000后" });
+  assert.equal(bad.ok, false);
+  assert.match(bad.ok ? "" : bad.error, /control/);
+  assert.equal(planSteer({ ...base, text: "第一行\n第二行\t" }).ok, true, "换行/制表放行");
+});
+
+test("转向：4096 中文字符放行，孤立代理项按 JSON 体积拒", () => {
+  const base = {
+    status: "running" as const,
+    existing: [],
+    hasStorage: true,
+    hasChildExtension: true,
+  };
+  // 体积按 JSON 编码后算：4096 个汉字（12KB）放行，孤立代理项（转义成 6 字节 ⇒ 24KB）拒
+  assert.equal(planSteer({ ...base, text: "字".repeat(4096) }).ok, true, "4096 汉字放行");
+  const escaped = planSteer({ ...base, text: "\uD800".repeat(4096) });
+  assert.equal(escaped.ok, false, "4096 孤立代理项 ⇒ JSON 24KB ⇒ 拒");
+  assert.match(escaped.ok ? "" : escaped.error, /bytes/);
+  const tooLong = planSteer({ ...base, text: "字".repeat(4097) });
+  assert.equal(tooLong.ok, false, "字符上限仍在");
+  assert.match(tooLong.ok ? "" : tooLong.error, /chars/);
+  // 体积闸的边界：JSON 编码后正好 15 KiB 放行，多 1 字节就拒（`>` 与 `>=` 的差别就在这）
+  const atLimit = "\uD800".repeat(2559) + "字" + "a";
+  assert.equal(
+    Buffer.byteLength(JSON.stringify(atLimit), "utf8"),
+    15 * 1024,
+    "夹具必须正好卡在阈值上",
+  );
+  assert.equal(planSteer({ ...base, text: atLimit }).ok, true, "正好 15KiB 放行");
+  assert.equal(planSteer({ ...base, text: `${atLimit}b` }).ok, false, "多 1 字节要拒");
+});
+
 test("转向：isReportStale 只在报告行早于最后送达时为 true", () => {
   const base = { queued: [], delivered: [{ seq: 1, line: 9 }], seen: [] };
   assert.equal(isReportStale({ ...base, reportLine: 5 }), true);

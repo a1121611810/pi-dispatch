@@ -10,6 +10,10 @@
 //   "0" 在 ?? 下是 "0"、在 || 下是 0，Number 之后都是 0 ⇒ 等价。
 //   `if (!engine) throw` 的 delete ! —— 工具只在 session_start 里注册，而 engine 在
 //   注册之前已赋值 ⇒ 这条分支到不了 ⇒ 等价。
+//   `raw.length > MAX_STOP_REASON_CHARS` → `>=`——理由截到 500 字符后 slice(0, 500) 是恒等：
+//   长度恰好 500 时截断与不截断同值 ⇒ 等价。
+//   黑板工具的 `process.env.PI_DISPATCH_TASK_ID ?? "unknown"` → `||`——任务编号要么没设
+//   （undefined，两向都给 "unknown"）要么是非空串（恒真，两向同值）⇒ 等价。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -29,6 +33,7 @@ import entry, {
 import { NotificationCenter } from "../src/core/notifications.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
 import { encodeBucket, findProjectRoot, Storage } from "../src/core/storage.ts";
+import type { TaskRecord } from "../src/core/types.ts";
 
 /** 最小假 pi：只实现本扩展用到的 API。 */
 function fakePi(options: { failSends?: number; noSendUserMessage?: boolean } = {}) {
@@ -208,6 +213,28 @@ test("适配层：理由是空串当没给（回落 user stop）", async () => {
     const out = await def.execute("call_1", { taskId: "不存在的编号", reason: "" });
     const payload = JSON.parse(out.content[0]!.text) as { reason: string };
     assert.equal(payload.reason, "user stop", "空串是坏值 ⇒ 回落默认理由");
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+  }
+});
+
+test("适配层：stop 的理由超长要截断（不随 dispatch_list 反复重发）", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dispatch-adapter-stop-"));
+  const oldHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const { pi, handlers, tools } = fakePi();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    entry(pi as any);
+    await [...(handlers.get("session_start") ?? [])][0]!(undefined, fakeCtx(home));
+    const def = tools.get("dispatch_stop") as {
+      execute: (id: string, args: unknown) => Promise<{ content: Array<{ text: string }> }>;
+    };
+    const out = await def.execute("call_1", { taskId: "不存在的编号", reason: "x".repeat(10_000) });
+    const payload = JSON.parse(out.content[0]!.text) as { reason: string; status?: string };
+    assert.equal(payload.reason.length, 500, "理由截断到 500 字符");
+    assert.equal(payload.status, undefined, "截断不影响 stop 本身（不存在的编号照样正常回）");
   } finally {
     if (oldHome === undefined) delete process.env.HOME;
     else process.env.HOME = oldHome;
@@ -582,6 +609,16 @@ test("anchoredRead：超 maxChars 给头尾窗口并提示 around", () => {
   assert.match(out.text!, /省略 \d+ 字符：用 around="N:hash" 拉窗口/);
 });
 
+test("anchoredRead：坏参数要拒并说清，不静默夹取", () => {
+  const prose = ["alpha", "beta"].join("\n");
+  assert.match(anchoredRead(prose, { maxChars: -1 }).error!, /maxChars 必须是正整数/);
+  assert.match(anchoredRead(prose, { maxChars: 1.5 }).error!, /maxChars 必须是正整数/);
+  assert.match(anchoredRead(prose, { contextLines: -1 }).error!, /contextLines 必须是非负整数/);
+  assert.match(anchoredRead(prose, { around: 3 as never }).error!, /around 必须是字符串/);
+  // 坏参数不许被悄悄夹成「能读」——错误信息里没有正文
+  assert.equal(anchoredRead(prose, { maxChars: -1 }).text, undefined);
+});
+
 test("适配层：dispatch_read 把原始 JSONL 散文化并带行锚", async () => {
   const home = mkdtempSync(join(tmpdir(), "dispatch-adapter-read-"));
   const project = mkdtempSync(join(tmpdir(), "dispatch-proj-"));
@@ -863,6 +900,50 @@ test("适配层：dispatch_list 对默认关记录的序列化与冻结基线逐
   }
 });
 
+test("适配层：坏记录被跳过时 dispatch_list 要明说条数", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dispatch-adapter-skip-"));
+  const project = mkdtempSync(join(tmpdir(), "dispatch-proj-skip-"));
+  mkdirSync(join(project, ".git"), { recursive: true });
+  const oldHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const storage = new Storage(`${home}/.pi/dispatch`, project);
+    storage.persistRecord({
+      id: "good-0001",
+      status: "succeeded",
+      task: "干活",
+      startedAt: 1700000000000,
+      finishedAt: 1700000001234,
+      outputPath: "/tmp/out.log",
+      outputTruncated: false,
+    });
+    // 一条形状不对的记录：恢复时被跳过，父方必须看得见少了几笔
+    writeFileSync(
+      storage.recordPath("bad").replace(/bad\.json$/, "bad.json"),
+      JSON.stringify({ id: "bad", status: "done", task: "t" }),
+      "utf8",
+    );
+    const { pi, handlers, tools } = fakePi();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    entry(pi as any);
+    await [...(handlers.get("session_start") ?? [])][0]!(undefined, fakeCtx(project));
+    const def = tools.get("dispatch_list") as {
+      execute: () => Promise<{ content: Array<{ text: string }> }>;
+    };
+    let out = await def.execute();
+    for (let i = 0; i < 20 && JSON.parse(out.content[0]!.text).total === 0; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+      out = await def.execute();
+    }
+    const payload = JSON.parse(out.content[0]!.text) as { skippedRecords?: number; total: number };
+    assert.equal(payload.total, 1, "好记录照常进账");
+    assert.equal(payload.skippedRecords, 1, "坏记录被跳过要明说条数");
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+  }
+});
+
 test("适配层：dispatch_list 只回转向收据字段，缺正文、不 stale 不留键", async () => {
   const home = mkdtempSync(join(tmpdir(), "dispatch-adapter-steer-list-"));
   const project = mkdtempSync(join(tmpdir(), "dispatch-proj-steer-list-"));
@@ -891,13 +972,15 @@ test("适配层：dispatch_list 只回转向收据字段，缺正文、不 stale
       ],
     });
     // 报告晚于（或没有）转向：reportStale 为 false 时列表里不许出现这个键
+    // 盘上写 false 是故意的：记录类型只允许 true / 缺席（引擎只写 true），
+    // 但盘上可能有旧版或外来的 false —— 列表不许把它漏出来。
     storage.persistRecord({
       id: "steer-fresh-01",
       status: "succeeded",
       task: "t",
       reportStale: false,
       steers: [{ seq: 1, text: "另一段正文", at: 30, state: "queued", queuedAt: 31 }],
-    });
+    } as unknown as TaskRecord);
     const { pi, handlers, tools } = fakePi();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     entry(pi as any);

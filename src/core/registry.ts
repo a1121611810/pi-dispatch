@@ -21,7 +21,7 @@ const STEER_ORDER: Readonly<Record<SteerState, number>> = {
 const ALLOWED_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
   queued: ["running", "canceled", "lost"],
   running: ["stopping", "succeeded", "failed", "lost"],
-  stopping: ["canceled", "failed", "lost"],
+  stopping: ["succeeded", "canceled", "failed", "lost"],
   succeeded: [],
   failed: [],
   canceled: [],
@@ -99,7 +99,19 @@ export function applyResolveExit(
   command: ResolveExitCommand,
 ): { to: TaskStatus; patch: Partial<TaskRecord> } | undefined {
   if (current.status === "stopping") {
-    return { to: "canceled", patch: command.notStarted ? { startedAt: undefined } : {} };
+    return {
+      // 孩子已经成功退出（退出码 0）时 stop 来晚了：记 succeeded，不是 canceled
+      to: command.exitCode === 0 ? "succeeded" : "canceled",
+      patch: {
+        ...(command.notStarted ? { startedAt: undefined } : {}),
+        // 叫停过也要记真实退出码：孩子确实以 143 退出的，账上不该回落 -1
+        exitCode: command.exitCode,
+        // 死因只在没有别的理由时补：stop 命令已经写过 stopReason（用户为什么叫停），别覆盖它
+        ...(command.exitCode !== 0 && command.detail && !current.stopReason
+          ? { stopReason: command.detail }
+          : {}),
+      },
+    };
   }
   if (current.status === "running") {
     return {

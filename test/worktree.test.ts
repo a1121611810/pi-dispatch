@@ -98,7 +98,7 @@ test("建：worktree 建在钉死的 base 上，分支是 pi-dispatch/<编号>",
       branch: branchNameFor("task-1"),
       baseCommit: base,
     });
-    assert.equal(created.ok, true, created.error);
+    assert.equal(created.ok, true, created.error ?? "");
     assert.ok(existsSync(join(path, ".git")), "worktree 里有个 .git 文件");
     assert.equal(gitIn(path, ["rev-parse", "HEAD"]).trim(), base, "HEAD 就是钉死的 base");
     assert.equal(
@@ -125,7 +125,7 @@ test("worktree：分支建在受理时钉死的 baseCommit 上", async () => {
       branch: branchNameFor("task-1"),
       baseCommit: base,
     });
-    assert.equal(created.ok, true, created.error);
+    assert.equal(created.ok, true, created.error ?? "");
     assert.equal(gitIn(path, ["rev-parse", "HEAD"]).trim(), base, "还是那个 base");
   });
 });

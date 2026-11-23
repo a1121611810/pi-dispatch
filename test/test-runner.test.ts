@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { plan } from "../scripts/test.ts";
-import { check } from "../scripts/breakpoints.ts";
+import { check, runOne } from "../scripts/breakpoints.ts";
 import {
   INHERITED_DISPATCH_DEPTH,
   INHERITED_TEST_CONTEXT,
@@ -139,6 +139,16 @@ test("测试门禁：在派发子代理里也擦掉深度（否则适配层按�
   assert.equal(run.status, 0, run.output);
 });
 
+test("测试门禁：0 用例不许退出 0（glob 写错不许假绿）", () => {
+  const result = spawnSync(process.execPath, [RUNNER, "test/**/*.nope.ts"], {
+    encoding: "utf8",
+    timeout: 60_000,
+    env: { ...process.env },
+  });
+  assert.notEqual(result.status, 0, "0 用例退出 0 就是假绿");
+  assert.match(`${result.stdout ?? ""}${result.stderr ?? ""}`, /一条用例都没跑过/);
+});
+
 test("测试门禁：经软链调用也真跑（overlay 把 scripts/ 做成软链）", () => {
   const probe = probeFile([
     `test("夹具：写标记后失败", () => {`,
@@ -188,6 +198,70 @@ test("破坏点：red 标题写错必须判 bad-title，不能当 killed", () =>
     why: "标题写错时 node 输出 ok 1 - <文件名>、退出 0，必须归到 bad-title",
   });
   assert.equal(result.outcome, "bad-title");
+});
+
+// ── 验红器自己的假绿：失败块边界与「抛错的变异」 ─────────────────────────
+
+test("破坏点跑器：失败块只吃到本用例结束，不吃下一条的 ERR_ASSERTION", () => {
+  const probe = probeFile([
+    `test("元测试：抛错的那条", () => {`,
+    `  assert.ok(true);`,
+    `});`,
+    `test("元测试：抛错的那条之后还有断言失败", () => {`,
+    `  assert.equal(1, 2);`,
+    `});`,
+  ]);
+  const result = check({
+    feature: "元测试：失败块边界",
+    file: probe.file,
+    from: "  assert.ok(true);",
+    to: '  throw new TypeError("probe-explode");',
+    test: probe.file,
+    red: "元测试：抛错的那条",
+    why: "失败块吃到 TAP 末尾 ⇒ 下一条的 ERR_ASSERTION 被算成这一条的",
+  });
+  assert.equal(
+    result.outcome,
+    "wrong-red",
+    `无名异常的块不许借下一条的断言变红：${result.outcome} — ${result.note}`,
+  );
+});
+
+test("破坏点跑器：抛错的变异给关键字也算 killed", () => {
+  const probe = probeFile([`test("元测试：关键字那条", () => {`, `  assert.ok(true);`, `});`]);
+  const result = check({
+    feature: "元测试：关键字逃生口",
+    file: probe.file,
+    from: "  assert.ok(true);",
+    to: '  throw new Error("probe-keyword-hit");',
+    test: probe.file,
+    red: "元测试：关键字那条",
+    redKeyword: "probe-keyword-hit",
+    why: "guard 型代码删早退只会抛，写不出断言失败——显式关键字是唯一诚实信号",
+  });
+  assert.equal(result.outcome, "killed", `${result.outcome} — ${result.note}`);
+});
+
+test("破坏点跑器：子进程超时要放弃（挂死也不拖死门禁）", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dispatch-timeout-"));
+  const file = join(dir, "slow.test.ts");
+  // 真实定时器：这里测的就是「子进程挂死多久被杀」——假定时器会让被测的进程永远不超时
+  writeFileSync(
+    file,
+    [
+      'import { test } from "node:test";',
+      'test("慢用例", async () => {',
+      "  await new Promise((resolve) => setTimeout(resolve, 2000));",
+      "});",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  const t0 = Date.now();
+  const out = runOne(file, "慢用例", 200);
+  const elapsed = Date.now() - t0;
+  assert.equal(out, "", "超时要放弃：返回空 TAP，不许把挂死的输出当结果");
+  assert.ok(elapsed < 1500, `200ms 的超时不该跑这么久：${elapsed}ms`);
 });
 
 // ── 假绿元测试：转向用例必须真的盯实现，而不是盯 fake 自己 ────────────────

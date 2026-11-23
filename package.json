@@ -34,9 +34,9 @@
     "fmt:check": "oxfmt --check",
     "test": "node scripts/test.ts",
     "test:coverage": "node scripts/test.ts --experimental-test-coverage",
-    "test:node22": "npx -y node@22.19.0 --test \"test/**/*.test.ts\"",
+    "test:node22": "npx -y node@22.19.0 scripts/test.ts",
     "mutate": "mutator --no-coverage src",
-    "test:node24": "npx -y node@24 --test \"test/**/*.test.ts\"",
+    "test:node24": "npx -y node@24 scripts/test.ts",
     "test:mode": "node scripts/verify-modes.ts",
     "check:breakpoints": "node scripts/breakpoints.ts"
   },

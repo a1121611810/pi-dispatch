@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   judgeAllowScripts,
   judgeBlackboardExchange,
+  judgeChildReport,
   judgeCommandReceipt,
   judgeDefaultOffUntouched,
   judgeDispatch,
@@ -53,21 +54,56 @@ test("判断·派发：没有记录 ⇒ 红", () => {
   assert.equal(judgeDispatch(undefined).ok, false);
 });
 
-// ── allowScripts：看工具声明 ─────────────────────────────────────────────
+// ── allowScripts：看 pi 打的工具声明（结构化事实），不看散文 ─────────────────
+
+/** pi 给 system 消息的 sections.tools：声明里有 codemode。 */
+const LOG_WITH_CODEMODE = [
+  {
+    type: "message_end",
+    message: {
+      role: "system",
+      content: "",
+      sections: { tools: "<tools>\n- read: Read file contents\n- codemode: 跑脚本\n</tools>" },
+    },
+  },
+]
+  .map((event) => JSON.stringify(event))
+  .join("\n");
+
+/** pi 给 system 消息的 sections.tools：声明里只有 read/bash。 */
+const LOG_WITHOUT_CODEMODE = [
+  {
+    type: "message_end",
+    message: {
+      role: "system",
+      content: "",
+      sections: {
+        tools: "<tools>\n- read: Read file contents\n- bash: Execute bash commands\n</tools>",
+      },
+    },
+  },
+]
+  .map((event) => JSON.stringify(event))
+  .join("\n");
 
 test("判断·allowScripts：声明里有 codemode ⇒ 绿", () => {
-  assert.equal(
-    judgeAllowScripts(good, "<tools>\n- read: ...\n- codemode: 跑脚本\n</tools>").ok,
-    true,
-  );
+  assert.equal(judgeAllowScripts(good, LOG_WITH_CODEMODE).ok, true);
 });
 
 test("判断·allowScripts：声明里没有 codemode ⇒ 红", () => {
-  assert.equal(judgeAllowScripts(good, "<tools>\n- read: ...\n- bash: ...\n</tools>").ok, false);
+  assert.equal(judgeAllowScripts(good, LOG_WITHOUT_CODEMODE).ok, false);
+});
+
+test("判断·allowScripts：只有散文里写了 codemode ⇒ 红（散文不算声明）", () => {
+  const prose = JSON.stringify({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text: "- codemode: 我能用脚本" }] },
+  });
+  assert.equal(judgeAllowScripts(good, prose).ok, false, "孩子复述工具名不算 pi 的声明");
 });
 
 test("判断·allowScripts：没有记录 ⇒ 红（哪怕日志里有字样）", () => {
-  assert.equal(judgeAllowScripts(undefined, "- codemode: 跑脚本").ok, false);
+  assert.equal(judgeAllowScripts(undefined, LOG_WITH_CODEMODE).ok, false);
 });
 
 // ── 退回：一条记录都不该有 ───────────────────────────────────────────────
@@ -109,6 +145,31 @@ test("判断·rpc：工具往返没到 ⇒ 红", () => {
   assert.equal(judgeRpc(false, true).ok, false);
 });
 
+// ── 账上有数：只看宿主观测的用量，不回落自报 ─────────────────────────────
+
+test("判断·账上有数：宿主观测用量非零 ⇒ 绿", () => {
+  const observed: TaskRecord = {
+    ...good,
+    reportChannel: "none",
+    usage: { input: 120, output: 30 },
+  };
+  assert.equal(judgeChildReport(observed).ok, true);
+});
+
+test("判断·账上有数：只有孩子自报的 usage ⇒ 红（自报不算账上有数）", () => {
+  const selfReported: TaskRecord = {
+    ...good,
+    reportChannel: "tool",
+    report: { summary: "s", why: "w", assessment: "a", usage: { input: 999, output: 1 } },
+  };
+  assert.equal(judgeChildReport(selfReported).ok, false, "自报用量不回落到观测侧");
+});
+
+test("判断·账上有数：没有用量 ⇒ 红", () => {
+  assert.equal(judgeChildReport(good).ok, false);
+  assert.equal(judgeChildReport(undefined).ok, false);
+});
+
 // ── 收据命令 / 对质（verified × commands 闭环） ─────────────────────────
 
 test("判断·命令收据：canary 命中 ⇒ 绿，没命中或无记录 ⇒ 红", () => {
@@ -117,7 +178,7 @@ test("判断·命令收据：canary 命中 ⇒ 绿，没命中或无记录 ⇒ �
   assert.equal(judgeCommandReceipt(undefined, "wc -l").ok, false);
 });
 
-test("判断·对质：谎称被标 ⇒ 绿；没声称（服从变体）⇒ 绿；声称了没被标 ⇒ 红", () => {
+test("判断·对质：谎称被标 ⇒ 绿；没声称 ⇒ 红（抓捕没演练过）；声称了没被标 ⇒ 红", () => {
   const lying: TaskRecord = {
     ...good,
     verifyUnverified: true,
@@ -128,7 +189,7 @@ test("判断·对质：谎称被标 ⇒ 绿；没声称（服从变体）⇒ 绿
     ...good,
     report: { summary: "s", why: "w", assessment: "a" },
   };
-  assert.equal(judgeVerifyAudit(obedientNoClaim).ok, true, "没声称不判——只读档孩子的正常形态");
+  assert.equal(judgeVerifyAudit(obedientNoClaim).ok, false, "没声称 = 抓捕没演练过，这条腿不算绿");
   const disobeyed: TaskRecord = {
     ...good,
     report: { summary: "s", why: "w", assessment: "a", verified: [{ command: "pnpm test" }] },
@@ -392,26 +453,30 @@ test("判断·隔离退回：零记录 ⇒ 绿，有记录 ⇒ 红", () => {
   assert.equal(judgeWorktreeRejected([isolated]).ok, false);
 });
 
-test("判断·转向：seen 且最后一条 assistant 正文出现 STEERED ⇒ 绿", () => {
+/** 转向的真事件流：queue_update → user 回显 → assistant 回合 → 转向后动了手。 */
+const STEER_RECEIPT_LOG = [
+  { type: "queue_update", steering: ["[pi-dispatch-steer #1]\n改方向"] },
+  { type: "message_end", message: { role: "user", content: "[pi-dispatch-steer #1]\n改方向" } },
+  {
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text: "好，改了" }] },
+  },
+  { type: "tool_execution_start", toolName: "bash", args: { command: "wc -l /etc/hosts" } },
+]
+  .map((event) => JSON.stringify(event))
+  .join("\n");
+
+test("判断·转向：收据 seen 且转向后有动作收据 ⇒ 绿", () => {
   const record: TaskRecord = {
     id: "task_steer_ok",
     status: "succeeded",
     task: "t",
     steers: [{ seq: 1, text: "改", at: 1, state: "seen" }],
   };
-  const log = [
-    { type: "message_end", message: { role: "user", content: "请回答 STEERED" } },
-    {
-      type: "message_end",
-      message: { role: "assistant", content: [{ type: "text", text: "STEERED" }] },
-    },
-  ]
-    .map((event) => JSON.stringify(event))
-    .join("\n");
-  assert.equal(judgeSteer(record, log).ok, true);
+  assert.equal(judgeSteer(record, STEER_RECEIPT_LOG).ok, true);
 });
 
-test("判断·转向：sent/undelivered 或正文没改 ⇒ 红", () => {
+test("判断·转向：sent/undelivered 或只有散文 ⇒ 红", () => {
   const base: TaskRecord = { id: "task_steer_bad", status: "succeeded", task: "t" };
   assert.equal(judgeSteer(undefined, "STEERED").ok, false, "没有记录不崩");
   assert.equal(judgeSteer({ ...base }, "STEERED").ok, false, "没有 steers 键不崩");
@@ -430,10 +495,11 @@ test("判断·转向：sent/undelivered 或正文没改 ⇒ 红", () => {
     false,
   );
   const echoOnly = [
-    { type: "message_end", message: { role: "user", content: "请回答 STEERED" } },
+    { type: "queue_update", steering: ["[pi-dispatch-steer #1]\n改方向"] },
+    { type: "message_end", message: { role: "user", content: "[pi-dispatch-steer #1]\n改方向" } },
     {
       type: "message_end",
-      message: { role: "assistant", content: [{ type: "text", text: "DONE" }] },
+      message: { role: "assistant", content: [{ type: "text", text: "STEERED" }] },
     },
   ]
     .map((event) => JSON.stringify(event))
@@ -441,6 +507,35 @@ test("判断·转向：sent/undelivered 或正文没改 ⇒ 红", () => {
   assert.equal(
     judgeSteer({ ...base, steers: [{ seq: 1, text: "改", at: 1, state: "seen" }] }, echoOnly).ok,
     false,
-    "user 回显里的 STEERED 不能冒充孩子改向",
+    "散文里的 STEERED 不能冒充改向——转向后没有任何动作收据",
   );
+});
+
+// 两道判据必须各自可分离：state 检查与 stdout 证据检查互相兜底会让变异活下来。
+
+test("判断·转向：收据说 sent 但 stdout 有 seen 证据 ⇒ 红", () => {
+  const record: TaskRecord = {
+    id: "task_steer_sent",
+    status: "succeeded",
+    task: "t",
+    steers: [{ seq: 1, text: "改", at: 1, state: "sent" }],
+  };
+  // 证据齐了也不行：最终收据说没到 seen，就是没到
+  assert.equal(judgeSteer(record, STEER_RECEIPT_LOG).ok, false);
+});
+
+test("判断·转向：收据说 seen 但 stdout 无证据 ⇒ 红", () => {
+  const record: TaskRecord = {
+    id: "task_steer_seen",
+    status: "succeeded",
+    task: "t",
+    steers: [{ seq: 1, text: "改", at: 1, state: "seen" }],
+  };
+  const actedOnly = JSON.stringify({
+    type: "tool_execution_start",
+    toolName: "bash",
+    args: { command: "ls" },
+  });
+  // 转向后确实动了手，但没有这条 seq 的 seen 证据 ⇒ 不算送达
+  assert.equal(judgeSteer(record, actedOnly).ok, false);
 });

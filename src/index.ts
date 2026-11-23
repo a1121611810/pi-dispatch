@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { basename, dirname } from "node:path";
 import { BLACKBOARD_READ, BLACKBOARD_WRITE, BlackboardStore } from "./core/blackboard.ts";
 import { CHILD_REPORT_SCHEMA, CHILD_REPORT_TOOL_NAME, parseChildStream } from "./core/child.ts";
+import { parseDepth } from "./core/gates.ts";
 import { TaskEngine } from "./core/engine.ts";
 import { TaskRegistry } from "./core/registry.ts";
 import { NotificationCenter } from "./core/notifications.ts";
@@ -81,6 +82,9 @@ export function excerptDeliverable(result: DispatchResult): DispatchResult {
 const AROUND_ANCHOR_RE = /^(\d+):([0-9a-f]{4})$/;
 const READ_MAX_CHARS_CAP = BIG_WINDOW_MAX_CHARS;
 
+/** 停任务理由的上限：它常驻记录、每轮随 dispatch_list 重发。 */
+const MAX_STOP_REASON_CHARS = 500;
+
 /** FNV-1a 取低 16 位（4 hex），对 trim 后的行内容——omp hashline 的加宽版。 */
 export function lineHash(line: string): string {
   let h = 0x811c9dc5;
@@ -108,9 +112,25 @@ export function anchoredRead(
   opts: { maxChars?: number; around?: string; contextLines?: number } = {},
 ): AnchoredReadResult {
   const lines = prose.split("\n");
-  if (opts.around !== undefined) {
-    const m = AROUND_ANCHOR_RE.exec(opts.around.trim());
-    if (!m) return { totalLines: lines.length, error: `锚格式不对：${opts.around}（要 N:hash）` };
+  // 参数闸：坏值退回并说清，不静默夹取（maxChars:-1 会放大输出，contextLines:"x" 会变 NaN）。
+  if (opts.maxChars !== undefined && !(Number.isInteger(opts.maxChars) && opts.maxChars > 0))
+    return { totalLines: lines.length, error: `maxChars 必须是正整数：${String(opts.maxChars)}` };
+  if (
+    opts.contextLines !== undefined &&
+    !(Number.isInteger(opts.contextLines) && opts.contextLines >= 0)
+  )
+    return {
+      totalLines: lines.length,
+      error: `contextLines 必须是非负整数：${String(opts.contextLines)}`,
+    };
+  if (opts.around !== undefined && typeof opts.around !== "string")
+    return { totalLines: lines.length, error: "around 必须是字符串（N:hash）" };
+  const around = opts.around;
+  const contextLines = opts.contextLines;
+  const maxCharsOpt = opts.maxChars;
+  if (around !== undefined) {
+    const m = AROUND_ANCHOR_RE.exec(around.trim());
+    if (!m) return { totalLines: lines.length, error: `锚格式不对：${around}（要 N:hash）` };
     const n = Number(m[1]);
     const line = lines[n - 1];
     if (line === undefined)
@@ -122,7 +142,7 @@ export function anchoredRead(
         error: `锚失配：第 ${n} 行内容已变或锚写错，拒绝读取`,
         freshAnchor: `${n}:${fresh}`,
       };
-    const ctx = Math.max(0, Math.floor(opts.contextLines ?? 20));
+    const ctx = Math.max(0, Math.floor(contextLines ?? 20));
     const from = Math.max(0, n - 1 - ctx);
     const to = Math.min(lines.length, n - 1 + ctx + 1);
     return {
@@ -136,7 +156,7 @@ export function anchoredRead(
     };
   }
   const joined = lines.map((l, i) => `${i + 1}:${lineHash(l)}|${l}`).join("\n");
-  const maxChars = Math.min(opts.maxChars ?? 8192, READ_MAX_CHARS_CAP);
+  const maxChars = Math.min(maxCharsOpt ?? 8192, READ_MAX_CHARS_CAP);
   if (joined.length <= maxChars) return { text: joined, totalLines: lines.length };
   const head = Math.floor(maxChars / 4);
   const tail = maxChars - head;
@@ -214,7 +234,7 @@ export default function piDispatchEntry(pi: ExtensionAPI): void {
   };
 
   // 命令在工厂层注册一次；放 session_start 会随 /new/resume 重复注册。
-  if (Number(process.env.PI_DISPATCH_DEPTH ?? 0) === 0) registerSteerCommand(pi, current);
+  if (parseDepth(process.env.PI_DISPATCH_DEPTH) === 0) registerSteerCommand(pi, current);
 
   // 注册必须发生在 session_start——factory 阶段 getActiveTools() 是 throw 的桩。
   pi.on("session_start", (_event, ctx) => {
@@ -223,7 +243,7 @@ export default function piDispatchEntry(pi: ExtensionAPI): void {
     cleanup = undefined;
 
     // 子代理进程（depth>0）：只装配回执工具（+开了黑板才有的黑板工具），不做宿主侧任何事
-    if (Number(process.env.PI_DISPATCH_DEPTH ?? 0) > 0) {
+    if (parseDepth(process.env.PI_DISPATCH_DEPTH) > 0) {
       registerChildReportTool(pi);
       registerBlackboardTools(pi);
       offSteerInbox?.();
@@ -465,7 +485,13 @@ function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
           ...(r.steers && r.steers.length > 0 ? { steers: steerRows(r.steers) } : {}),
           ...(r.reportStale ? { reportStale: r.reportStale } : {}),
         }));
-      return textResult({ total: records.length, records });
+      // 坏记录被跳过时明说条数：父方要知道账上少了几笔
+      const skipped = current().skippedRecords;
+      return textResult({
+        total: records.length,
+        records,
+        ...(skipped > 0 ? { skippedRecords: skipped } : {}),
+      });
     },
   });
 
@@ -508,17 +534,33 @@ function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
     } as never,
     execute: async (_id, args) => {
       const a = args as {
-        taskId: string;
-        maxChars?: number;
-        around?: string;
-        contextLines?: number;
+        taskId?: unknown;
+        maxChars?: unknown;
+        around?: unknown;
+        contextLines?: unknown;
       };
+      // 参数闸：taskId 先是字符串才谈读（null.trim() 会抛）；其余坏值退回并说清。
+      if (typeof a.taskId !== "string" || a.taskId === "")
+        return textResult({ taskId: a.taskId, error: "taskId 必须是非空字符串" });
+      if (a.maxChars !== undefined && typeof a.maxChars !== "number")
+        return textResult({ taskId: a.taskId, error: "maxChars 必须是正整数" });
+      if (a.around !== undefined && typeof a.around !== "string")
+        return textResult({ taskId: a.taskId, error: "around 必须是字符串（N:hash）" });
+      if (a.contextLines !== undefined && typeof a.contextLines !== "number")
+        return textResult({ taskId: a.taskId, error: "contextLines 必须是非负整数" });
       const raw = await current().readOutput(a.taskId);
       if (raw === undefined)
         return textResult({ taskId: a.taskId, error: "还没落盘：任务未结束或编号不存在" });
       // 盘上的是原始 JSONL 事件流——模型直接读会拿到一堆 JSON 行；先散文化再锚定
       const prose = parseChildStream(raw).text || raw;
-      return textResult({ taskId: a.taskId, ...anchoredRead(prose, a) });
+      return textResult({
+        taskId: a.taskId,
+        ...anchoredRead(prose, {
+          ...(typeof a.maxChars === "number" ? { maxChars: a.maxChars } : {}),
+          ...(typeof a.around === "string" ? { around: a.around } : {}),
+          ...(typeof a.contextLines === "number" ? { contextLines: a.contextLines } : {}),
+        }),
+      });
     },
   });
 
@@ -554,9 +596,16 @@ function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
       required: ["taskId"],
     } as never,
     execute: async (_id, args) => {
-      const a = args as { taskId: string; reason?: string };
+      const a = args as { taskId?: unknown; reason?: unknown };
+      if (typeof a.taskId !== "string" || a.taskId === "")
+        return textResult({ taskId: a.taskId, error: "taskId 必须是非空字符串" });
+      // 理由必须是非字符串或没给：不是字符串就是坏值，拒掉（写进 stopReason 的是父方的原话）
+      if (a.reason !== undefined && typeof a.reason !== "string")
+        return textResult({ taskId: a.taskId, error: "reason 必须是字符串" });
       // 空串当没给：理由是坏值时回落默认（与 core 的 nonEmpty 口径一致）
-      const reason = a.reason || "user stop";
+      const raw = typeof a.reason === "string" && a.reason.trim() !== "" ? a.reason : "user stop";
+      // 理由随每条记录在每次 dispatch_list 里重发：超长截断（不拒——stop 不能被一句注脚挡住）
+      const reason = raw.length > MAX_STOP_REASON_CHARS ? raw.slice(0, MAX_STOP_REASON_CHARS) : raw;
       await current().stop(a.taskId, reason);
       // 停完要回一句话（pi 的 details 是必填；text 不能是 undefined）
       return textResult({

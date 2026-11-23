@@ -56,6 +56,7 @@ import { batchBySize, NotificationCenter } from "../src/core/notifications.ts";
 import { Storage, processStartMs } from "../src/core/storage.ts";
 import type { MachineReader, MachineSpec } from "../src/core/pool.ts";
 import type { ChildHandle } from "../src/core/child.ts";
+import type { Gate } from "../src/core/gates.ts";
 import type { GitRunner } from "../src/core/worktree.ts";
 
 const GiB = 1024 * 1024 * 1024;
@@ -110,7 +111,7 @@ function freshEngine(
     stallMs?: number;
     whyEnabled?: () => boolean;
     allowScriptsDefault?: () => boolean;
-    dispatchEnabled?: () => boolean;
+    extraGates?: Gate[];
     git?: GitRunner;
     repoRoot?: string;
     isGitRepo?: () => boolean;
@@ -128,7 +129,7 @@ function freshEngine(
     stallMs: opts.stallMs,
     whyEnabled: opts.whyEnabled,
     allowScriptsDefault: opts.allowScriptsDefault,
-    dispatchEnabled: opts.dispatchEnabled,
+    extraGates: opts.extraGates,
     git: opts.git,
     repoRoot: opts.repoRoot,
     isGitRepo: opts.isGitRepo,
@@ -221,14 +222,14 @@ function gatedGit(): {
 function recordingSpawn(seen: unknown[][]): (...args: unknown[]) => ChildHandle {
   return (...args: unknown[]) => {
     seen.push(args);
-    const exits: Array<(code: number) => void> = [];
+    const exits: Array<(code: number, stderr: string) => void> = [];
     setTimeout(() => {
-      for (const l of exits) l(0);
+      for (const l of exits) l(0, "");
     }, 5);
     return {
       pid: 1,
       onOutput: () => {},
-      onExit: (cb: (code: number) => void) => exits.push(cb),
+      onExit: (cb: (code: number, stderr: string) => void) => exits.push(cb),
       kill: () => {},
     };
   };
@@ -317,10 +318,24 @@ test("通知：非终态不进队列（queued/running/stopping 都不进）", as
 // ── 引擎：安检与记录 ─────────────────────────────────────────────────────
 
 test("引擎：安检不过要退回，且不留记录不占座位", async () => {
-  const { registry, engine } = freshEngine();
+  const root = mkdtempSync(join(tmpdir(), "dispatch-notch-"));
+  const project = join(root, "proj");
+  mkdirSync(join(project, ".git"), { recursive: true });
+  const storage = new Storage(join(root, "dispatch"), project);
+  const { registry, engine } = freshEngine({ storage });
   const rejected = await engine.dispatch({ task: "" });
   assert.equal((rejected as { status: string }).status, "rejected");
   assert.equal(registry.list().length, 0, "被拒不留记录");
+  // 盘上也不许有：闸在铸编号/建记录之前
+  const base = join(root, "dispatch", storage.bucket);
+  const recordsDir = join(base, "records");
+  const tasksDir = join(base, "tasks");
+  assert.equal(
+    existsSync(recordsDir) ? readdirSync(recordsDir).length : 0,
+    0,
+    "盘上不许有 records/*.json",
+  );
+  assert.equal(existsSync(tasksDir) ? readdirSync(tasksDir).length : 0, 0, "盘上不许有 tasks/<id>");
 });
 
 test("引擎：任务以横线开头要拒，不留记录", async () => {
@@ -328,17 +343,6 @@ test("引擎：任务以横线开头要拒，不留记录", async () => {
   const rejected = await engine.dispatch({ task: "--help" });
   assert.equal((rejected as { status: string }).status, "rejected");
   assert.equal(registry.list().length, 0);
-});
-
-test("引擎：派发开关关着要拒（谓词热生效）", async () => {
-  let enabled = true;
-  const { engine } = freshEngine({ dispatchEnabled: () => enabled });
-  enabled = false;
-  const rejected = await engine.dispatch({ task: "干活" });
-  assert.equal((rejected as { status: string }).status, "rejected");
-  enabled = true;
-  const ok = await engine.dispatch({ task: "干活" });
-  assert.equal((ok as { status: string }).status, "queued");
 });
 
 test("引擎：理由开关关着——记「理由被丢了」，不记内容", async () => {
@@ -805,9 +809,9 @@ test("引擎：allowScripts 缺省用会话默认值", async () => {
   const spawn = (argv: string[]): ChildHandle => {
     seenArgv = argv;
     const listeners: Array<(c: string) => void> = [];
-    const exits: Array<(c: number) => void> = [];
+    const exits: Array<(code: number, stderr: string) => void> = [];
     setTimeout(() => {
-      for (const l of exits) l(0);
+      for (const l of exits) l(0, "");
     }, 5);
     return {
       pid: 1,
@@ -833,9 +837,9 @@ test("引擎：调用方显式给 allowScripts:false 覆盖会话默认", async 
   let seenArgv: string[] = [];
   const spawn = (argv: string[]): ChildHandle => {
     seenArgv = argv;
-    const exits: Array<(c: number) => void> = [];
+    const exits: Array<(code: number, stderr: string) => void> = [];
     setTimeout(() => {
-      for (const l of exits) l(0);
+      for (const l of exits) l(0, "");
     }, 5);
     return {
       pid: 1,
@@ -851,6 +855,17 @@ test("引擎：调用方显式给 allowScripts:false 覆盖会话默认", async 
   });
   await engine.dispatch({ task: "干活", allowScripts: false });
   assert.ok(!seenArgv.includes("builtin:codemode"), "调用方关掉 ⇒ 不带 codemode");
+});
+
+test("引擎：allowScripts 会话默认值不是布尔 ⇒ 退回（不把 truthy 当开）", async () => {
+  const { registry, engine } = freshEngine({
+    allowScriptsDefault: (() => "yes") as never,
+    hostMode: "one-shot",
+  });
+  const out = await engine.dispatch({ task: "干活" });
+  assert.equal((out as { status: string }).status, "rejected");
+  assert.match((out as { errorMessage: string }).errorMessage, /allowScripts 默认值/);
+  assert.equal(registry.list().length, 0, "被拒不留记录");
 });
 
 // ── 引擎变异补强：把默认配置与编排分支钉死 ───────────────────────────────
@@ -908,9 +923,9 @@ test("引擎：allowScripts 会话默认缺省是 false", async () => {
   let seenArgv: string[] = [];
   const spawn = (argv: string[]): ChildHandle => {
     seenArgv = argv;
-    const exits: Array<(c: number) => void> = [];
+    const exits: Array<(code: number, stderr: string) => void> = [];
     setTimeout(() => {
-      for (const l of exits) l(0);
+      for (const l of exits) l(0, "");
     }, 5);
     return { pid: 1, onOutput: () => {}, onExit: (cb) => exits.push(cb), kill: () => {} };
   };
@@ -1032,7 +1047,6 @@ test("通知：连续 drain 第二次是空的", async () => {
   await registry.submit({ kind: "spawn", record: { id: "a", status: "queued", task: "t" } });
   await registry.submit({ kind: "transition", id: "a", to: "running" });
   await registry.submit({ kind: "resolve-exit", id: "a", exitCode: 0 });
-  nc.dain?.();
   const first = nc.drain();
   assert.equal(first.length, 1);
   const second = nc.drain();
@@ -1048,12 +1062,12 @@ test("引擎：不带任何可选 dep 也能构造（默认值兜底）", () => 
     machineReader: machineReader(),
     spawnChild: fakeSpawn({}),
     hostMode: "one-shot",
-    // 故意不注入 whyEnabled / allowScriptsDefault / dispatchEnabled / storage 等
+    // 故意不注入 whyEnabled / allowScriptsDefault / storage 等
   });
   assert.ok(engine, "缺省构造不抛异常");
 });
 
-test("引擎：缺省构造时派发开关是开的", async () => {
+test("引擎：缺省构造时派发不被拦", async () => {
   const registry = new TaskRegistry();
   const engine = new TaskEngine({
     registry,
@@ -1374,16 +1388,16 @@ test("引擎：maxDepth=0 时任何派发都被拒", async () => {
 
 test("引擎：并发派 3 个，座位够时 3 个都起（不能只起一个）", async () => {
   const registry = new TaskRegistry();
-  const exits: Array<(c: number) => void> = [];
+  const exits: Array<(code: number, stderr: string) => void> = [];
   let spawns = 0;
   const engine = new TaskEngine({
     registry,
     machineReader: machineReader(), // 5 座
     spawnChild: () => {
       spawns++;
-      const mine: Array<(c: number) => void> = [];
+      const mine: Array<(code: number, stderr: string) => void> = [];
       setTimeout(() => {
-        for (const l of mine) l(0);
+        for (const l of mine) l(0, "");
       }, 2000);
       return { pid: spawns, onOutput: () => {}, onExit: (cb) => mine.push(cb), kill: () => {} };
     },
@@ -1412,9 +1426,9 @@ test("引擎：并发派 5 个、座位 2 个 ⇒ 恰好起 2 个（不能超发
     },
     spawnChild: () => {
       spawns++;
-      const mine: Array<(c: number) => void> = [];
+      const mine: Array<(code: number, stderr: string) => void> = [];
       setTimeout(() => {
-        for (const l of mine) l(0);
+        for (const l of mine) l(0, "");
       }, 3000);
       return { pid: spawns, onOutput: () => {}, onExit: (cb) => mine.push(cb), kill: () => {} };
     },
@@ -1499,9 +1513,9 @@ test("引擎：启动名额只占启动，不占整个运行期（并发上限 =
     },
     spawnChild: () => {
       spawns++;
-      const mine: Array<(c: number) => void> = [];
+      const mine: Array<(code: number, stderr: string) => void> = [];
       setTimeout(() => {
-        for (const l of mine) l(0);
+        for (const l of mine) l(0, "");
       }, 3000); // 长跑，确保观测时都还在
       return { pid: spawns, onOutput: () => {}, onExit: (cb) => mine.push(cb), kill: () => {} };
     },
@@ -1712,7 +1726,7 @@ test("通知：未核实的交付带标记，已验证的不带", async () => {
     await registry.submit({
       kind: "attach-report",
       id,
-      report: { summary: "s" },
+      report: { summary: "s", why: "", assessment: "" },
       channel: "prompt-json",
       ...(unverified ? { unverified: true } : {}),
     });
@@ -1792,9 +1806,9 @@ test("引擎：错峰——一个结束后，排队的要立刻起（座位不�
     spawnChild: () => {
       const d = durations[spawnedAt.length] ?? 400;
       spawnedAt.push(Date.now() - t0);
-      const mine: Array<(c: number) => void> = [];
+      const mine: Array<(code: number, stderr: string) => void> = [];
       setTimeout(() => {
-        for (const l of mine) l(0);
+        for (const l of mine) l(0, "");
       }, d);
       return {
         pid: spawnedAt.length,
@@ -1854,7 +1868,7 @@ test("golden：默认关——记录与结果里都没有隔离的键", async ()
   const keys = Object.keys(registry.get(taskId) ?? {});
   assert.ok(!keys.includes("isolation"), "记录里没有 isolation");
   assert.ok(!keys.includes("worktree"), "记录里没有 worktree");
-  const result = outcome as Record<string, unknown>;
+  const result = outcome as unknown as Record<string, unknown>;
   assert.ok(!("isolation" in result), "结果里没有 isolation");
   assert.ok(!("worktree" in result), "结果里没有 worktree");
 });
@@ -2355,7 +2369,7 @@ test("引擎：没开黑板 ⇒ 记录与结果里都没有黑板的键", async 
   const outcome = await engine.dispatch({ task: "干活" });
   const taskId = (outcome as { taskId: string }).taskId;
   assert.ok(!Object.keys(registry.get(taskId) ?? {}).includes("blackboard"));
-  assert.ok(!("blackboard" in (outcome as Record<string, unknown>)));
+  assert.ok(!("blackboard" in (outcome as unknown as Record<string, unknown>)));
 });
 
 test("引擎：等启动名额时被叫停 ⇒ 一次性宿主以 canceled 返回，不挂住", async () => {
@@ -2391,7 +2405,7 @@ test("引擎：等启动名额时被叫停 ⇒ 一次性宿主以 canceled 返�
     guard = setTimeout(() => reject(new Error("dispatch 挂住了：记录停在 stopping")), 2000);
   });
   try {
-    const outcome = (await Promise.race([b, timeout])) as { status: string };
+    const outcome = (await Promise.race([b, timeout])) as { status: string; started?: boolean };
     assert.equal(outcome.status, "canceled", "一次性宿主拿到 canceled，而不是永远等");
     assert.equal(outcome.started, false);
     assert.equal(registry.get(bId)?.status, "canceled", "记录不停在 stopping");

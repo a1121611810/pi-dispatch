@@ -13,15 +13,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  allowScriptsGate,
   blackboardGate,
   depthGate,
-  dispatchEnabledGate,
   isolationGate,
   readOnlyGate,
   rejection,
   sessionEndingGate,
   taskTextGate,
+  textFieldsGate,
   timeoutGate,
+  parseDepth,
+  projectContextGate,
   worktreeNeedsGit,
   defaultGates,
 } from "../src/core/gates.ts";
@@ -32,7 +35,7 @@ import {
   compareTerminal,
   TaskRegistry,
 } from "../src/core/registry.ts";
-import type { TaskRecord } from "../src/core/types.ts";
+import { hasC0, type TaskRecord } from "../src/core/types.ts";
 
 // ── 安检 ──────────────────────────────────────────────────────────────────
 
@@ -44,16 +47,6 @@ test("安检 1：readOnly 写错值要拒，不能 coerce 成宽松", () => {
   assert.match(bad!.errorMessage, /invalid readOnly value/);
   // 关键：拒绝信息里不能出现「已按 lenient 处理」这种悄悄放行
   assert.doesNotMatch(bad!.errorMessage, /按 lenient|已放宽|降级为/);
-});
-
-test("安检 2：派发开关是谓词不是值——中途改要立刻生效", () => {
-  let enabled = true;
-  const gate = dispatchEnabledGate(() => enabled);
-  assert.equal(gate({ task: "x" }), null);
-  enabled = false;
-  const bad = gate({ task: "x" });
-  assert.ok(bad, "开关关掉后必须拒");
-  assert.match(bad!.errorMessage, /dispatch is disabled/);
 });
 
 test("安检 3：会话收尾时不接新派发", () => {
@@ -86,6 +79,42 @@ test("安检 6：以横线开头的任务要拒（pi 会当命令行选项）", 
   assert.equal(taskTextGate({ task: "干这个活 -x" }), null, "中间有横线不算");
 });
 
+test("安检 14：task 以 @ 开头要拒（pi 会把它当文件读，任务正文被丢弃）", () => {
+  const bad = taskTextGate({ task: "@/etc/passwd" });
+  assert.ok(bad, "@ 开头的任务必须被拒");
+  assert.match(bad!.errorMessage, /不能以 @ 开头/);
+  assert.ok(taskTextGate({ task: "@~/.ssh/id_rsa" }), "~ 会展开，同样要拒");
+  // pi 判的是**原始**位置参数：前导空白之后不算文件参数，别用 trimStart 误伤
+  assert.equal(taskTextGate({ task: "  @不是文件" }), null, "前导空白后 pi 不当文件参数");
+  assert.equal(taskTextGate({ task: "读 @/etc/passwd 报行数" }), null, "中间出现 @ 不算");
+});
+
+test("安检 15：task 含 C0 控制字符要拒（NUL 进 argv 会让 spawn 抛）", () => {
+  const bad = taskTextGate({ task: "前\u0000后" });
+  assert.ok(bad, "NUL 必须被拒");
+  assert.match(bad!.errorMessage, /控制字符/);
+  assert.ok(taskTextGate({ task: "\u001f" }), "单元分隔符也算控制字符");
+  // 换行/制表/回车是正常文本：多行任务要放行
+  assert.equal(taskTextGate({ task: "第一行\n第二行\t\r" }), null);
+});
+
+test("安检 16：task / why 有字节上限（超了 rejected，不是 spawn 后 E2BIG）", () => {
+  // 硬编码 64 KiB：import 常量的话，常量变异会跟着变，测试永远不会红
+  const max = "x".repeat(64 * 1024);
+  assert.equal(taskTextGate({ task: max }), null, "正好 64KiB 放行");
+  const over = taskTextGate({ task: `${max}x` });
+  assert.ok(over, "超 64KiB 要拒");
+  assert.match(over!.errorMessage, /字节上限/);
+  assert.equal(textFieldsGate({ task: "x", why: max }), null);
+  assert.ok(textFieldsGate({ task: "x", why: `${max}x` }), "why 同上限");
+  assert.equal(
+    taskTextGate({ task: "字".repeat(20_000) }),
+    null,
+    "60KB 汉字放行（按字节不按字符）",
+  );
+  assert.ok(taskTextGate({ task: "字".repeat(22_000) }), "66KB 汉字要拒");
+});
+
 test("安检：timeoutMs 必须是正数", () => {
   assert.equal(timeoutGate({ task: "x" }), null);
   assert.equal(timeoutGate({ task: "x", timeoutMs: 1000 }), null);
@@ -97,9 +126,8 @@ test("安检：timeoutMs 必须是正数", () => {
 });
 
 test("安检顺序：第一道不过，后面一概不问", () => {
-  // 开关关着 + 任务空 —— 两个都不合法。哪个先问？
+  // 任务空 —— 与后面的闸无关。哪一道先问？
   const gates = defaultGates({
-    isEnabled: () => false,
     isEnding: () => false,
     depth: () => 0,
     maxDepth: 3,
@@ -146,23 +174,103 @@ test("安检 9：要 worktree 但没有可用 git 仓要拒", () => {
 
 test("安检 10：默认闸序含隔离/黑板两道值闸", () => {
   const gates = defaultGates({
-    isEnabled: () => true,
     isEnding: () => false,
     depth: () => 0,
     maxDepth: 3,
   });
   // 既有 6 道位置一个字不动（既有用例按索引断言 gates[1]）
-  assert.equal(gates.length, 9);
+  assert.equal(gates.length, 11);
   assert.equal(gates[0], readOnlyGate);
   assert.equal(gates[1], taskTextGate);
   assert.equal(gates[2], timeoutGate);
-  // 新闸追加在末尾，编号 7/8/9
-  assert.equal(gates[6], isolationGate, "安检 7 在末尾第一位");
-  assert.equal(gates[7], blackboardGate, "安检 8 在末尾第二位");
+  // 值闸追加在末尾，编号 7/8/9
+  assert.equal(gates[5], isolationGate, "安检 7 在末尾第一位");
+  assert.equal(gates[6], blackboardGate, "安检 8 在末尾第二位");
   // 安检 9 是谓词闸（要 git）：没 git 时 isolation=worktree 要被拒
-  const rejected = gates[8]!({ task: "x", isolation: "worktree" });
+  const rejected = gates[7]!({ task: "x", isolation: "worktree" });
   assert.ok(rejected, "安检 9 要在默认闸序里");
   assert.match(rejected.errorMessage, /git/);
+  // 安检 10/11/12：allowScripts、文本字段、项目上下文的值闸追加在末尾
+  assert.equal(gates[8], allowScriptsGate);
+  assert.equal(gates[9], textFieldsGate);
+  assert.equal(gates[10], projectContextGate);
+});
+
+test("安检 11：allowScripts 非 boolean 要拒（truthy 就是开了 codemode）", () => {
+  assert.equal(allowScriptsGate({ task: "x" }), null, "不给 = 用会话默认值");
+  assert.equal(allowScriptsGate({ task: "x", allowScripts: true }), null);
+  assert.equal(allowScriptsGate({ task: "x", allowScripts: false }), null);
+  for (const bad of ["false", 1, {}, []] as unknown[]) {
+    const rejected = allowScriptsGate({ task: "x", allowScripts: bad as never });
+    assert.ok(rejected, `allowScripts=${JSON.stringify(bad)} 必须被拒`);
+    assert.match(rejected.errorMessage, /invalid allowScripts value/);
+    // 关键：不能悄悄当成 true（"false" 是非空串 ⇒ truthy ⇒ 能力扩大）
+    assert.doesNotMatch(rejected.errorMessage, /当作 true|已放宽|降级为/);
+  }
+});
+
+test("安检 12：model/thinkingLevel/why 必须是字符串，不许带控制字符", () => {
+  assert.equal(textFieldsGate({ task: "x" }), null, "不给 = 走默认");
+  assert.equal(
+    textFieldsGate({ task: "x", model: "a/b", thinkingLevel: "high", why: "理由" }),
+    null,
+  );
+  const bad = textFieldsGate({ task: "x", model: 1 as never });
+  assert.ok(bad, "非字符串必须被拒");
+  assert.match(bad.errorMessage, /invalid model/);
+  const c0 = textFieldsGate({ task: "x", why: "有\u0000 nul" });
+  assert.ok(c0, "NUL 不许进 argv");
+  assert.match(c0.errorMessage, /控制字符/);
+  // 换行/制表/回车是正常文本，放行
+  assert.equal(textFieldsGate({ task: "x", why: "第一行\n第二行\t\r" }), null);
+});
+
+test("安检 12b：model / thinkingLevel 带控制字符也拒（不只 why）", () => {
+  assert.ok(textFieldsGate({ task: "x", model: "a\u0000b" }), "model 的 NUL 要拒");
+  assert.ok(textFieldsGate({ task: "x", thinkingLevel: "hi\u001F" }), "thinkingLevel 的 C0 要拒");
+  assert.equal(textFieldsGate({ task: "x", model: "a/b", thinkingLevel: "high" }), null);
+});
+
+test("C0：垂直制表 / 单元分隔符也算控制字符", () => {
+  assert.equal(hasC0("\u000B"), true, "垂直制表");
+  assert.equal(hasC0("\u001F"), true, "单元分隔符");
+  assert.equal(hasC0("\u000C"), true, "换页");
+  assert.equal(hasC0("\n\t\r"), false, "换行/制表/回车放行");
+  assert.equal(hasC0("普通文本"), false);
+});
+
+test("安检 3/4 位置固定（会话收尾在深度之前）", () => {
+  const gates = defaultGates({ isEnding: () => true, depth: () => 3, maxDepth: 3 });
+  // 两个闸在这种输入下都会拒，只能比各自的拒绝理由
+  assert.match(gates[3]!({ task: "x" })!.errorMessage, /session is ending/);
+  assert.match(gates[4]!({ task: "x" })!.errorMessage, /depth/);
+});
+
+test("安检 13：projectContext 写错值要拒（错值方向是多加载上下文）", () => {
+  assert.equal(projectContextGate({ task: "x" }), null, "不给 = 走默认");
+  assert.equal(projectContextGate({ task: "x", projectContext: "auto" }), null);
+  assert.equal(projectContextGate({ task: "x", projectContext: "none" }), null);
+  const bad = projectContextGate({ task: "x", projectContext: "NON" as never });
+  assert.ok(bad, "写错值必须被拒");
+  assert.match(bad.errorMessage, /invalid projectContext value/);
+});
+
+test("安检：timeoutMs 必须是 1..2^31-1 的整数毫秒", () => {
+  assert.equal(timeoutGate({ task: "x", timeoutMs: 1 }), null);
+  assert.equal(timeoutGate({ task: "x", timeoutMs: 2 ** 31 - 1 }), null);
+  assert.ok(timeoutGate({ task: "x", timeoutMs: 2 ** 31 }), "超过 Node 定时器上限要拒");
+  assert.ok(timeoutGate({ task: "x", timeoutMs: 1.5 }), "小数不是有效时限");
+});
+
+test("深度解析：坏值按「太深」算，不当 0", () => {
+  assert.equal(parseDepth(undefined), 0, "没设 = 0 层");
+  assert.equal(parseDepth("0"), 0);
+  assert.equal(parseDepth("3"), 3);
+  // 「abc」当 0 会让深度闸放行、子进程被当宿主装全套工具 ⇒ 坏值必须 fail-closed
+  assert.equal(parseDepth("abc"), Number.MAX_SAFE_INTEGER);
+  assert.equal(parseDepth("-1"), Number.MAX_SAFE_INTEGER);
+  assert.equal(parseDepth("1.5"), Number.MAX_SAFE_INTEGER);
+  assert.equal(parseDepth(""), Number.MAX_SAFE_INTEGER);
 });
 
 test("安检：rejection 造的形状对", () => {
@@ -213,7 +321,7 @@ test("状态机：终态哪儿也去不了——迟到写入静默丢弃不报�
   const late = await reg.submit({
     kind: "attach-report",
     id: "a",
-    report: { summary: "迟到的" },
+    report: { summary: "迟到的", why: "", assessment: "" },
     channel: "tool",
   });
   assert.equal(late.changed, false, "迟到报告不该改记录");
@@ -224,13 +332,25 @@ test("状态机：终态哪儿也去不了——迟到写入静默丢弃不报�
   assert.equal(lateTransition.record.status, "succeeded", "终态不被改写");
 });
 
-test("状态机：stopping 的子代理收完算 canceled", async () => {
+test("状态机：stopping 的子代理收完算 canceled（退出码非 0）", async () => {
   const reg = new TaskRegistry();
   await reg.submit({ kind: "spawn", record: record("a") });
   await reg.submit({ kind: "transition", id: "a", to: "running" });
   await reg.submit({ kind: "stop", id: "a", reason: "用户叫停" });
   const done = await reg.submit({ kind: "resolve-exit", id: "a", exitCode: 143 });
   assert.equal(done.record.status, "canceled", "叫停过的一律算取消");
+  assert.equal(done.record.exitCode, 143, "真实退出码进账，不回落 -1");
+  assert.equal(done.record.stopReason, "用户叫停", "用户的叫停理由不被死因覆盖");
+});
+
+test("状态机：stop 后 resolve-exit(0) 仍是 succeeded（stop 来晚了）", async () => {
+  const reg = new TaskRegistry();
+  await reg.submit({ kind: "spawn", record: record("late") });
+  await reg.submit({ kind: "transition", id: "late", to: "running" });
+  await reg.submit({ kind: "stop", id: "late", reason: "用户叫停" });
+  const done = await reg.submit({ kind: "resolve-exit", id: "late", exitCode: 0 });
+  assert.equal(done.record.status, "succeeded", "孩子已经成功退出 ⇒ 不是 canceled");
+  assert.equal(done.record.exitCode, 0, "退出码 0 也进账");
 });
 
 test("状态机：cancel-queued 只对 queued 生效", async () => {
@@ -555,13 +675,17 @@ test("纯函数：applyResolveExit——stopping + notStarted 清 startedAt 并�
     exitCode: -1,
     notStarted: true,
   });
-  assert.deepEqual(next, { to: "canceled", patch: { startedAt: undefined } });
+  assert.equal(next?.to, "canceled");
+  assert.equal(next?.patch.startedAt, undefined, "孩子没起 ⇒ startedAt 清掉");
+  assert.equal(next?.patch.exitCode, -1, "真实退出码进账");
 });
 
 test("纯函数：applyResolveExit——stopping 不带 notStarted 保留 startedAt", () => {
   const current: TaskRecord = { id: "s", status: "stopping", task: "t", startedAt: 123 };
   const next = applyResolveExit(current, { kind: "resolve-exit", id: "s", exitCode: -1 });
-  assert.deepEqual(next, { to: "canceled", patch: {} }, "没起过的证据别乱清");
+  assert.equal(next?.to, "canceled");
+  assert.equal(next?.patch.startedAt, undefined, "没起过的证据别乱清");
+  assert.equal(next?.patch.exitCode, -1, "叫停过也要记真实退出码");
 });
 
 test("纯函数：applyResolveExit——只有非零退出的 detail 进 stopReason", () => {

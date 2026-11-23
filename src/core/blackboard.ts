@@ -236,6 +236,10 @@ export class BlackboardStore {
    * trust 恒为常量——文件自报的 trust 不作数。
    */
   read(o: { after?: string; limit?: number } = {}): BlackboardRead {
+    // after 是游标（noteId 字符串）：非字符串不许悄悄从头读——父方会以为读到的是新的一段
+    if (o.after !== undefined && typeof o.after !== "string") {
+      throw new Error(`after 必须是字符串（游标）：${String(o.after)}`);
+    }
     const limit = normalizeLimit(o.limit);
     const notesDir = this.#notesDir();
     if (!existsSync(notesDir))

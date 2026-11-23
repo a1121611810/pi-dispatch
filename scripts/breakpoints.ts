@@ -27,6 +27,11 @@ export type Breakpoint = {
   test: string;
   /** 该红的测试用例标题（精确） */
   red: string;
+  /**
+   * 失败消息里必须出现的关键字（可选）。
+   * 给了就当锚点：变异后指名用例红了，但消息里没有这个关键字 ⇒ 是别的理由红的，记 wrong-red。
+   */
+  redKeyword?: string;
   /** 弄坏之后什么表现坏掉 */
   why: string;
 };
@@ -62,15 +67,6 @@ const CASES: Breakpoint[] = [
     why: "只读档位被写错值时悄悄按宽松放行",
   },
   {
-    feature: "派发开关关着要退回",
-    file: "src/core/gates.ts",
-    from: '    isEnabled() ? null : rejection("dispatch is disabled：不再收新的派发，在飞任务不受影响");',
-    to: "    isEnabled() ? null : null;",
-    test: "test/core-logic.test.ts",
-    red: "安检 2：派发开关是谓词不是值——中途改要立刻生效",
-    why: "关掉派发后仍然接新任务",
-  },
-  {
     feature: "会话收尾时不接新派发",
     file: "src/core/gates.ts",
     from: '    isEnding() ? rejection("session is ending：这次派发不被接受") : null;',
@@ -100,7 +96,7 @@ const CASES: Breakpoint[] = [
   {
     feature: "横线开头的任务要退回",
     file: "src/core/gates.ts",
-    from: '      ? rejection("task 不能以 - 开头：pi 会把它当命令行选项")',
+    from: '      ? rejection("task 不能以 - 开头：当前 -- 分隔符已挡住旗标，这条是纵深防御")',
     to: "      ? null",
     test: "test/core-logic.test.ts",
     red: "安检 6：以横线开头的任务要拒（pi 会当命令行选项）",
@@ -109,11 +105,110 @@ const CASES: Breakpoint[] = [
   {
     feature: "超时必须是正数",
     file: "src/core/gates.ts",
-    from: '  (typeof input.timeoutMs !== "number" || !Number.isFinite(input.timeoutMs) || input.timeoutMs <= 0)',
-    to: '  (typeof input.timeoutMs !== "number" || !Number.isFinite(input.timeoutMs) || input.timeoutMs < 0)',
+    from: "    input.timeoutMs <= 0 ||",
+    to: "    input.timeoutMs < 0 ||",
     test: "test/core-logic.test.ts",
     red: "安检：timeoutMs 必须是正数",
     why: "timeoutMs 0 被当成有效时限",
+  },
+  {
+    feature: "task 以 @ 开头要退回",
+    file: "src/core/gates.ts",
+    from: '      : input.task.startsWith("@")',
+    to: "      : false",
+    test: "test/core-logic.test.ts",
+    red: "安检 14：task 以 @ 开头要拒（pi 会把它当文件读，任务正文被丢弃）",
+    why: "@ 开头的位置参数被 pi 当文件路径：任务正文丢弃、文件内容变成孩子的指令",
+  },
+  {
+    feature: "task 含 C0 控制字符要退回",
+    file: "src/core/gates.ts",
+    from: "        : hasC0(input.task)",
+    to: "        : false",
+    test: "test/core-logic.test.ts",
+    red: "安检 15：task 含 C0 控制字符要拒（NUL 进 argv 会让 spawn 抛）",
+    why: "NUL 进 argv 让 spawn 抛在铸编号之后：闸放行、占了座位、留下误导记录",
+  },
+  {
+    feature: "C0 字符类不许收窄",
+    file: "src/core/types.ts",
+    from: "const C0_RE = /[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F]/;",
+    to: "const C0_RE = /[\\u0000-\\u0008]/;",
+    test: "test/core-logic.test.ts",
+    red: "C0：垂直制表 / 单元分隔符也算控制字符",
+    why: "字符类收窄后 \\u000B / \\u001F 混进 argv：spawn 在铸编号之后抛，记成 failed",
+  },
+  {
+    feature: "allowScripts 非布尔要退回",
+    file: "src/core/gates.ts",
+    from: '  input.allowScripts !== undefined && typeof input.allowScripts !== "boolean"',
+    to: "  false",
+    test: "test/core-logic.test.ts",
+    red: "安检 11：allowScripts 非 boolean 要拒（truthy 就是开了 codemode）",
+    why: 'allowScripts="false" 是 truthy：猜成布尔就是把「不许写脚本」偷偷变成「能写脚本」',
+  },
+  {
+    feature: "文本字段必须是字符串",
+    file: "src/core/gates.ts",
+    from: '    if (typeof value !== "string")',
+    to: '    if (typeof value !== "string")\n      return null;',
+    test: "test/core-logic.test.ts",
+    red: "安检 12：model/thinkingLevel/why 必须是字符串，不许带控制字符",
+    why: "非字符串在铸编号之后 .trim 抛错 ⇒ 记成 failed 而不是 rejected",
+  },
+  {
+    feature: "文本字段的控制字符闸不只查 why",
+    file: "src/core/gates.ts",
+    from: "    if (hasC0(value))",
+    to: '    if (hasC0(value) && field === "why")',
+    test: "test/core-logic.test.ts",
+    red: "安检 12b：model / thinkingLevel 带控制字符也拒（不只 why）",
+    why: "只有 why 查控制字符，model 里的 NUL 照样进 argv——spawn 在铸编号之后抛，记成 failed",
+  },
+  {
+    feature: "task / why 有字节上限",
+    file: "src/core/gates.ts",
+    from: "export const MAX_TEXT_BYTES = 64 * 1024;",
+    to: "export const MAX_TEXT_BYTES = Number.MAX_SAFE_INTEGER;",
+    test: "test/core-logic.test.ts",
+    red: "安检 16：task / why 有字节上限（超了 rejected，不是 spawn 后 E2BIG）",
+    why: "上限被取消，2 MiB 的 task 会在 spawn 处抛 E2BIG：闸放行、记 failed、留误导记录",
+  },
+  {
+    feature: "projectContext 写错值要退回",
+    file: "src/core/gates.ts",
+    from: '  input.projectContext !== undefined &&\n  input.projectContext !== "auto" &&\n  input.projectContext !== "none"',
+    to: "  false",
+    test: "test/core-logic.test.ts",
+    red: "安检 13：projectContext 写错值要拒（错值方向是多加载上下文）",
+    why: '"NON" 被悄悄当成 auto：父方想少加载上下文，加载量反而变多',
+  },
+  {
+    feature: "深度解析只认整串十进制",
+    file: "src/core/gates.ts",
+    from: "  const value = /^\\d+$/.test(raw) ? Number(raw) : Number.NaN;",
+    to: "  const value = /\\d+/.test(raw) ? Number(raw) : Number.NaN;",
+    test: "test/core-logic.test.ts",
+    red: "深度解析：坏值按「太深」算，不当 0",
+    why: "坏值被解析成负数/小数混进深度：闸按「0 层」放行，子进程被当宿主装全套工具",
+  },
+  {
+    feature: "超时必须是整数",
+    file: "src/core/gates.ts",
+    from: "    !Number.isInteger(input.timeoutMs) ||",
+    to: "    false ||",
+    test: "test/core-logic.test.ts",
+    red: "安检：timeoutMs 必须是 1..2^31-1 的整数毫秒",
+    why: "1.5 毫秒不是有效时限：小数被当成真时限，计时口径就说不清了",
+  },
+  {
+    feature: "超时不超过 Node 定时器上限",
+    file: "src/core/gates.ts",
+    from: "    input.timeoutMs > MAX_TIMEOUT_MS)",
+    to: "    false)",
+    test: "test/core-logic.test.ts",
+    red: "安检：timeoutMs 必须是 1..2^31-1 的整数毫秒",
+    why: "超过 2^31-1 的定时器立刻溢出：不是「很久」，是几乎立刻超时",
   },
   {
     feature: "退回不留记录",
@@ -226,7 +321,7 @@ const CASES: Breakpoint[] = [
     feature: "终态不可再迁",
     file: "src/core/registry.ts",
     from: "    const current = this.#require(id);\n    if (isTerminal(current.status))\n      return { record: current, fromStatus: current.status, changed: false };\n    if (!ALLOWED_TRANSITIONS[current.status].includes(to)) {",
-    to: "    const current = this.#require(id);\n    if (!ALLOWED_TRANSITIONS[current.status].includes(to)) {",
+    to: "    const current = this.#require(id);\n    if (isTerminal(current.status))\n      return { record: { ...current, status: to }, fromStatus: current.status, changed: true };\n    if (!ALLOWED_TRANSITIONS[current.status].includes(to)) {",
     test: "test/core-logic.test.ts",
     red: "状态机：终态哪儿也去不了——迟到写入静默丢弃不报错",
     why: "终态被改写，账本回头会说谎",
@@ -252,17 +347,17 @@ const CASES: Breakpoint[] = [
   {
     feature: "叫停过的收完算取消",
     file: "src/core/registry.ts",
-    from: '    return { to: "canceled", patch: command.notStarted ? { startedAt: undefined } : {} };',
-    to: '    return { to: "failed", patch: command.notStarted ? { startedAt: undefined } : {} };',
+    from: '      to: command.exitCode === 0 ? "succeeded" : "canceled",',
+    to: '      to: command.exitCode === 0 ? "succeeded" : "failed",',
     test: "test/core-logic.test.ts",
-    red: "状态机：stopping 的子代理收完算 canceled",
+    red: "状态机：stopping 的子代理收完算 canceled（退出码非 0）",
     why: "用户主动停的显示成失败",
   },
   {
     feature: "只有排队中的能被抽掉",
     file: "src/core/registry.ts",
-    from: '        if (current.status !== "queued")',
-    to: "        if (false)",
+    from: '        if (current.status !== "queued")\n          return { record: current, fromStatus: current.status, changed: false };',
+    to: '        if (current.status !== "queued")\n          return {\n            record: { ...current, status: "canceled" },\n            fromStatus: current.status,\n            changed: true,\n          };',
     test: "test/core-logic.test.ts",
     red: "状态机：cancel-queued 只对 queued 生效",
     why: "在跑的任务被 cancel-queued 改名，实际还在跑",
@@ -366,8 +461,8 @@ const CASES: Breakpoint[] = [
   {
     feature: "编号里的 / \\ .. 要拒",
     file: "src/core/storage.ts",
-    from: '  return !taskId.includes("/") && !taskId.includes("\\\\") && !taskId.includes("..");',
-    to: '  return !taskId.includes("/");',
+    from: '  if (taskId.includes("/") || taskId.includes("\\\\") || taskId.includes("..")) return false;',
+    to: '  if (taskId.includes("/")) return false;',
     test: "test/storage.test.ts",
     red: "编号安全：斜杠、反斜杠、两个点都拒",
     why: "路径穿越，写到桶外",
@@ -375,11 +470,30 @@ const CASES: Breakpoint[] = [
   {
     feature: "坏记录不拖垮启动",
     file: "src/core/storage.ts",
-    from: "      } catch {\n        // 单条坏记录不拖垮启动\n      }",
-    to: "      } catch (error) {\n        throw error;\n      }",
+    from: "      } catch {\n        // 单条坏记录不拖垮启动\n        this.#skippedRecords += 1;\n      }",
+    to: "      } catch (error) {\n        throw new Error(`bad record kills startup: ${String(error)}`);\n      }",
     test: "test/storage.test.ts",
     red: "记录：坏文件不拖垮启动，跳过继续",
     why: "一条坏记录让整个会话起不来",
+    redKeyword: "bad record kills startup",
+  },
+  {
+    feature: "恢复：只读普通文件（FIFO / 超大文件跳过）",
+    file: "src/core/storage.ts",
+    from: "    if (!info.isFile() || info.size > maxBytes) return undefined;",
+    to: "    if (false) return undefined;",
+    test: "test/storage.test.ts",
+    red: "记录：恢复时 FIFO / 超大文件 / 文件名与 id 对不上的都跳过，不阻塞启动",
+    why: "孩子放一个 FIFO 叫 x.json，下次启动 #ready 永不落定，该项目所有派发永久挂住",
+  },
+  {
+    feature: "恢复：文件名必须等于记录 id",
+    file: "src/core/storage.ts",
+    from: "        if (isRestorableRecord(record) && file === `${record.id}.json`) records.push(record);",
+    to: "        if (isRestorableRecord(record)) records.push(record);",
+    test: "test/storage.test.ts",
+    red: "记录：恢复时 FIFO / 超大文件 / 文件名与 id 对不上的都跳过，不阻塞启动",
+    why: 'evil.json 写 {"id":"other"} 就冒充别人的记录进账',
   },
   {
     feature: "空产出是空串，不是没产出",
@@ -414,7 +528,7 @@ const CASES: Breakpoint[] = [
     from: '        env: { ...process.env, LC_ALL: "C" },',
     to: "        env: process.env,",
     test: "test/storage.test.ts",
-    red: "locale：中文环境下进程启动时刻仍读得到（ps 输出带 LC_ALL=C）",
+    red: "locale：ps 子进程拿到 LC_ALL=C（不被别处的 locale 顶掉）",
     why: "中文环境下启动时刻解析失败，活着的会话被标失联",
   },
   {
@@ -483,13 +597,31 @@ const CASES: Breakpoint[] = [
     why: "/new 或 resume 后 handler 累积、旧引擎没人收",
   },
   {
+    feature: "stop 的理由有长度上限（截断不拒）",
+    file: "src/index.ts",
+    from: "      const reason = raw.length > MAX_STOP_REASON_CHARS ? raw.slice(0, MAX_STOP_REASON_CHARS) : raw;",
+    to: "      const reason = raw;",
+    test: "test/adapter.test.ts",
+    red: "适配层：stop 的理由超长要截断（不随 dispatch_list 反复重发）",
+    why: "十万字的 stopReason 每轮随 dispatch_list 全量重发，父方上下文被一句话吃掉",
+  },
+  {
     feature: "allowScripts 缺省用会话默认值",
     file: "src/core/engine.ts",
-    from: "      allowScripts: rawInput.allowScripts ?? this.#allowScriptsDefault(),",
-    to: "      allowScripts: rawInput.allowScripts ?? false,",
+    from: "    const allowScripts = rawInput.allowScripts ?? this.#allowScriptsDefault();",
+    to: "    const allowScripts = rawInput.allowScripts ?? false;",
     test: "test/engine.test.ts",
     red: "引擎：allowScripts 缺省用会话默认值",
     why: "会话默认开着却用不上",
+  },
+  {
+    feature: "allowScripts 默认值不是 boolean 要退回",
+    file: "src/core/engine.ts",
+    from: '    if (typeof allowScripts !== "boolean") {',
+    to: "    if (false) {",
+    test: "test/engine.test.ts",
+    red: "引擎：allowScripts 会话默认值不是布尔 ⇒ 退回（不把 truthy 当开）",
+    why: 'provider 返回 "yes" 时 truthy 开 codemode——「不许写脚本」被悄悄变成「能写脚本」',
   },
 
   // ── 验收判断（判断写错也要能抓住） ──────────────────────────────────────
@@ -505,7 +637,7 @@ const CASES: Breakpoint[] = [
   {
     feature: "判断·allowScripts：看工具声明",
     file: "scripts/verdicts.ts",
-    from: '  const declared = childLog.includes("- codemode");',
+    from: '  const declared = parseChildStream(childLog).declaredTools.includes("codemode");',
     to: "  const declared = childLog.length > 0;",
     test: "test/verdicts.test.ts",
     red: "判断·allowScripts：声明里没有 codemode ⇒ 红",
@@ -720,7 +852,7 @@ const CASES: Breakpoint[] = [
     feature: "转向：受理计划拒绝非字符串",
     file: "src/core/steer.ts",
     from: '  if (typeof input.text !== "string") return { ok: false, error: "steer message must be a string" };',
-    to: '  if (false) return { ok: false, error: "steer message must be a string" };',
+    to: '  if (typeof input.text !== "string") return { ok: true, seq: 1, text: "" };',
     test: "test/steer.test.ts",
     red: "转向：受理计划只认 running、4096/4097 边界、16 条与续号",
     why: "非字符串会崩在 trim()，不是可预期拒绝",
@@ -810,11 +942,11 @@ const CASES: Breakpoint[] = [
   {
     feature: "孩子进程只注册回执工具",
     file: "src/index.ts",
-    from: `    if (Number(process.env.PI_DISPATCH_DEPTH ?? 0) > 0) {
+    from: `    if (parseDepth(process.env.PI_DISPATCH_DEPTH) > 0) {
       registerChildReportTool(pi);
       registerBlackboardTools(pi);
       offSteerInbox?.();`,
-    to: `    if (Number(process.env.PI_DISPATCH_DEPTH ?? 0) > 0) {
+    to: `    if (parseDepth(process.env.PI_DISPATCH_DEPTH) > 0) {
       registerBlackboardTools(pi);
       offSteerInbox?.();`,
     test: "test/adapter.test.ts",
@@ -989,8 +1121,8 @@ const CASES: Breakpoint[] = [
   {
     feature: "空理由当没给",
     file: "src/index.ts",
-    from: '      const reason = a.reason || "user stop";',
-    to: '      const reason = a.reason ?? "user stop";',
+    from: '      const raw = typeof a.reason === "string" && a.reason.trim() !== "" ? a.reason : "user stop";',
+    to: '      const raw = typeof a.reason === "string" ? a.reason : "user stop";',
     test: "test/adapter.test.ts",
     red: "适配层：理由是空串当没给（回落 user stop）",
     why: "空串是坏值却当有效理由记进停止原因",
@@ -1144,10 +1276,11 @@ const CASES: Breakpoint[] = [
   {
     feature: "TUI 转向未知选项不猜 id",
     file: "src/tui.ts",
-    from: "    if (index < 0) {",
-    to: "    if (false) {",
+    from: '    if (index < 0) {\n      deps.ui.notify("选择器返回了未知选项，没发", "error");\n      return;\n    }',
+    to: '    if (index < 0) {\n      throw new Error("unknown steer option");\n    }',
     test: "test/tui.test.ts",
     red: "steer：select 取消/未知项不发送",
+    redKeyword: "unknown steer option",
     why: "select 返回未知串时 target 变 undefined，抛异常或发错任务",
   },
   {
@@ -1180,7 +1313,7 @@ const CASES: Breakpoint[] = [
   {
     feature: "TUI 转向命令工厂层只注册一次",
     file: "src/index.ts",
-    from: "  if (Number(process.env.PI_DISPATCH_DEPTH ?? 0) === 0) registerSteerCommand(pi, current);",
+    from: "  if (parseDepth(process.env.PI_DISPATCH_DEPTH) === 0) registerSteerCommand(pi, current);",
     to: "  if (false) registerSteerCommand(pi, current);",
     test: "test/adapter.test.ts",
     red: "steer 命令：工厂层只注册一次 /steer",
@@ -1243,8 +1376,8 @@ const CASES: Breakpoint[] = [
   {
     feature: "TUI 转向命令孩子进程不注册",
     file: "src/index.ts",
-    from: "  if (Number(process.env.PI_DISPATCH_DEPTH ?? 0) === 0) registerSteerCommand(pi, current);",
-    to: "  if (Number(process.env.PI_DISPATCH_DEPTH ?? 0) >= 0) registerSteerCommand(pi, current);",
+    from: "  if (parseDepth(process.env.PI_DISPATCH_DEPTH) === 0) registerSteerCommand(pi, current);",
+    to: "  if (parseDepth(process.env.PI_DISPATCH_DEPTH) >= 0) registerSteerCommand(pi, current);",
     test: "test/adapter.test.ts",
     red: "steer 命令：depth>0 不注册（孩子进程里连命令都没有）",
     why: "子代理进程也拿到 /steer，孩子之间可以互相插话",
@@ -1289,14 +1422,52 @@ const CASES: Breakpoint[] = [
     why: "mutator 的 overlay 里 scripts/ 是软链 ⇒ 门禁静默空转退出 0，变异全假活",
   },
   {
+    feature: "测试门禁：0 用例不许退出 0",
+    file: "scripts/test.ts",
+    from: "  if (passed === undefined || passed === 0) {",
+    to: "  if (false) {",
+    test: "test/test-runner.test.ts",
+    red: "测试门禁：0 用例不许退出 0（glob 写错不许假绿）",
+    why: "glob/文件路径写错时一条用例都不跑却退出 0：整条门禁的「绿」全是假的",
+  },
+  {
     feature: "破坏点跑器：也擦掉继承来的测试上下文",
     file: "scripts/breakpoints.ts",
     // 锚点分两段拼：这张表就在同一个文件里，整段写死会连同本条一起匹配到自己
-    from: '      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ' + "env: scrubbedEnv() },",
-    to: '      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },',
+    from: "        env: scrubbedEn" + "v(),\n",
+    to: "",
     test: "test/test-runner.test.ts",
     red: "破坏点跑器：子代理环境里也真判红（擦掉继承来的测试上下文）",
     why: "子代理里跑验红，每条都报「原本不是绿的」——验红门禁全瘫",
+  },
+  {
+    feature: "破坏点跑器：失败块只吃到本用例结束",
+    file: "scripts/breakpoints.ts",
+    from:
+      "  const end = lines.findIndex((line, index) => index > start && line.trimEnd() === " +
+      '"  ...");',
+    to: '  const end = lines.findIndex((line, index) => index > start && line.startsWith("  ...\\n"));',
+    test: "test/test-runner.test.ts",
+    red: "破坏点跑器：失败块只吃到本用例结束，不吃下一条的 ERR_ASSERTION",
+    why: "按 \\n split 后行尾永远没有换行 ⇒ 块吃到 TAP 末尾，下一条的断言失败被算成本条 killed",
+  },
+  {
+    feature: "破坏点跑器：显式关键字 kills 也算红",
+    file: "scripts/breakpoints.ts",
+    from: "        (bp.redKeyword !== undefined && block.includes(bp." + "redKeyword));",
+    to: "        false;",
+    test: "test/test-runner.test.ts",
+    red: "破坏点跑器：抛错的变异给关键字也算 killed",
+    why: "抛错类变异没有断言失败消息，只靠 ERR_ASSERTION 判会全记 wrong-red",
+  },
+  {
+    feature: "破坏点跑器：子进程有超时（挂死拖不死单实例门禁）",
+    file: "scripts/breakpoints.ts",
+    from: "        timeout: timeout" + "Ms,",
+    to: "        timeout: undefined,",
+    test: "test/test-runner.test.ts",
+    red: "破坏点跑器：子进程超时要放弃（挂死也不拖死门禁）",
+    why: "变异触发 FIFO / 死循环时验红器永久挂住：单实例门禁一挂，整条交付线停摆",
   },
   // ── 隔离与黑板地基 ──────────────────────────────────────────────────────
   {
@@ -1334,6 +1505,24 @@ const CASES: Breakpoint[] = [
     test: "test/core-logic.test.ts",
     red: "安检 10：默认闸序含隔离/黑板两道值闸",
     why: "闸写好了却没接进默认闸序，隔离值写错也放行",
+  },
+  {
+    feature: "收尾闸与深度闸的次序固定",
+    file: "src/core/gates.ts",
+    from: "    sessionEndingGate(deps.isEnding),\n    depthGate(deps.depth, deps.maxDepth),",
+    to: "    depthGate(deps.depth, deps.maxDepth),\n    sessionEndingGate(deps.isEnding),",
+    test: "test/core-logic.test.ts",
+    red: "安检 3/4 位置固定（会话收尾在深度之前）",
+    why: "会话收尾闸挪到深度闸之后，收尾中还会先问深度——顺序变了，人读的编号与实现脱节",
+  },
+  {
+    feature: "缺省 git 探测按「不是 git 仓」算",
+    file: "src/core/gates.ts",
+    from: "    worktreeNeedsGit(deps.isGitRepo ?? (() => false)),",
+    to: "    worktreeNeedsGit(deps.isGitRepo ?? (() => true)),",
+    test: "test/core-logic.test.ts",
+    red: "安检 10：默认闸序含隔离/黑板两道值闸",
+    why: "缺省配置被当成「是 git 仓」：非 git 目录里开隔离，worktree 到运行时才炸",
   },
   {
     feature: "spawn 第三参 cwd 落到子进程",
@@ -1423,13 +1612,14 @@ const CASES: Breakpoint[] = [
     to: "        const r = undefined;",
     test: "test/engine.test.ts",
     red: "引擎：等启动名额时被叫停 ⇒ 一次性宿主以 canceled 返回，不挂住",
+    redKeyword: "dispatch 挂住了",
     why: "叫停分支不 submit resolve-exit ⇒ 记录永远停在 stopping，一次性宿主在 #awaitTerminal 上永久挂住",
   },
   {
     feature: "notStarted 清 startedAt",
     file: "src/core/registry.ts",
-    from: "...(command.notStarted ? { startedAt: undefined } : {})",
-    to: "...({})",
+    from: "        // 记录里 startedAt 有值必须恒等于「孩子真起过」。\n        ...(command.notStarted ? { startedAt: undefined } : {}),\n        exitCode: command.exitCode,",
+    to: "        // 记录里 startedAt 有值必须恒等于「孩子真起过」。\n        ...({}),\n        exitCode: command.exitCode,",
     test: "test/core-logic.test.ts",
     red: "状态机：notStarted 的 resolve-exit ⇒ started:false、duration 0",
     why: "孩子压根没起，记录里却留着 startedAt——账上说它跑过",
@@ -1447,7 +1637,7 @@ const CASES: Breakpoint[] = [
     feature: "观测失败只记 captureError",
     file: "src/core/worktree.ts",
     from: "return { ...fallback, captureError: messageOf(error) };",
-    to: "throw error;",
+    to: "return { ...fallback, captureError: undefined };",
     test: "test/worktree.test.ts",
     red: "worktree：观测失败只记 captureError，不回改终态",
     why: "观测失败就抛——孩子明明跑完了，终态被观测的意外改掉",
@@ -1596,6 +1786,15 @@ const CASES: Breakpoint[] = [
     test: "test/blackboard.test.ts",
     red: "黑板：坏 JSON 与 .tmp 计入 errors，其余照读",
     why: "坏文件不记错——父方看不到板上读漏了东西",
+  },
+  {
+    feature: "黑板 after 游标必须是字符串",
+    file: "src/core/blackboard.ts",
+    from: 'typeof o.after !== "string"',
+    to: "false",
+    test: "test/blackboard.test.ts",
+    red: "黑板：after 非字符串要拒（不悄悄从头读）",
+    why: "非字符串游标静默从头读：父方以为读到的是新的一段，其实是全部旧笔记",
   },
   {
     feature: "strict 白名单收编黑板工具",
@@ -1847,6 +2046,24 @@ const CASES: Breakpoint[] = [
     why: "第 17 条也写进去，孩子收到超量转向",
   },
   {
+    feature: "转向：C0 正文拒收",
+    file: "src/core/steer.ts",
+    from: '  if (hasC0(trimmed)) return { ok: false, error: "steer message contains control characters" };',
+    to: '  if (false) return { ok: false, error: "steer message contains control characters" };',
+    test: "test/steer.test.ts",
+    red: "转向：C0 正文拒（JSON 转义会把信箱撑爆）",
+    why: "C0 在 JSON 里转义成 6 字节：16 条就能撑爆信箱读上限，任务转向永久失效",
+  },
+  {
+    feature: "转向：JSON 体积上限只拒 6 倍转义与超长",
+    file: "src/core/steer.ts",
+    from: '  if (Buffer.byteLength(JSON.stringify(trimmed), "utf8") > MAX_STEER_JSON_BYTES)',
+    to: "  if (false)",
+    test: "test/steer.test.ts",
+    red: "转向：4096 中文字符放行，孤立代理项按 JSON 体积拒",
+    why: "体积闸被删，16 条孤立代理项 = 393KB 撑爆 256 KiB 读上限，该任务转向永久失效",
+  },
+  {
     feature: "已有信箱续号而不是从 1 重开",
     file: "src/core/steer.ts",
     from: "  const seq = last ? last.seq + 1 : 1;",
@@ -1898,6 +2115,7 @@ const CASES: Breakpoint[] = [
     to: '      throw new Error("bad steer line");',
     test: "test/steer.test.ts",
     red: "转向：坏行/半行/纯空白不毒化，有效行按 seq 升序且同 seq 只取一次",
+    redKeyword: "bad steer line",
     why: "半个 JSON 行让整个信箱不可读，后续转向全丢",
   },
   {
@@ -1955,6 +2173,15 @@ const CASES: Breakpoint[] = [
     why: "报告不 stale 的任务也带 reportStale:false，跟「缺席即没事」的约定打架",
   },
   {
+    feature: "坏记录被跳过时列表明说条数",
+    file: "src/index.ts",
+    from: "        ...(skipped > 0 ? { skippedRecords: skipped } : {}),",
+    to: "        ...(false ? { skippedRecords: skipped } : {}),",
+    test: "test/adapter.test.ts",
+    red: "适配层：坏记录被跳过时 dispatch_list 要明说条数",
+    why: "账上少了几笔却不吭声：父方以为记录全在，缺的那几笔永远无人知道",
+  },
+  {
     feature: "终态通知带转向收据",
     file: "src/index.ts",
     from: '          n.steers ? steerHint(n.steers) : "",',
@@ -1996,7 +2223,7 @@ const CASES: Breakpoint[] = [
     from: '  if (steer.state !== "seen") return { ok: false, detail: `state=${steer.state}` };',
     to: "  if (false) return { ok: false, detail: `state=${steer.state}` };",
     test: "test/verdicts.test.ts",
-    red: "判断·转向：sent/undelivered 或正文没改 ⇒ 红",
+    red: "判断·转向：收据说 sent 但 stdout 有 seen 证据 ⇒ 红",
     why: "sent/undelivered 也当成功，真机腿把没送达的转向判绿",
   },
   {
@@ -2036,13 +2263,13 @@ const CASES: Breakpoint[] = [
     why: "最终收据缺 deliveredAt，真机腿和父方读不到送达时刻",
   },
   {
-    feature: "judgeSteer 只看最后一条 assistant",
+    feature: "judgeSteer 看收据不看散文",
     file: "scripts/verdicts.ts",
-    from: "  const text = parseChildStream(childLog).text;",
-    to: "  const text = childLog;",
+    from: "  if (!parsed.steerEvidence.seen.some((entry) => entry.seq === steer.seq))",
+    to: "  if (false)",
     test: "test/verdicts.test.ts",
-    red: "判断·转向：sent/undelivered 或正文没改 ⇒ 红",
-    why: "user 回显里的 STEERED 冒充孩子改向，真机腿假绿",
+    red: "判断·转向：收据说 seen 但 stdout 无证据 ⇒ 红",
+    why: "转向收据不看送达证据，散文里写一句 STEERED 就能冒充改向",
   },
   {
     feature: "通知只在 reportStale 为 true 时带警告",
@@ -2074,17 +2301,40 @@ function escapeRe(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** TAP 里指名用例的失败块（not ok 段）。找不到就返回空串。 */
+function failureBlock(tap: string, title: string): string {
+  const lines = tap.split("\n");
+  const start = lines.findIndex(
+    (line) => line.startsWith(`not ok `) && line.includes(`- ${title}`),
+  );
+  if (start < 0) return "";
+  const end = lines.findIndex((line, index) => index > start && line.trimEnd() === "  ...");
+  return lines.slice(start, end > start ? end : lines.length).join("\n");
+}
+
+/** 单条指名用例的超时：挂死也要变红，不能把单实例门禁拖死。 */
+export const RUN_TIMEOUT_MS = 120_000;
+
 /** 跑一条指名用例，返回 TAP 原文。环境要擦干净：在测试进程/子代理里否则一条用例都不跑。 */
-function runOne(file: string, red: string): string {
+export function runOne(file: string, red: string, timeoutMs = RUN_TIMEOUT_MS): string {
   try {
     return execFileSync(
       process.execPath,
       ["--test", "--test-reporter=tap", `--test-name-pattern=${escapeRe(red)}`, file],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: scrubbedEnv() },
+      {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        env: scrubbedEnv(),
+        timeout: timeoutMs,
+        killSignal: "SIGKILL",
+      },
     );
   } catch (error) {
     // 非零退出也可能带着 TAP 输出——照读，归属判断只看文本
-    const e = error as { stdout?: string; stderr?: string };
+    const e = error as { stdout?: string; stderr?: string; code?: string };
+    // 超时 = 子进程挂死（读 FIFO、死循环）：返回空 TAP ⇒ check 自然判 bad-title / wrong-red，
+    // 不新增 outcome（挂死不是「红在断言上」，更不是通过）。
+    if (e.code === "ETIMEDOUT") return "";
     return `${e.stdout ?? ""}${e.stderr ?? ""}`;
   }
 }
@@ -2115,7 +2365,24 @@ export function check(bp: Breakpoint): { outcome: Outcome; note: string } {
     writeFileSync(bp.file, source.replace(bp.from, bp.to), "utf8");
     const after = runOne(bp.test, bp.red);
     if (isGreen(after, bp.red)) return { outcome: "survived", note: "改了还是绿的" };
-    if (isRed(after, bp.red)) return { outcome: "killed", note: "" };
+    if (isRed(after, bp.red)) {
+      // 红在指名用例上还不够：得红在**断言**上（或该 case 声明的关键字上）。
+      // 无关的 TypeError 让用例炸掉，也会输出 "not ok 1 - <标题>"——
+      // 那不是这个功能点坏了，是别的坏了 ⇒ 记 wrong-red。
+      // 块只取本用例那一段：吃到 TAP 末尾会把下一条的断言算成自己的。
+      const block = failureBlock(after, bp.red);
+      const killed =
+        block.includes("ERR_ASSERTION") ||
+        (bp.redKeyword !== undefined && block.includes(bp.redKeyword));
+      if (!killed)
+        return {
+          outcome: "wrong-red",
+          note: bp.redKeyword
+            ? `失败消息既不是断言失败，也不含锚点关键字「${bp.redKeyword}」`
+            : "红在无关异常上（不是断言失败）",
+        };
+      return { outcome: "killed", note: "" };
+    }
     if (isGreen(after, bp.test)) return { outcome: "bad-title", note: "变异后 0 命中" };
     return { outcome: "wrong-red", note: "红了，但不是指名的那条" };
   } catch (error) {

@@ -11,23 +11,34 @@
 //   `parsed && typeof parsed.id`（line 213）——去掉 `parsed &&` 后 `null.id` 抛异常，
 //   被外层的 try/catch 兜住 ⇒ 行为等价。
 //   TTL 判断的 `>` vs `>=`（line 234）——真实运行中差值恰好等于 ttlMs 的那一瞬间不可达。
+//   appendSteer 的 `statSync(path).size > 0` → `>= 1`——size 是整数，两向同值 ⇒ 等价。
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
+  chmodSync,
+  closeSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  rmSync,
   utimesSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { gzipSync } from "node:zlib";
 import {
   encodeBucket,
   findProjectRoot,
   isPidAlive,
   isSafeTaskId,
+  MAX_OUTPUT_BYTES,
+  OUTPUT_TRUNCATED_MARK,
   parseProcStatStarttime,
   processStartMs,
   Storage,
@@ -137,6 +148,134 @@ test("记录：坏文件不拖垮启动，跳过继续", () => {
     "好记录还在",
   );
   assert.ok(!restored.some((r) => r.id === "corrupt"), "坏记录跳过");
+  assert.equal(storage.skippedRecords, 1, "坏 JSON 也要记进跳过条数");
+});
+
+test("编号安全：空串/点/双点/C0/超长都要拒", () => {
+  assert.equal(isSafeTaskId(""), false, "空编号会让 removeTrace 删掉 tasks 根目录");
+  assert.equal(isSafeTaskId("."), false);
+  assert.equal(isSafeTaskId(".."), false);
+  assert.equal(isSafeTaskId("a\u0000b"), false, "NUL 不许进路径");
+  assert.equal(isSafeTaskId("x".repeat(129)), false, "超长编号拒");
+  assert.equal(isSafeTaskId("x".repeat(128)), true);
+  assert.equal(isSafeTaskId("9e7e6d16-1234-4abc-8def-0123456789ab"), true);
+});
+
+test("记录：形状不对的记录不进账（假状态/假任务/非法编号都跳）", () => {
+  const { storage } = freshStorage();
+  const dir = storage.recordPath("placeholder").replace(/placeholder\.json$/, "");
+  mkdirSync(dir, { recursive: true });
+  const write = (name: string, body: unknown): void => {
+    writeFileSync(join(dir, name), JSON.stringify(body), "utf8");
+  };
+  write("badstatus.json", { id: "badstatus", status: "done", task: "t" });
+  write("notask.json", { id: "notask", status: "succeeded", task: 42 });
+  write("badid.json", { id: "../evil", status: "succeeded", task: "t" });
+  write("noid.json", { status: "succeeded", task: "t" });
+  write("good.json", { id: "good", status: "succeeded", task: "t" });
+  const restored = storage.restoreRecords();
+  assert.deepEqual(
+    restored.map((r) => r.id),
+    ["good"],
+    "只有形状全对的记录进账",
+  );
+  assert.equal(storage.skippedRecords, 4, "跳过的条数要记账");
+});
+
+test("记录：恢复时 FIFO / 超大文件 / 文件名与 id 对不上的都跳过，不阻塞启动", () => {
+  const { root, storage } = freshStorage();
+  storage.persistRecord(record("good"));
+  const dir = storage.recordPath("placeholder").replace(/placeholder\.json$/, "");
+  mkdirSync(dir, { recursive: true });
+  // FIFO：裸 readFileSync 读它会永久阻塞 ⇒ 恢复必须跳过（守卫失效时探针会被超时杀掉）
+  execFileSync("mkfifo", [join(dir, "fifo.json")]);
+  // 超 1 MiB 的记录
+  writeFileSync(
+    join(dir, "big.json"),
+    JSON.stringify({ id: "big", status: "succeeded", task: "x".repeat(1024 * 1024) }),
+    "utf8",
+  );
+  // 文件名与 id 对不上
+  writeFileSync(join(dir, "evil.json"), JSON.stringify(record("other")), "utf8");
+
+  // 子进程探针：守卫失效时同步读 FIFO 会挂死整个测试进程（node:test 的 timeout 救不了同步阻塞）
+  const probe = join(root, "probe.mjs");
+  writeFileSync(
+    probe,
+    `import { Storage } from ${JSON.stringify(
+      fileURLToPath(new URL("../src/core/storage.ts", import.meta.url)),
+    )};\n` +
+      `const s = new Storage(${JSON.stringify(join(root, "dispatch"))}, ${JSON.stringify(
+        join(root, "proj"),
+      )});\n` +
+      `console.log(JSON.stringify({ ids: s.restoreRecords().map((r) => r.id), skipped: s.skippedRecords }));\n`,
+    "utf8",
+  );
+  const run = spawnSync(process.execPath, [probe], { encoding: "utf8", timeout: 5000 });
+  assert.equal(run.status, 0, `恢复不许阻塞（守卫失效时探针会被超时杀掉）：${run.stderr}`);
+  assert.deepEqual(JSON.parse(run.stdout), { ids: ["good"], skipped: 3 });
+});
+
+test("归档：产出超过 16MB 不进归档（记录照常归档）", () => {
+  const { storage } = freshStorage();
+  storage.persistRecord(record("a"));
+  const path = storage.persistOutput("a", "");
+  // 17MB 稀疏产出：归档不许整份读进内存（超上限就跳过产出档）
+  const fd = openSync(path, "w");
+  const chunk = "x".repeat(1024 * 1024);
+  for (let i = 0; i < 17; i++) writeSync(fd, chunk);
+  closeSync(fd);
+  storage.archiveOne(record("a"));
+  assert.ok(storage.readArchivedRecord("a"), "记录照常归档");
+  assert.equal(storage.readArchivedOutput("a"), undefined, "超上限的产出不进归档");
+});
+
+test("产出：不是普通文件（FIFO）时读回 undefined，不阻塞", () => {
+  const { storage } = freshStorage();
+  const path = storage.persistOutput("fifo", "");
+  rmSync(path);
+  // 用命名管道冒充产出：readFileSync 读它会永久阻塞
+  execFileSync("mkfifo", [path]);
+  assert.equal(storage.readOutput("fifo"), undefined, "FIFO 不许被读成产出");
+});
+
+test("归档：编号不安全时读归档返回 undefined（不拼错路径）", () => {
+  const { storage } = freshStorage();
+  assert.equal(storage.readArchivedRecord("../evil"), undefined);
+  assert.equal(storage.readArchivedOutput("../evil"), undefined);
+});
+test("归档：编号不安全时读归档不碰桶外文件（埋了真文件也读不到）", () => {
+  const { root, storage } = freshStorage();
+  // 桶外埋一份真归档：守卫被删时 "../evil" 会拼到 <桶>/../evil.json.gz
+  const sibling = join(root, "dispatch", storage.bucket);
+  mkdirSync(sibling, { recursive: true });
+  writeFileSync(join(sibling, "evil.json.gz"), gzipSync(Buffer.from('{"id":"evil"}')));
+  writeFileSync(join(sibling, "evil.output.gz"), gzipSync(Buffer.from("桶外正文")));
+  assert.equal(storage.readArchivedRecord("../evil"), undefined, "不许读到桶外的归档");
+  assert.equal(storage.readArchivedOutput("../evil"), undefined, "不许读到桶外的产出");
+});
+
+test("留痕：removeTrace 空编号不动 tasks 根（删光所有产出）", () => {
+  const { root, storage } = freshStorage();
+  storage.persistOutput("keep", "正文");
+  const tasksDir = join(root, "dispatch", storage.bucket, "tasks");
+  storage.removeTrace("");
+  assert.ok(existsSync(tasksDir), "空编号不许把 tasks 根删掉");
+  assert.equal(storage.readOutput("keep"), "正文", "别的任务的产出也不许被牵连");
+});
+
+test("产出：超过 16MB 只读前 16MB 并标记截断", () => {
+  const { storage } = freshStorage();
+  // 造一个刚过上限的产出（稀疏文件：只写首尾，size 仍按写入长度算）
+  const path = storage.persistOutput("big", "");
+  const chunk = "x".repeat(1024 * 1024);
+  const fd = openSync(path, "w");
+  for (let i = 0; i < 17; i++) writeSync(fd, chunk);
+  closeSync(fd);
+  const out = storage.readOutput("big")!;
+  assert.ok(out.length > MAX_OUTPUT_BYTES, "读出的量就是上限那一截");
+  assert.ok(out.length < MAX_OUTPUT_BYTES + 1024, "不会把整份都读进来");
+  assert.ok(out.includes(OUTPUT_TRUNCATED_MARK), "截断要留标记：父方必须知道读到的不完整");
 });
 
 test("记录：编号带 / 时读回返回空（不拼错路径）", () => {
@@ -375,21 +514,39 @@ test("解析：字段不够时返回 undefined", () => {
   assert.equal(parseProcStatStarttime("1 (x) S"), undefined);
 });
 
-test("locale：中文环境下进程启动时刻仍读得到（ps 输出带 LC_ALL=C）", () => {
+test("locale：ps 子进程拿到 LC_ALL=C（不被别处的 locale 顶掉）", () => {
+  if (process.platform !== "darwin") return; // Linux 读 /proc，不调 ps
+  // 直接看 ps 的 locale 在这台机器上分不出差别（zh_CN 也输出英文）⇒ 假绿。
+  // 用 PATH 上的假 ps 把「子进程实际拿到的 LC_ALL」录下来。
+  const dir = mkdtempSync(join(tmpdir(), "dispatch-ps-"));
+  const seen = join(dir, "lc_all.txt");
+  const shim = join(dir, "ps");
+  writeFileSync(
+    shim,
+    `#!/bin/sh\nprintf %s "$LC_ALL" > ${JSON.stringify(seen)}\necho "2026-11-17 10:00:00"\n`,
+    "utf8",
+  );
+  chmodSync(shim, 0o755);
+  const oldPath = process.env.PATH;
   const oldLang = process.env.LANG;
   const oldLcAll = process.env.LC_ALL;
+  process.env.PATH = `${dir}:${oldPath ?? ""}`;
   process.env.LANG = "zh_CN.UTF-8";
   // 门禁把 LC_ALL 固定成了 C.UTF-8；不清掉它，LANG 被压住，测不到代码自己那一锁
   delete process.env.LC_ALL;
   try {
     const start = processStartMs(process.pid);
-    assert.ok(start, "锁了 LC_ALL=C ⇒ ps 输出可解析");
+    assert.equal(readFileSync(seen, "utf8"), "C", "ps 子进程必须拿到 LC_ALL=C");
+    assert.ok(start, "ps 输出可解析");
     assert.ok(start! <= Date.now());
   } finally {
+    if (oldPath === undefined) delete process.env.PATH;
+    else process.env.PATH = oldPath;
     if (oldLang === undefined) delete process.env.LANG;
     else process.env.LANG = oldLang;
     if (oldLcAll === undefined) delete process.env.LC_ALL;
     else process.env.LC_ALL = oldLcAll;
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

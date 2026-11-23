@@ -1,4 +1,4 @@
-import type { SteerRecord, SteerState } from "./types.ts";
+import { hasC0, type SteerRecord, type SteerState } from "./types.ts";
 
 /** 一条任务上所有转向的计数：送达 = 进了 transcript（delivered + seen）；其余都算未送达。 */
 export interface SteerTally {
@@ -36,6 +36,14 @@ export function tallySteers(records: readonly SteerRecord[]): SteerTally {
 export const MAX_STEERS = 16;
 /** 单条转向正文最多 4096 字符（trim 后）。 */
 export const MAX_STEER_CHARS = 4096;
+
+/**
+ * 单条转向 JSON 编码后的上限。
+ * 算术：16 条 × 15 KiB ≈ 240 KiB < 信箱读上限 256 KiB（MAX_STEER_INBOX_BYTES）。
+ * 按「JSON 编码后」算才准：孤立代理项被转义成 6 字节（1 个 UTF-16 单元 → 6 字节），
+ * 那才会撑爆信箱；按原始 UTF-8 字节算会把 4096 个汉字（12 KiB）误拒。
+ */
+export const MAX_STEER_JSON_BYTES = 15 * 1024;
 
 /** 首行标记：整行必须正好是标记——正文/前后缀伪造不算。 */
 const STEER_MARKER_RE = /^\[pi-dispatch-steer #(\d+)\]$/;
@@ -131,6 +139,14 @@ export function planSteer(input: SteerPlanInput): SteerPlan {
   if (!trimmed) return { ok: false, error: "empty steer message" };
   if (trimmed.length > MAX_STEER_CHARS)
     return { ok: false, error: `steer message exceeds ${MAX_STEER_CHARS} chars` };
+  // 体积上限按 JSON 编码后算：16 条 × 15KiB ≈ 240KiB < 信箱 256KiB 读上限。
+  if (Buffer.byteLength(JSON.stringify(trimmed), "utf8") > MAX_STEER_JSON_BYTES)
+    return {
+      ok: false,
+      error: `steer message exceeds ${MAX_STEER_JSON_BYTES} bytes after JSON encoding`,
+    };
+  // C0 控制字符（NUL 等）不许进信箱：JSON.stringify 会把它转义成 6 字节，撑爆读上限
+  if (hasC0(trimmed)) return { ok: false, error: "steer message contains control characters" };
   if (input.existing.length >= MAX_STEERS)
     return { ok: false, error: `task already has ${MAX_STEERS} steers` };
   const last = input.existing[input.existing.length - 1];

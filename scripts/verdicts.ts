@@ -15,9 +15,12 @@ export function judgeDispatch(record: TaskRecord | undefined): Verdict {
   };
 }
 
-/** 孩子看得见 codemode——看 pi 打的工具声明，不看它有没有真的用。 */
+/**
+ * 孩子看得见 codemode——看 pi 给孩子声明的工具清单（父方观测到的事实），
+ * 不看孩子正文里复述的字符串（散文谁都能写）。
+ */
 export function judgeAllowScripts(record: TaskRecord | undefined, childLog: string): Verdict {
-  const declared = childLog.includes("- codemode");
+  const declared = parseChildStream(childLog).declaredTools.includes("codemode");
   return { ok: Boolean(record) && declared, detail: `记录=${Boolean(record)} 声明=${declared}` };
 }
 
@@ -32,24 +35,44 @@ export function judgeJsonStream(stdout: string): Verdict {
   return { ok: tools.length > 0, detail: `工具=${tools.join(",") || "无"}` };
 }
 
-/** 运行中转向：收据到 seen，且最后一条 assistant 正文确实改了方向（不看 user 回显）。 */
+/**
+ * 运行中转向：收据到 seen，且转向之后孩子**真的动过手**（工具/路径/命令收据）。
+ * 散文不算——「STEERED」这句话模型自己就会写，写完不改方向也算「改了」。
+ */
 export function judgeSteer(record: TaskRecord | undefined, childLog: string): Verdict {
   const steer = record?.steers?.[0];
   if (!steer) return { ok: false, detail: "没有转向收据" };
   if (steer.state !== "seen") return { ok: false, detail: `state=${steer.state}` };
-  const text = parseChildStream(childLog).text;
-  if (!text.includes("STEERED")) return { ok: false, detail: "最后一条 assistant 没有 STEERED" };
-  return { ok: true, detail: `seq=${steer.seq} state=seen` };
+  const parsed = parseChildStream(childLog);
+  // 收据级证据：stdout 里这条 seq 真的被 seen（不是散文里写的）
+  if (!parsed.steerEvidence.seen.some((entry) => entry.seq === steer.seq))
+    return { ok: false, detail: `stdout 没有 seq=${steer.seq} 的 seen 证据` };
+  // 转向之后要有可观测的动作：工具/路径/命令收据里的变化
+  const delivered = parsed.steerEvidence.delivered.find((entry) => entry.seq === steer.seq);
+  const lines = childLog.split("\n");
+  const after = delivered ? lines.slice(delivered.line).join("\n") : childLog;
+  const acted = parseChildStream(after).delivery;
+  if (
+    Object.keys(acted.tools).length === 0 &&
+    acted.paths.length === 0 &&
+    acted.commands.length === 0
+  )
+    return { ok: false, detail: "转向之后没有新的动作收据（只有散文不算）" };
+  return { ok: true, detail: `seq=${steer.seq} state=seen 转向后有动作收据` };
 }
 
-/** 账上有数：无论孩子交没交报告，宿主观测的用量都要非零。 */
+/**
+ * 账上有数：宿主观测到的用量非零。
+ * 只看 record.usage（引擎从事件流累加的观测值），**不回落到孩子自报的** report.usage——
+ * 回落就是「孩子自己报个数就算账上有数」。
+ */
 export function judgeChildReport(record: TaskRecord | undefined): Verdict {
   const channel = record?.reportChannel;
-  const usage = record?.usage ?? record?.report?.usage;
+  const usage = record?.usage;
   const ok = typeof usage?.input === "number" && usage.input > 0;
   return {
     ok,
-    detail: `通道=${channel ?? "无"} 用量=${usage?.input ?? 0}`,
+    detail: `通道=${channel ?? "无"} 观测用量=${usage?.input ?? 0}`,
   };
 }
 
@@ -64,12 +87,13 @@ export function judgeCommandReceipt(record: TaskRecord | undefined, canary: stri
  * 对质真触发：孩子按指令没跑命令却谎报自检 ⇒ 必被标 verifyUnverified。
  * 孩子不服从、真去跑了命令 ⇒ 声称命中、无旗标 ⇒ 红——那是模型服从问题不是代码问题，
  * 真机首跑看服从率，连续翻车按方案降级成观察项。
+ * 什么都不敢声称（claimed===0）⇒ 这条腿**没演练过**，不算绿。
  */
 export function judgeVerifyAudit(record: TaskRecord | undefined): Verdict {
   const claimed = record?.report?.verified?.length ?? 0;
   const flagged = record?.verifyUnverified === true;
-  const note = flagged ? "" : "（抓捕未演练）";
-  return { ok: flagged || claimed === 0, detail: `声称=${claimed} 旗标=${flagged}${note}` };
+  if (claimed === 0) return { ok: false, detail: "声称=0：抓捕未演练，不算绿" };
+  return { ok: flagged, detail: `声称=${claimed} 旗标=${flagged}` };
 }
 
 /** rpc：工具往返与终态通知都到了。 */

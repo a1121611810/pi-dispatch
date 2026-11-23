@@ -18,6 +18,29 @@ export const TERMINAL_STATUSES = [
   "lost",
 ] as const satisfies readonly TaskStatus[];
 
+/** 全部任务状态（恢复记录的结构闸用）：七个值，少一个都不许进账。 */
+export const TASK_STATUSES = [
+  "queued",
+  "running",
+  "stopping",
+  "succeeded",
+  "failed",
+  "canceled",
+  "lost",
+] as const satisfies readonly TaskStatus[];
+
+/**
+ * C0 控制字符（NUL 等）不许进 argv / 附加块 / 信箱 / 编号。
+ * \n \t \r 放行——它们是正常的文本换行与制表。
+ */
+// oxlint-disable-next-line no-control-regex -- 要匹配的正是控制字符本身
+const C0_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/;
+
+/** 文本里有 C0 控制字符吗（\n \t \r 不算）。 */
+export function hasC0(text: string): boolean {
+  return C0_RE.test(text);
+}
+
 export function isTerminal(status: TaskStatus): boolean {
   return (TERMINAL_STATUSES as readonly string[]).includes(status);
 }
@@ -111,6 +134,8 @@ export type ChildDelivery = {
   errors: number;
   /** 孩子最终正文长度（字符）——0 = 空交 */
   textChars: number;
+  /** 畸形事件行数（不是合法事件的行）：好行照留，坏行计数 */
+  malformed?: number;
 };
 
 /** 用量。子代理自报为空或零时，用主方观察到的顶上去。 */
