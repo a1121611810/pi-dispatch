@@ -95,7 +95,23 @@ test("项目根：到顶都找不到就退回 start", () => {
   const { root } = freshStorage();
   const nowhere = join(root, "nowhere", "deep");
   mkdirSync(nowhere, { recursive: true });
-  assert.equal(findProjectRoot(nowhere), nowhere);
+  // 注入「哪层都没有标记」：真机上 ~/.pi 一定存在，真 existsSync 走不到「到顶退回」。
+  assert.equal(
+    findProjectRoot(nowhere, () => false),
+    nowhere,
+  );
+});
+
+test("项目根：真文件系统上向上找到第一个带 .git / .pi 的祖先（本机 ~/.pi 在家目录）", () => {
+  const { root } = freshStorage();
+  const nowhere = join(root, "nowhere", "deep");
+  mkdirSync(nowhere, { recursive: true });
+  const found = findProjectRoot(nowhere);
+  // 要么是 start 自己（上方无标记），要么是它的某个祖先（含 .git/.pi）
+  assert.ok(
+    found === nowhere || nowhere.startsWith(`${found}/`),
+    `返回值必须是 start 或它的祖先，实际 ${found}`,
+  );
 });
 
 // ── 编号安全 ──────────────────────────────────────────────────────────────

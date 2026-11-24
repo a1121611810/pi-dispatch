@@ -13,11 +13,41 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { plan } from "../scripts/test.ts";
+import { plan, sweepLeftoverTmp } from "../scripts/test.ts";
+
+test("门禁清扫：只删上一轮遗留的临时桶，本轮的不动（mutate 并行时不许误杀）", () => {
+  const root = mkdtempSync(join(tmpdir(), "sweep-probe-"));
+  const now = Date.now();
+  const leftover = join(root, "dispatch-store-old");
+  const current = join(root, "dispatch-board-new");
+  const unrelated = join(root, "unrelated-keep");
+  for (const d of [leftover, current, unrelated]) mkdirSync(d, { recursive: true });
+  // 把「上一轮」的 mtime 拨到 1 小时前；本轮与无关目录保持现在
+  const past = new Date(now - 60 * 60 * 1000);
+  utimesSync(leftover, past, past);
+
+  const removed = sweepLeftoverTmp(now, root);
+
+  assert.equal(removed, 1, "只该删上一轮那一个");
+  assert.equal(existsSync(leftover), false, "上一轮遗留必须被清掉");
+  assert.equal(existsSync(current), true, "本轮新建的不许动（否则 mutate 并行会误杀）");
+  assert.equal(existsSync(unrelated), true, "不是我们的前缀，碰都不许碰");
+
+  rmSync(root, { recursive: true, force: true });
+});
 import { check, runOne } from "../scripts/breakpoints.ts";
 import {
   INHERITED_DISPATCH_DEPTH,

@@ -7,7 +7,7 @@
 // 第二道假绿：glob / 文件路径写错 ⇒ `node --test` 0 命中 ⇒ 退出 0 ⇒ 门禁自己说「全绿」。
 // 所以这里额外挂一个 TAP reporter 数 `# pass`：一条都没跑过就不许退出 0。
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,7 +47,52 @@ export function passedCount(output: string): number | undefined {
   return match ? Number(match[1]) : undefined;
 }
 
+/**
+ * 测试自己 mkdtemp 出来、从不清理的临时桶前缀。
+ * 实测：freshStorage() 一次 pnpm test 建 38 个 17MB 目录（storage 测试要写 16MB 产出），
+ * 不清就每次泄约 650MB。清单变长时改这里一处即可。
+ */
+export const TMP_LEFTOVER_PREFIXES = [
+  "dispatch-store-",
+  "dispatch-board-",
+  "dispatch-git-",
+  "dispatch-verify-",
+  "dispatch-steer-",
+];
+
+/**
+ * 清掉**上一轮**遗留的临时桶，返回删掉的个数。
+ *
+ * 只删本进程启动之前创建的（mtime 早于 startedAt）：本轮自己建的不动，
+ * 因为 `pnpm mutate` 会并行起多个测试进程，删活目录会误杀别人的用例。
+ * 代价是最后一轮会留一批——下一次跑门禁时清掉。
+ *
+ * 删不掉不算失败：清扫是副产品，不影响测试结论。
+ */
+export function sweepLeftoverTmp(startedAt: number, root = tmpdir()): number {
+  let names: string[];
+  try {
+    names = readdirSync(root);
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const name of names) {
+    if (!TMP_LEFTOVER_PREFIXES.some((prefix) => name.startsWith(prefix))) continue;
+    const full = join(root, name);
+    try {
+      if (statSync(full).mtimeMs >= startedAt) continue; // 本轮或并发的，别动
+      rmSync(full, { recursive: true, force: true });
+      removed += 1;
+    } catch {
+      // 权限/占用：跳过，下一次再清
+    }
+  }
+  return removed;
+}
+
 if (isDirectInvocation(process.argv[1], fileURLToPath(import.meta.url))) {
+  const startedAt = Date.now();
   const dir = mkdtempSync(join(tmpdir(), "pi-dispatch-count-"));
   const tapFile = join(dir, "tap.txt");
   const [head, ...rest] = plan(process.argv.slice(2));
@@ -72,6 +117,9 @@ if (isDirectInvocation(process.argv[1], fileURLToPath(import.meta.url))) {
     passed = undefined; // 没有 tap 文件 = 没跑起来，按 0 处理
   }
   rmSync(dir, { recursive: true, force: true });
+  // 顺手清上一轮遗留的临时桶：测试自己 mkdtemp、从不清理，不清会每次泄几百 MB。
+  const swept = sweepLeftoverTmp(startedAt);
+  if (swept > 0) console.error(`测试门禁：清掉上一轮遗留的临时桶 ${swept} 个`);
   if (status !== 0) process.exit(status); // 红照传，先红先报
   if (passed === undefined || passed === 0) {
     console.error(

@@ -34,10 +34,16 @@ export function encodeBucket(projectRoot: string): string {
 }
 
 /** 项目根：向上找 .git 或 .pi（不是裸 cwd）。 */
-export function findProjectRoot(start: string): string {
+export function findProjectRoot(
+  start: string,
+  // 判「这一层算不算项目根」。默认真实文件系统；测试注入 false 才能测到「到顶退回」
+  // ——真实机器上 ~/.pi 一定存在，那条分支用真 existsSync 永远走不到。
+  hasMarker: (dir: string) => boolean = (dir) =>
+    existsSync(join(dir, ".git")) || existsSync(join(dir, ".pi")),
+): string {
   let dir = start;
   for (;;) {
-    if (existsSync(join(dir, ".git")) || existsSync(join(dir, ".pi"))) return dir;
+    if (hasMarker(dir)) return dir;
     const parent = join(dir, "..");
     if (parent === dir) return start; // 到顶了都没找到 ⇒ 退回 start
     dir = parent;
