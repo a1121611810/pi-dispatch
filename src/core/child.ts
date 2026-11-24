@@ -194,16 +194,29 @@ export const WORKTREE_CONTRACT_BLOCK = [
   "</pi-dispatch-worktree>",
 ].join("\n");
 
-/** 拼附加块：上下文 +（可选）理由 +（可选）隔离契约 + 报告契约。 */
-export function buildAppendBlock(options: { why?: string; isolation?: Isolation }): string {
+/**
+ * 恒定契约块：上下文块 + 报告契约。每次派发逐字节相同。
+ * 变的部分（why / 隔离契约）全在 user message 里——系统提示词恒定 ⇒ 跨子代理共享同一段前缀。
+ */
+export const CONTRACT_BLOCK = [SUBAGENT_CONTEXT_BLOCK, REPORT_CONTRACT_BLOCK].join("\n");
+
+/**
+ * 给孩子的 user message：任务正文 +（可选）理由块 +（可选）隔离契约块。
+ * 顺序固定：任务 → why → 隔离契约（why 解释动机，隔离契约讲环境与交付，靠近交付）。
+ * 没有 why、没有隔离时逐字节等于任务原文 ⇒ argv 与今天相同。
+ */
+export function buildUserMessage(options: {
+  task: string;
+  why?: string;
+  isolation?: Isolation;
+}): string {
   return [
-    SUBAGENT_CONTEXT_BLOCK,
+    options.task,
     options.why ? `<pi-dispatch-why>${escapeXmlText(options.why)}</pi-dispatch-why>` : "",
     options.isolation === "worktree" ? WORKTREE_CONTRACT_BLOCK : "",
-    REPORT_CONTRACT_BLOCK,
   ]
     .filter(Boolean)
-    .join("\n");
+    .join("\n\n");
 }
 
 /** 只读档位的读集。 */
@@ -252,15 +265,15 @@ export function supportsNoMcp(piVersion?: string): boolean {
  * 拼子代理的命令行。
  * 每一段都有理由（规格第 10 节）：
  *   -p --no-session --mode json  不留磁盘状态；输出是机器能读的事件流
- *   --append-system-prompt       挂附加块，告诉孩子它是什么、交付物是什么
+ *   --append-system-prompt       挂恒定契约块（上下文 + 报告契约）——逐字节相同 ⇒ 前缀可共享
  *   --no-extensions --no-skills  减重：砍掉自动发现带进孩子的散文与技能
  *   -e builtin:codemode          allowScripts 时把写程序的能力显式带进来
  *   --tools 名单                 只读档位收窄；带 codemode 才不会被名单砍掉
- *   任务放最后                   任务不能以横线开头（安检已经拦过）
+ *   user message 放最后          任务 + why + 隔离契约（变的内容不进系统提示词）
  */
 export function buildPiArgv(options: BuildArgvOptions): string[] {
   const argv = [nonEmpty(options.piPath) ?? "pi", "-p", "--no-session", "--mode", "json"];
-  argv.push("--append-system-prompt", buildAppendBlock(options));
+  argv.push("--append-system-prompt", CONTRACT_BLOCK);
   // 减量：砍自动发现带进孩子的宿主面散文与技能
   argv.push("--no-extensions", "--no-skills");
   // 回执工具：把本扩展自己装进孩子（显式 -e 不受 --no-extensions 影响）
@@ -270,18 +283,31 @@ export function buildPiArgv(options: BuildArgvOptions): string[] {
   if (supportsNoMcp(options.piVersion)) argv.push("--no-mcp");
   // 解析序：调用参数 → 会话当前模型；思考档位挂 :<thinking> 后缀
   // 空串是坏值（会变成 --model ""），当没给处理
-  const model = nonEmpty(options.model) ?? nonEmpty(options.sessionModel);
+  const model = effectiveModel({ model: options.model, sessionModel: options.sessionModel });
   if (model) {
     const thinking = nonEmpty(options.thinkingLevel);
-    argv.push("--model", thinking ? `${model}:${thinking}` : model);
+    const modelArg = thinking ? `${model}:${thinking}` : model;
+    argv.push("--model", modelArg);
   }
   argv.push(...strictToolsArgv(options));
   // allowScripts：命令行显式给的扩展不受 --no-extensions 影响 ⇒ 减量效果不丢
   if (options.allowScripts) argv.push("-e", "builtin:codemode");
   // `--` 分隔符：任务后面的一切都是位置参数，不许被当旗标
   // （pi 的 args.js 有 `--` 分支：1.0.0 起就有，见 node_modules/@earendil-works/pi-coding-agent/dist/cli/args.js）
-  argv.push("--", options.task);
+  argv.push("--", buildUserMessage(options));
   return argv;
+}
+
+/**
+ * 模型解析序：调用给的 → 会话当前模型。空串是坏值，当没给处理。
+ * 抽成一处是因为 buildPiArgv 与引擎都要它（引擎要用它查模型目录）。
+ */
+export function effectiveModel(options: {
+  model?: string;
+  sessionModel?: string;
+}): string | undefined {
+  const model = nonEmpty(options.model) ?? nonEmpty(options.sessionModel);
+  return model;
 }
 
 /**
@@ -629,6 +655,60 @@ export function createSteerEvidenceTracker(): SteerEvidenceTracker {
         buffer = "";
       }
       return evidenceOf(acc);
+    },
+  };
+}
+
+/**
+ * 运行中用量追踪：边喂 stdout 边累计用量。
+ * 口径与 parseChildStream **完全一致**（复用 takeUsage / addUsage / parseLine）——
+ * tracker.snapshot().usage 必须等于 parseChildStream(同一段流).observedUsageTotal。
+ * 这是「运行中判预算」与「退出后记账」不打架的唯一保证。
+ */
+export interface UsageTracker {
+  /** 喂一段 stdout；跨 chunk 的半行自己留着。 */
+  push(chunk: string): void;
+  /** 冲刷末尾的半行（流结束时调一次）。 */
+  finish(): void;
+  /** 累计用量 + assistant 回合数。 */
+  snapshot(): { usage: ChildUsage | null; turns: number };
+}
+
+export function createUsageTracker(): UsageTracker {
+  let usage: ChildUsage | null = null;
+  let turns = 0;
+  let buffer = "";
+  const consume = (line: string): void => {
+    const event = parseLine(line);
+    if (!event || event.type !== "message_end" || !event.message) return;
+    const message = event.message;
+    if (message.role !== "assistant") return;
+    if (!message.usage) return;
+    turns += 1;
+    usage = addUsage(usage, takeUsage(message.usage));
+  };
+  const drain = (final: boolean): void => {
+    let index = buffer.indexOf("\n");
+    while (index >= 0) {
+      consume(buffer.slice(0, index));
+      buffer = buffer.slice(index + 1);
+      index = buffer.indexOf("\n");
+    }
+    if (final && buffer) {
+      consume(buffer);
+      buffer = "";
+    }
+  };
+  return {
+    push(chunk) {
+      buffer += chunk;
+      drain(false);
+    },
+    finish() {
+      drain(true);
+    },
+    snapshot() {
+      return { usage, turns };
     },
   };
 }

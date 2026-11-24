@@ -10,6 +10,9 @@
 //   compareTerminal 的 `id < id` → `<=`——同 id 已在上一行返回 0，可达输入上只比异 id ⇒ 等价。
 //   src/core/gates.ts 的 `deps.isGitRepo ?? (() => false)` → `||`——isGitRepo 的类型是
 //   `() => boolean`，函数恒真 ⇒ ?? 与 || 在可达输入上给同一个谓词 ⇒ 等价。
+//   timeoutGate 的 `typeof input.timeoutMs !== "number" ||` → `&&`——按优先级变成
+//   `(A && B) || C || D || E`；A（非 number）⇒ B（Number.isFinite 不 coerce，非 number 恒 false）
+//   ⇒ C（Number.isInteger 对非 number / 非有限数恒 false），合取项被 C 吞掉 ⇒ 可达输入同判。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -27,6 +30,9 @@ import {
   projectContextGate,
   worktreeNeedsGit,
   defaultGates,
+  usageBudgetGate,
+  messageBytesGate,
+  MAX_TIMEOUT_MS,
 } from "../src/core/gates.ts";
 import {
   applyAttachSteer,
@@ -115,6 +121,87 @@ test("安检 16：task / why 有字节上限（超了 rejected，不是 spawn �
   assert.ok(taskTextGate({ task: "字".repeat(22_000) }), "66KB 汉字要拒");
 });
 
+test("安检 17：usageBudget 至少要给一个上限（maxUsd / maxTokens）", () => {
+  assert.equal(usageBudgetGate({ task: "x" }), null, "没给预算 = 不设限");
+  assert.equal(usageBudgetGate({ task: "x", usageBudget: { maxUsd: 1 } }), null);
+  assert.equal(usageBudgetGate({ task: "x", usageBudget: { maxTokens: 1 } }), null);
+  const empty = usageBudgetGate({ task: "x", usageBudget: {} });
+  assert.ok(empty, "空预算对象等于没设预算");
+  assert.match(empty!.errorMessage, /至少要给一个上限/);
+});
+
+test("安检 17b：usageBudget 的上限必须是正的有限数（0 / 负数 / NaN 都拒）", () => {
+  for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.ok(
+      usageBudgetGate({ task: "x", usageBudget: { maxUsd: bad } }),
+      `maxUsd=${String(bad)} 不 coerce`,
+    );
+    assert.ok(
+      usageBudgetGate({ task: "x", usageBudget: { maxTokens: bad } }),
+      `maxTokens=${String(bad)} 不 coerce`,
+    );
+  }
+});
+
+test("安检 17c：usageBudget 的 hardFactor 必须是 ≥1 的有限数（NaN / Infinity / 字符串都拒）", () => {
+  assert.equal(usageBudgetGate({ task: "x", usageBudget: { maxUsd: 1, hardFactor: 1 } }), null);
+  assert.ok(
+    usageBudgetGate({ task: "x", usageBudget: { maxUsd: 1, hardFactor: 0.5 } }),
+    "<1 会让硬门早于软门",
+  );
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, "2"] as unknown[]) {
+    assert.ok(
+      usageBudgetGate({ task: "x", usageBudget: { maxUsd: 1, hardFactor: bad as number } }),
+      `hardFactor=${String(bad)} 不 coerce`,
+    );
+  }
+});
+
+test("安检 17d：usageBudget 的 hardGraceMs 必须是正的有限数，且不超过 setTimeout 上限", () => {
+  assert.equal(usageBudgetGate({ task: "x", usageBudget: { maxUsd: 1, hardGraceMs: 1 } }), null);
+  for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.ok(
+      usageBudgetGate({ task: "x", usageBudget: { maxUsd: 1, hardGraceMs: bad } }),
+      `hardGraceMs=${String(bad)} 不合法`,
+    );
+  }
+  assert.equal(
+    usageBudgetGate({ task: "x", usageBudget: { maxUsd: 1, hardGraceMs: MAX_TIMEOUT_MS } }),
+    null,
+    "上限本身合法",
+  );
+  assert.ok(
+    usageBudgetGate({ task: "x", usageBudget: { maxUsd: 1, hardGraceMs: MAX_TIMEOUT_MS + 1 } }),
+    "超过 setTimeout 上限 ⇒ 会被夹成 1ms，必须拒",
+  );
+});
+
+test("安检 17e：usageBudget=null / 非对象要拒（不能当没设预算）", () => {
+  assert.equal(usageBudgetGate({ task: "x", usageBudget: undefined }), null, "undefined = 没设");
+  for (const bad of [null, "x", 1, []] as unknown[]) {
+    const rejected = usageBudgetGate({ task: "x", usageBudget: bad as never });
+    assert.ok(rejected, `usageBudget=${String(bad)} 必须被拒`);
+    assert.match(rejected!.errorMessage, /必须是对象/);
+  }
+});
+
+test("安检 18：user message 超过 64 KiB 要拒（拼进一个 argv 装不下）", () => {
+  const max = "x".repeat(64 * 1024);
+  assert.equal(messageBytesGate({ task: max }), null, "正好 64KiB 放行（message == task）");
+  const over = messageBytesGate({ task: max, why: "y" });
+  assert.ok(over, "task 顶格 + why ⇒ 合并后超过 64KiB");
+  assert.match(over!.errorMessage, /字节上限/);
+  assert.equal(messageBytesGate({ task: "字".repeat(20_000) }), null, "按字节不按字符");
+  assert.ok(messageBytesGate({ task: "字".repeat(22_000) }), "66KB 汉字要拒");
+});
+
+test("安检 18b：user message 不能以 @ 开头（pi 会把它当文件读）", () => {
+  const bad = messageBytesGate({ task: "@/etc/passwd" });
+  assert.ok(bad, "@ 开头的 message 必须被拒");
+  assert.match(bad!.errorMessage, /不能以 @ 开头/);
+  assert.equal(messageBytesGate({ task: "  @不是文件" }), null, "前导空白后 pi 不当文件参数");
+});
+
 test("安检：timeoutMs 必须是正数", () => {
   assert.equal(timeoutGate({ task: "x" }), null);
   assert.equal(timeoutGate({ task: "x", timeoutMs: 1000 }), null);
@@ -178,8 +265,8 @@ test("安检 10：默认闸序含隔离/黑板两道值闸", () => {
     depth: () => 0,
     maxDepth: 3,
   });
-  // 既有 6 道位置一个字不动（既有用例按索引断言 gates[1]）
-  assert.equal(gates.length, 11);
+  // 既有 11 道位置一个字不动（既有用例按索引断言 gates[1]）
+  assert.equal(gates.length, 13);
   assert.equal(gates[0], readOnlyGate);
   assert.equal(gates[1], taskTextGate);
   assert.equal(gates[2], timeoutGate);
@@ -194,6 +281,9 @@ test("安检 10：默认闸序含隔离/黑板两道值闸", () => {
   assert.equal(gates[8], allowScriptsGate);
   assert.equal(gates[9], textFieldsGate);
   assert.equal(gates[10], projectContextGate);
+  // 安检 17/18：预算闸与 user message 体积闸接在最后（既有 11 道的索引一个字不动）
+  assert.equal(gates[11], usageBudgetGate, "预算闸接在末尾");
+  assert.equal(gates[12], messageBytesGate, "user message 体积闸接在最后");
 });
 
 test("安检 11：allowScripts 非 boolean 要拒（truthy 就是开了 codemode）", () => {

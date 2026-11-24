@@ -1471,6 +1471,28 @@
                 <code>auto</code>：加载量会变多
               </td>
             </tr>
+            <tr>
+              <td>12</td>
+              <td><code>usageBudget</code> 合法吗</td>
+              <td>
+                至少要给一个上限（<code>maxUsd</code> / <code>maxTokens</code>
+                都没给 = 没设预算，不如不设）；上限必须是<b>正的有限数</b>（0 / 负数 / NaN
+                <b>不 coerce</b>——错值方向是多花钱）；<code>hardFactor ≥ 1</code>（&lt;1
+                会让硬门早于软门；<b>= 1</b> 是合法值 ⇒ 到点直接进硬门，不给降级交付的机会）；<code
+                  >hardGraceMs</code
+                >
+                是正的有限数
+              </td>
+            </tr>
+            <tr>
+              <td>13</td>
+              <td>合并后的 user message 能进 argv 吗</td>
+              <td>
+                任务 + why + 隔离契约现在拼进<b>同一个 argv 参数</b>（&lt; 64 KiB，UTF-8
+                字节）——超了会撞 Linux 的 <code>MAX_ARG_STRLEN</code>，spawn 抛 E2BIG ⇒ 记 failed
+                而不是 rejected；首字符不能是 <code>@</code>（pi 把位置参数当文件读，正文被丢弃）
+              </td>
+            </tr>
           </tbody>
         </table>
 
@@ -1501,14 +1523,16 @@
         <div class="row">
           <div class="node decide">
             <span class="t">理由这个开关开着吗</span>
-            <span class="d">理由会进子代理的提示词。这个开关由主方握着。</span>
+            <span class="d"
+              >理由会进子代理的 user message（不是系统提示词）。这个开关由主方握着。</span
+            >
           </div>
         </div>
 
         <div class="side">
           <div class="node act">
             <span class="t">开着 → 理由留着</span>
-            <span class="d">理由原样进子代理的附加块。记录里不记「被丢掉」。</span>
+            <span class="d">理由原样进 user message。记录里不记「被丢掉」。</span>
           </div>
           <div class="node act">
             <span class="t">关着 → 丢掉内容</span>
@@ -1871,17 +1895,18 @@
             <div class="node act">
               <span class="t">拼命令</span>
               <span class="d"
-                >基础命令 + 减量旗标 +（可选）模型 +（可选）工具名单 + <b>任务放最后</b></span
+                >基础命令 + 减量旗标 +（可选）模型 +（可选）工具名单 +
+                <b>user message 放最后</b></span
               >
             </div>
           </div>
           <div class="arrowdown"></div>
           <div class="row">
             <div class="node act">
-              <span class="t">拼附加块</span>
+              <span class="t">拼恒定契约块</span>
               <span class="d"
-                >你是被派出去的，看不到父方对话，<b>你的最后一段话就是交付物</b> +（可选）理由
-                +（可选）报告契约</span
+                >你是被派出去的，看不到父方对话，<b>你的最后一段话就是交付物</b> +
+                报告契约（每次派发逐字节相同）；理由与隔离契约进 user message</span
               >
             </div>
           </div>
@@ -1922,8 +1947,11 @@
             <td>不留在磁盘上；输出是机器能读的事件流</td>
           </tr>
           <tr>
-            <td><code>--append-system-prompt</code> 挂附加块</td>
-            <td>告诉子代理它是什么、交付物是什么</td>
+            <td><code>--append-system-prompt</code> 挂恒定契约块</td>
+            <td>
+              上下文块 + 报告契约，<b>每次派发逐字节相同</b> ⇒
+              系统提示词恒定，跨子代理共享同一段前缀
+            </td>
           </tr>
           <tr>
             <td><code>--no-extensions --no-skills</code></td>
@@ -1964,18 +1992,97 @@
           </tr>
           <tr>
             <td><code>--model 模型:思考档位</code>（可选）</td>
-            <td>定模型。<b>解析序：这次调用给的 → 会话当前模型</b></td>
+            <td>
+              定模型。<b>解析序：这次调用给的 → 会话当前模型</b
+              >。思考档位<b>先按模型目录校验</b>：只发模型支持的档位（降级目标
+              <code>low</code>，只降不升）；模型不在目录里就原样透传，并在回执里说「未校验」
+            </td>
           </tr>
           <tr>
             <td><code>--tools 名单</code>（可选）</td>
             <td>只给这几个工具。<b>名单里必须包含写程序那个能力和回执工具</b>，否则会被砍掉</td>
           </tr>
           <tr>
-            <td><b>任务放最后</b></td>
-            <td>任务不能以横线开头（安检已经拦过）</td>
+            <td><b>user message 放最后</b>（任务 + why + 隔离契约）</td>
+            <td>
+              why 与隔离契约从系统提示词搬到 user
+              message：<b>系统前缀恒定</b>才能跨子代理共享缓存。任务不能以横线开头（安检已经拦过）
+            </td>
           </tr>
         </tbody>
       </table>
+
+      <div class="card">
+        <h3>前缀稳定化：系统提示词恒定，变化的内容进 user message</h3>
+        <p>
+          provider 的 prompt 缓存按<b>请求前缀</b>命中。以前 why（和条件出现的隔离契约）在
+          <code>--append-system-prompt</code> 里 ⇒ 每个子代理的系统提示词都不同 ⇒
+          彼此之间前缀不共享。 搬到 user message 后，所有子代理共享同一段前缀（上下文块 + 报告契约 +
+          pi 自己的前言 / 工具 / 项目上下文）。
+        </p>
+        <p>
+          轮内前缀本来就稳定（argv 是启动参数，运行期不变）；这项改造的收益是<b>跨子代理共享</b>，
+          能否真命中取决于 provider 的缓存键与 TTL（需真机验证）。没有 why、没有隔离时，user message
+          逐字节等于任务原文 ⇒ argv 与改造前完全相同。
+        </p>
+        <p style="margin-bottom: 0">
+          代价：隔离契约的权威性从 system 降到 user message（真机验 <code>isolation=worktree</code>
+          的子代理仍自行 commit、不 push）。
+        </p>
+      </div>
+
+      <h3>思考档位：派发前按模型校验</h3>
+      <p>
+        pi 的 <code>clampThinkingLevel</code> 会<b>往上找</b>可用档位：vendor-local 的
+        <code>medium</code> 是显式 <code>null</code> ⇒ 会被抬到 <code>high</code>
+        （16384 token 预算）。所以派发前先按模型目录校验，<b>只发支持的档位</b>——pi 的 clamp
+        不再插手，回执里的「实际生效档位」就是孩子真跑的档位。
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>请求档位</th>
+            <th>实际发给孩子的</th>
+            <th>回执</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>没给</td>
+            <td>不拼后缀（沿用会话默认）</td>
+            <td>不擅自替父方降档</td>
+          </tr>
+          <tr>
+            <td>模型支持</td>
+            <td>原样</td>
+            <td><code>adjusted: false</code></td>
+          </tr>
+          <tr>
+            <td><code>thinkingLevelMap</code> 显式 <code>null</code></td>
+            <td>降到 <code>low</code></td>
+            <td>说明「该模型没有这档」</td>
+          </tr>
+          <tr>
+            <td><code>xhigh</code> / <code>max</code> 缺键</td>
+            <td>最接近的一档（通常是 <code>high</code>）</td>
+            <td>按 pi 口径</td>
+          </tr>
+          <tr>
+            <td>模型不在目录里</td>
+            <td>原样透传</td>
+            <td><code>modelKnown: false</code>（未校验）</td>
+          </tr>
+          <tr>
+            <td>非思考模型</td>
+            <td>不拼后缀（= off）</td>
+            <td>说明该模型不支持思考</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        三条硬规矩：<b>只降不升</b>（生效档位的成本序不得高于请求档位）；<b>降级目标是 low</b>
+        （能干活又不肉疼，不是「最近的一档」）；<b>只发 supported 里的档位</b>。
+      </p>
 
       <div class="card warn">
         <h3>隔离与黑板：argv 零新增</h3>
@@ -2750,7 +2857,151 @@
         </p>
       </div>
 
-      <h2><span class="n">17</span>别踩的坑</h2>
+      <h2><span class="n">17</span>预算：软门 + 硬门</h2>
+
+      <p>
+        预算按<b>观测到的用量</b>判（孩子事件流里 assistant <code>message_end</code> 的
+        <code>usage</code>），不认孩子自报。两个上限都给时<b>任一越线即到点</b>。
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>口径</th>
+            <th>怎么算</th>
+            <th>为什么</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>美元</td>
+            <td>累计 <code>usage.cost</code>（provider 不上报时按 0 算）</td>
+            <td>用户真正在意的单位；本机 vendor-local 下 cacheRead 只占成本 13%</td>
+          </tr>
+          <tr>
+            <td>token</td>
+            <td>
+              <code>input + output + cacheRead + cacheWrite</code>
+            </td>
+            <td>
+              <b>必须含 cacheRead</b>：本机 27505 回合实测它占 prompt token 的
+              97.7%；不含的话缓存型子代理在账上「几乎不花钱」，预算形同虚设
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>两段式：<b>软门先行，硬门兜底</b>。</p>
+      <table>
+        <thead>
+          <tr>
+            <th>阶段</th>
+            <th>触发</th>
+            <th>动作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>软门</td>
+            <td>累计用量 ≥ 上限</td>
+            <td>
+              走现成的<b>转向</b>通道给孩子写一条收尾指令（「停止扩展工作，用现有结果收尾，按报告契约交付」）——<b>不打断在飞工具</b>；记
+              <code>budget.exhausted</code> 与 <code>softAt</code>，并 arm 一个
+              <code>hardGraceMs</code> 的定时器
+            </td>
+          </tr>
+          <tr>
+            <td>硬门</td>
+            <td>
+              累计用量 ≥ 上限 × <code>hardFactor</code>（默认 2），或软门后过了
+              <code>hardGraceMs</code>（默认 120s）还没交
+            </td>
+            <td>
+              <code>stop</code> ⇒ 现有路径 SIGTERM → 宽限后 SIGKILL。<b
+                >status 仍是 <code>canceled</code></b
+              >（不许装成 succeeded），但部分正文照交
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <ul>
+        <li>
+          预算是<b>软上限</b>：用量在请求完成后才观测到，越线那一轮已经付过钱。实际最多超到
+          <code>上限 × hardFactor</code>，或软门后 <code>hardGraceMs</code> 内自然停下。
+        </li>
+        <li>
+          没有转向通道（没留痕目录 / 没装孩子扩展）⇒ 软门写不进去：回执带
+          <code>softSteerFailed</code>，靠硬门兜底。
+        </li>
+        <li>
+          <code>hardFactor = 1</code>：硬门与软门同一条线，硬门先判 ⇒ <b>到点直接收掉</b>，
+          不走软门的降级交付。这是给「只认硬上限、不要降级机会」的场景准备的。
+        </li>
+        <li><b>受理时钉死</b>：预算参数在受理时克隆一份，排队期间调用方改参数不影响这一单。</li>
+        <li>
+          孩子<b>没起来</b>（spawn 失败 / 排队时被取消）⇒ 没有用量 ⇒ 结果里不带
+          <code>budget</code> / <code>budgetExhausted</code> 键。
+        </li>
+        <li><code>reportChannel: "none"</code> 时预算照判、账照记；预算旗标与报告旗标互不掩盖。</li>
+      </ul>
+
+      <div class="card">
+        <h3>父方看到的</h3>
+        <ul style="margin-bottom: 0">
+          <li>
+            <b>回执</b>：<code>budget</code>（<code>maxUsd</code> / <code>maxTokens</code> /
+            <code>spentUsd</code> / <code>spentTokens</code> / <code>exhausted</code> /
+            <code>softAt</code> / <code>softSteerFailed</code>）、<code>budgetExhausted</code>、
+            <code>thinking</code>（<code>requested</code> / <code>effective</code> /
+            <code>adjusted</code> / <code>modelKnown</code> / <code>reason</code>）。键只在给了预算
+            / 解析过档位时出现。
+          </li>
+          <li>
+            <b>列表</b>：<code>dispatch_list</code> 的行多带 <code>budget</code> /
+            <code>thinking</code> / <code>budgetExhausted</code> 三列。
+          </li>
+          <li>
+            <b>终态通知</b>：预算到点带一句「预算到点（降级交付）」；档位被降级时带一句「思考档位
+            high→low」。
+          </li>
+          <li>
+            <b>TUI 面板</b>：在飞/排队那几行行内带提示——预算到点带「预算到点」， 档位被降级带「档位
+            high→low」。没有就不占位。
+          </li>
+        </ul>
+      </div>
+
+      <h2><span class="n">18</span>预热：孩子侧关掉</h2>
+
+      <p>
+        pi 的 <code>cacheWarming</code> 只读 <b>agent 目录级</b> settings（项目级
+        <code>.pi/settings.json</code> 里的值不生效）。所以关闭它走<b>扩展钩子</b>
+        <code>cache_warming_decision</code>：<code>depth &gt; 0</code> 的进程返回
+        <code>{action: "stop"}</code>，<code>depth === 0</code>（父会话）不表态。
+      </p>
+
+      <ul>
+        <li>
+          注册在<b>工厂层</b>（跑一次、进程内长期有效），不是 <code>session_start</code>
+          （后者会因 new / resume / fork 重复触发）。
+        </li>
+        <li>注册处 <code>try/catch</code>：老版本 pi 不认识这个事件时抛错也不影响派发。</li>
+        <li>
+          <b>不往孩子工作区写 <code>.pi/settings.json</code></b
+          >：写了不生效，还会污染父方工作区、给隔离档添落点问题。
+        </li>
+        <li>
+          父会话（<code>depth 0</code>）不注册 ⇒
+          预热照旧（父会话长命，预热对它有价值）；子代理短命，热缓存没人用。
+        </li>
+        <li>
+          机制事实：<b>运行中</b>的续接概率是 1（闲置期才是 0.15）⇒ 孩子在跑时 pi
+          几乎总判定「预热划算」。收益小（每预热一次约 $0.00006 量级）但严格非负。
+        </li>
+      </ul>
+
+      <h2><span class="n">19</span>别踩的坑</h2>
 
       <div class="card red">
         <ol style="margin-bottom: 0">

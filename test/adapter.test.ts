@@ -36,7 +36,9 @@ import { encodeBucket, findProjectRoot, Storage } from "../src/core/storage.ts";
 import type { TaskRecord } from "../src/core/types.ts";
 
 /** 最小假 pi：只实现本扩展用到的 API。 */
-function fakePi(options: { failSends?: number; noSendUserMessage?: boolean } = {}) {
+function fakePi(
+  options: { failSends?: number; noSendUserMessage?: boolean; unknownEvents?: string[] } = {},
+) {
   const handlers = new Map<string, Set<(...args: unknown[]) => unknown>>();
   const tools = new Map<string, unknown>();
   const commands = new Map<string, { handler: (...args: unknown[]) => unknown }>();
@@ -51,6 +53,7 @@ function fakePi(options: { failSends?: number; noSendUserMessage?: boolean } = {
     sent,
     pi: {
       on(event: string, handler: (...args: unknown[]) => unknown) {
+        if (options.unknownEvents?.includes(event)) throw new Error(`unknown event: ${event}`); // 老版本 pi 不认识这个事件
         const set = handlers.get(event) ?? new Set();
         set.add(handler);
         handlers.set(event, set);
@@ -1113,6 +1116,9 @@ test("适配层：孩子 turn_end 增量读信箱，失败不推进游标", asyn
       "[pi-dispatch-steer #2]\n父方在你运行期间调整了方向；这是对当前任务的补充/修正，不是新任务：\n乙",
     );
 
+    // 展开成数组是**必要的**：shutdown() 会退订（同一行下面断言 turn_end 的 size 归 0），
+    // 直接迭代 Set 时改动它会让迭代器漏元素 ⇒ 先快照再调。lint 的 no-useless-spread 在这里是误报。
+    // oxlint-disable-next-line unicorn/no-useless-spread
     for (const shutdown of [...(handlers.get("session_shutdown") ?? [])]) shutdown();
     assert.equal(handlers.get("turn_end")!.size, 0, "shutdown 后退订");
   } finally {
@@ -1209,4 +1215,245 @@ test("steer 命令：没有活动会话时报错原文，不抛", async () => {
     ui: { notify: (message: string, level: string) => notes.push([message, level]) },
   });
   assert.deepEqual(notes, [["派单引擎未就绪", "error"]]);
+});
+
+// ── 适配层：预热钩子 / 预算 schema / 列表三列 / 终态通知 ────────────────
+
+test("适配层：子代理进程（depth>0）注册 cache_warming_decision 并返回 stop", () => {
+  const oldDepth = process.env.PI_DISPATCH_DEPTH;
+  process.env.PI_DISPATCH_DEPTH = "1";
+  try {
+    const { pi, handlers } = fakePi();
+    entry(pi as never);
+    const hook = [...(handlers.get("cache_warming_decision") ?? [])][0];
+    assert.ok(hook, "孩子进程要注册预热钩子");
+    assert.deepEqual(hook({}, {}), { action: "stop" }, "孩子侧关掉预热");
+  } finally {
+    if (oldDepth === undefined) delete process.env.PI_DISPATCH_DEPTH;
+    else process.env.PI_DISPATCH_DEPTH = oldDepth;
+  }
+});
+
+test("适配层：父进程不注册 cache_warming_decision", () => {
+  const oldDepth = process.env.PI_DISPATCH_DEPTH;
+  process.env.PI_DISPATCH_DEPTH = "0";
+  try {
+    const { pi, handlers } = fakePi();
+    entry(pi as never);
+    assert.equal(handlers.get("cache_warming_decision"), undefined, "父会话预热照旧");
+  } finally {
+    if (oldDepth === undefined) delete process.env.PI_DISPATCH_DEPTH;
+    else process.env.PI_DISPATCH_DEPTH = oldDepth;
+  }
+});
+
+test("适配层：pi 不认识 cache_warming_decision 时不炸", () => {
+  const oldDepth = process.env.PI_DISPATCH_DEPTH;
+  process.env.PI_DISPATCH_DEPTH = "1";
+  try {
+    const { pi } = fakePi({ unknownEvents: ["cache_warming_decision"] });
+    assert.doesNotThrow(() => entry(pi as never), "老版本 pi 注册未知事件不影响派发");
+  } finally {
+    if (oldDepth === undefined) delete process.env.PI_DISPATCH_DEPTH;
+    else process.env.PI_DISPATCH_DEPTH = oldDepth;
+  }
+});
+
+test("适配层：dispatch_task 的 schema 带 usageBudget", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dispatch-adapter-budget-"));
+  const oldHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const { pi, handlers, tools } = fakePi();
+    entry(pi as never);
+    await [...(handlers.get("session_start") ?? [])][0]!(undefined, fakeCtx(home));
+    const def = tools.get("dispatch_task") as {
+      parameters: {
+        properties: Record<
+          string,
+          { type: string; description: string; properties?: Record<string, { type: string }> }
+        >;
+      };
+    };
+    const budget = def.parameters.properties.usageBudget!;
+    assert.equal(budget.type, "object");
+    assert.match(budget.description, /cacheRead/, "token 口径含缓存要说清");
+    assert.deepEqual(Object.keys(budget.properties ?? {}).sort(), [
+      "hardFactor",
+      "hardGraceMs",
+      "maxTokens",
+      "maxUsd",
+    ]);
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+  }
+});
+
+test("适配层：dispatch_list 的行带 budget / thinking / budgetExhausted 三列", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dispatch-adapter-budget-list-"));
+  const project = mkdtempSync(join(tmpdir(), "dispatch-proj-budget-list-"));
+  mkdirSync(join(project, ".git"), { recursive: true });
+  const oldHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    new Storage(`${home}/.pi/dispatch`, project).persistRecord({
+      id: "budget-0001",
+      status: "succeeded",
+      task: "干活",
+      budget: { maxUsd: 1, spentUsd: 2, spentTokens: 300, exhausted: true },
+      budgetExhausted: true,
+      thinking: {
+        requested: "medium",
+        effective: "low",
+        adjusted: true,
+        modelKnown: true,
+        reason: "该模型没有 medium 档",
+      },
+    });
+    const { pi, handlers, tools } = fakePi();
+    entry(pi as never);
+    await [...(handlers.get("session_start") ?? [])][0]!(undefined, fakeCtx(project));
+    const def = tools.get("dispatch_list") as {
+      execute: () => Promise<{ content: Array<{ text: string }> }>;
+    };
+    let out = await def.execute();
+    for (let i = 0; i < 20 && JSON.parse(out.content[0]!.text).total === 0; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+      out = await def.execute();
+    }
+    const row = (
+      JSON.parse(out.content[0]!.text) as {
+        records: Array<{
+          id: string;
+          budget?: { maxUsd?: number; spentTokens?: number };
+          thinking?: { requested?: string; effective?: string };
+          budgetExhausted?: boolean;
+        }>;
+      }
+    ).records.find((r) => r.id === "budget-0001")!;
+    assert.equal(row.budget?.maxUsd, 1);
+    assert.equal(row.budget?.spentTokens, 300);
+    assert.equal(row.thinking?.requested, "medium");
+    assert.equal(row.thinking?.effective, "low");
+    assert.equal(row.budgetExhausted, true);
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+  }
+});
+
+test("适配层：终态通知在预算到点时带「降级交付」、降档时带「high→low」", async () => {
+  const registry = new TaskRegistry();
+  const notifications = new NotificationCenter();
+  notifications.attach(registry as never);
+  await registry.submit({
+    kind: "spawn",
+    record: {
+      id: "budget-notify-1",
+      status: "succeeded",
+      task: "t",
+      finishedAt: 1700000000000,
+      budgetExhausted: true,
+      thinking: {
+        requested: "high",
+        effective: "low",
+        adjusted: true,
+        modelKnown: true,
+      },
+    },
+  });
+  const sent: Array<{ content?: string }> = [];
+  deliver({ sendMessage: (m: { content?: string }) => sent.push(m) } as never, notifications);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0]!.content!, /预算到点（降级交付）/);
+  assert.match(sent[0]!.content!, /思考档位 high→low/);
+});
+
+// ── 适配层：TUI 接线 / 空 steers 收据 ───────────────────────────────────
+
+test("适配层：TUI 常驻面只在 mode=tui 时挂（rpc 不碰 UI）", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dispatch-adapter-tui-"));
+  const oldHome = process.env.HOME;
+  process.env.HOME = home;
+  /** 假 ctx.ui：只记调用，不渲染。 */
+  const recorder = (): { calls: string[]; ui: unknown } => {
+    const calls: string[] = [];
+    return {
+      calls,
+      ui: {
+        setWidget: (key: string) => calls.push(`widget:${key}`),
+        setStatus: (key: string) => calls.push(`status:${key}`),
+      },
+    };
+  };
+  try {
+    // tui：挂常驻面（挂载即推一次 widget + status）
+    const tui = recorder();
+    const tuiPi = fakePi();
+    entry(tuiPi.pi as never);
+    await [...(tuiPi.handlers.get("session_start") ?? [])][0]!(undefined, {
+      mode: "tui",
+      cwd: home,
+      model: undefined,
+      ui: tui.ui,
+    });
+    assert.ok(
+      tui.calls.some((call) => call.startsWith("widget:")),
+      "tui 模式要挂常驻面板",
+    );
+
+    // rpc：同一套装配，但不许碰常驻面板
+    const rpc = recorder();
+    const rpcPi = fakePi();
+    entry(rpcPi.pi as never);
+    await [...(rpcPi.handlers.get("session_start") ?? [])][0]!(undefined, {
+      mode: "rpc",
+      cwd: home,
+      model: undefined,
+      ui: rpc.ui,
+    });
+    assert.deepEqual(rpc.calls, [], "rpc 模式不挂常驻面板");
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+  }
+});
+
+test("适配层：dispatch_list 的空 steers 数组不留键（空数组也不行）", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dispatch-adapter-empty-steers-"));
+  const project = mkdtempSync(join(tmpdir(), "dispatch-proj-empty-steers-"));
+  mkdirSync(join(project, ".git"), { recursive: true });
+  const oldHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    // 盘上可能有一条 steers 为空数组的旧记录：列表不许把这个空键漏出来
+    new Storage(`${home}/.pi/dispatch`, project).persistRecord({
+      id: "empty-steers-01",
+      status: "succeeded",
+      task: "t",
+      steers: [],
+    });
+    const { pi, handlers, tools } = fakePi();
+    entry(pi as never);
+    await [...(handlers.get("session_start") ?? [])][0]!(undefined, fakeCtx(project));
+    const def = tools.get("dispatch_list") as {
+      execute: () => Promise<{ content: Array<{ text: string }> }>;
+    };
+    let out = await def.execute();
+    for (let i = 0; i < 20 && JSON.parse(out.content[0]!.text).total === 0; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+      out = await def.execute();
+    }
+    const rows = (
+      JSON.parse(out.content[0]!.text) as {
+        records: Array<{ id: string; steers?: unknown[] }>;
+      }
+    ).records;
+    const row = rows.find((r) => r.id === "empty-steers-01")!;
+    assert.ok(!("steers" in row), "空 steers 数组不许在列表里留键");
+  } finally {
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+  }
 });

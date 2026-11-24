@@ -36,7 +36,9 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   assessmentVacuous,
-  buildAppendBlock,
+  buildUserMessage,
+  CONTRACT_BLOCK,
+  createUsageTracker,
   buildPiArgv,
   createSteerEvidenceTracker,
   deliveryUnverified,
@@ -203,21 +205,23 @@ test("拼命令：不 allowScripts 时不带 -e", () => {
   assert.ok(!buildPiArgv({ task: "t", readOnly: "strict" }).includes("-e"));
 });
 
-test("附加块：理由被实体转义（<> 不会伪造标签）", () => {
-  const block = buildAppendBlock({ why: "<script>alert(1)</script>" });
-  assert.ok(!block.includes("<script>"), "未转义的标签会破坏块边界");
-  assert.ok(block.includes("&lt;script&gt;"));
+test("拼命令：理由里的 XML 实体被转义（不会伪造标签）", () => {
+  const message = buildUserMessage({ task: "干活", why: "<script>alert(1)</script>" });
+  assert.ok(!message.includes("<script>"), "未转义的标签会破坏块边界");
+  assert.ok(message.includes("&lt;script&gt;"));
+  // 连 & 也要逃逸，否则可以拼出 `&lt;` 再伪造标签
+  assert.ok(buildUserMessage({ task: "干活", why: "a &amp; b" }).includes("a &amp;amp; b"));
 });
 
 test("附加块：没给理由时不带理由段", () => {
-  const block = buildAppendBlock({});
+  const message = buildUserMessage({ task: "干活" });
   // 契约文案会提到 <pi-dispatch-why>（条件句），注入的理由段必有闭合标签——按闭合标签判有无
-  assert.ok(!block.includes("</pi-dispatch-why>"));
-  assert.ok(block.includes(SUBAGENT_CONTEXT_BLOCK));
+  assert.ok(!message.includes("</pi-dispatch-why>"));
+  assert.ok(CONTRACT_BLOCK.includes(SUBAGENT_CONTEXT_BLOCK));
 });
 
 test("附加块：报告契约总是带上", () => {
-  assert.ok(buildAppendBlock({}).includes("<child-report-contract>"));
+  assert.ok(CONTRACT_BLOCK.includes("<child-report-contract>"));
 });
 
 test("报告契约：说清「报告是摘要，交付物是正文」", () => {
@@ -1388,15 +1392,24 @@ const FROZEN_REPORT_CONTRACT_BLOCK = [
   "</child-report-contract>",
 ].join("\n");
 
-/** 冻结：默认附加块（上下文 + 报告契约；中间没有理由段）。 */
+/** 冻结：恒定契约块（上下文 + 报告契约；中间没有理由段）。 */
 const FROZEN_APPEND_BLOCK = [FROZEN_CONTEXT_BLOCK, FROZEN_REPORT_CONTRACT_BLOCK].join("\n");
 
-/** 冻结：带理由的附加块。 */
-const FROZEN_APPEND_BLOCK_WITH_WHY = [
-  FROZEN_CONTEXT_BLOCK,
-  "<pi-dispatch-why>为什么</pi-dispatch-why>",
-  FROZEN_REPORT_CONTRACT_BLOCK,
+/** 冻结：隔离契约块（逐字节）。 */
+const FROZEN_WORKTREE_BLOCK = [
+  "<pi-dispatch-worktree>",
+  "你在一个独立工作区（git worktree）里干活：当前目录不是父方的仓库目录，你的改动不会踩到父方的工作区。",
+  "分支由父方掌握，你只管在当前分支上干活：交付前自己把改动 commit 在这个工作区里——父方靠提交收编你的产出。",
+  "不要 push、不要 rebase、不要切分支、不要动父方的主分支：合并归父方。",
+  "</pi-dispatch-worktree>",
 ].join("\n");
+
+/** 冻结：user message（任务 + 理由 + 隔离契约；分隔符是空行）。 */
+const FROZEN_USER_MESSAGE = [
+  "干活",
+  "<pi-dispatch-why>为什么</pi-dispatch-why>",
+  FROZEN_WORKTREE_BLOCK,
+].join("\n\n");
 
 /** 冻结：五种组合的 argv（逐元素）。 */
 const FROZEN_ARGV = {
@@ -1490,22 +1503,36 @@ test("golden：buildPiArgv 五种组合逐元素等于冻结字面量", () => {
   ]);
 });
 
-test("golden：buildAppendBlock 与今天逐字节相等", () => {
-  assert.equal(buildAppendBlock({ why: "为什么" }), FROZEN_APPEND_BLOCK_WITH_WHY);
-  assert.equal(buildAppendBlock({}), FROZEN_APPEND_BLOCK);
+test("golden：附加块逐字节等于冻结字面量（上下文 + 报告契约）", () => {
+  assert.equal(CONTRACT_BLOCK, FROZEN_APPEND_BLOCK);
+  // 开不开黑板都不改附加块（黑板契约全在工具描述里）
+  const blockOf = (argv: string[]): string => argv[argv.indexOf("--append-system-prompt") + 1]!;
+  assert.equal(
+    blockOf(buildPiArgv({ task: "干活", why: "为什么", blackboard: true })),
+    FROZEN_APPEND_BLOCK,
+  );
 });
 
-test("golden：开隔离时附加块多一段 worktree 契约", () => {
-  const block = buildAppendBlock({ why: "为什么", isolation: "worktree" });
-  assert.ok(block.includes(WORKTREE_CONTRACT_BLOCK), "要有隔离契约段");
+test("golden：user message 逐字节等于冻结字面量（任务 + why + 隔离契约）", () => {
+  assert.equal(
+    buildUserMessage({ task: "干活", why: "为什么", isolation: "worktree" }),
+    FROZEN_USER_MESSAGE,
+  );
+  // 隔离契约是 user message 的一段，不是系统提示词的一段
+  assert.ok(!CONTRACT_BLOCK.includes("<pi-dispatch-worktree>"));
+});
+
+test("golden：开隔离时 user message 多一段 worktree 契约", () => {
+  const message = buildUserMessage({ task: "干活", why: "为什么", isolation: "worktree" });
+  assert.ok(message.includes(WORKTREE_CONTRACT_BLOCK), "要有隔离契约段");
   // 契约要点一个都不能少：独立工作区 / 交付前自行 commit / 不 push 不 rebase 不动主分支
-  assert.match(block, /独立工作区/);
-  assert.match(block, /交付前自己把改动 commit/);
-  assert.match(block, /不要 push、不要 rebase/);
-  assert.match(block, /主分支/);
+  assert.match(message, /独立工作区/);
+  assert.match(message, /交付前自己把改动 commit/);
+  assert.match(message, /不要 push、不要 rebase/);
+  assert.match(message, /主分支/);
   // 默认关时这段不出现
-  assert.ok(!buildAppendBlock({ why: "为什么" }).includes("<pi-dispatch-worktree>"));
-  assert.ok(!buildAppendBlock({}).includes("<pi-dispatch-worktree>"));
+  assert.ok(!buildUserMessage({ task: "干活", why: "为什么" }).includes("<pi-dispatch-worktree>"));
+  assert.ok(!buildUserMessage({ task: "干活" }).includes("<pi-dispatch-worktree>"));
 });
 
 test("golden：strict 的 --tools 名单与今天相等", () => {
@@ -1571,7 +1598,7 @@ test("golden：开黑板时附加块逐字节不变（黑板契约全在工具�
   const on = buildPiArgv({ task: "干活", why: "为什么", blackboard: true });
   const blockOf = (argv: string[]): string => argv[argv.indexOf("--append-system-prompt") + 1]!;
   assert.equal(blockOf(on), blockOf(off), "开黑板不改附加块");
-  assert.equal(blockOf(on), FROZEN_APPEND_BLOCK_WITH_WHY, "附加块与冻结字面量逐字节相等");
+  assert.equal(blockOf(on), FROZEN_APPEND_BLOCK, "附加块与冻结字面量逐字节相等");
   assert.ok(!blockOf(on).includes("黑板"), "附加块里不出现黑板段");
 });
 
@@ -1895,4 +1922,117 @@ test("报告：自报用量里的 NaN / Infinity 一律丢掉", () => {
     usage: { input: Number.NaN, output: Number.POSITIVE_INFINITY, cost: 0.5 },
   });
   assert.deepEqual(report.usage, { cost: 0.5 }, "只留有限数");
+});
+
+// ── 运行中用量：增量口径与退出后的记账同数 ────────────────────────────────
+
+test("收件：增量用量累加 = 终局 parseChildStream 的口径（同一段流，两条路同数）", () => {
+  const tracker = createUsageTracker();
+  tracker.push(REAL_USAGE_STREAM);
+  tracker.finish();
+  const incremental = tracker.snapshot().usage;
+  const final = parseChildStream(REAL_USAGE_STREAM).observedUsageTotal;
+  assert.deepEqual(incremental, final, "运行中判预算与退出后记账必须同数");
+  assert.ok(incremental && incremental.input! > 0, "真机样本有非零用量");
+});
+
+test("收件：增量用量跨 chunk 的半行不丢（usage 事件被切成两半也要算进去）", () => {
+  const tracker = createUsageTracker();
+  const mid = Math.floor(REAL_USAGE_STREAM.length / 2);
+  tracker.push(REAL_USAGE_STREAM.slice(0, mid));
+  tracker.push(REAL_USAGE_STREAM.slice(mid));
+  tracker.finish();
+  assert.deepEqual(
+    tracker.snapshot().usage,
+    parseChildStream(REAL_USAGE_STREAM).observedUsageTotal,
+  );
+});
+
+test("收件：增量用量只认 assistant 的 message_end（user / system 的 usage 不计）", () => {
+  const stream = [
+    '{"type":"message_end","message":{"role":"user","content":[],"usage":{"input":9999,"output":9999}}}',
+    '{"type":"message_end","message":{"role":"system","content":[],"usage":{"input":8888,"output":8888}}}',
+    '{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":3,"output":4,"cacheRead":5,"cacheWrite":6,"cost":0.5}}}',
+  ].join("\n");
+  const tracker = createUsageTracker();
+  tracker.push(stream);
+  tracker.finish();
+  const snap = tracker.snapshot();
+  assert.equal(snap.usage?.input, 3, "非 assistant 的 usage 不许进账");
+  assert.equal(snap.usage?.output, 4);
+  assert.equal(snap.usage?.cacheRead, 5);
+  assert.equal(snap.usage?.cacheWrite, 6);
+  assert.equal(snap.usage?.cost, 0.5);
+  assert.equal(snap.turns, 1, "只有一个 assistant 回合带 usage");
+  assert.deepEqual(snap.usage, parseChildStream(stream).observedUsageTotal);
+});
+
+test("收件：增量用量在没有用量事件时是 null（与终局口径一致）", () => {
+  const stream = '{"type":"message_end","message":{"role":"assistant","content":[]}}';
+  const tracker = createUsageTracker();
+  tracker.push(stream);
+  tracker.finish();
+  assert.equal(tracker.snapshot().usage, null);
+  assert.equal(tracker.snapshot().turns, 0);
+});
+
+// ── 前缀稳定化：附加块恒定，变的内容进 user message ──────────────────────
+
+test("拼命令：附加块恒定（why 不进系统提示词）", () => {
+  const withWhy = buildPiArgv({ task: "干活", why: "为什么" });
+  const without = buildPiArgv({ task: "干活" });
+  const blockOf = (argv: string[]): string => argv[argv.indexOf("--append-system-prompt") + 1]!;
+  assert.equal(blockOf(withWhy), blockOf(without), "why 改变不改系统提示词");
+  assert.ok(!blockOf(withWhy).includes("</pi-dispatch-why>"), "契约里的条件句不算理由段");
+  assert.equal(blockOf(withWhy), CONTRACT_BLOCK);
+});
+
+test("拼命令：why 进 user message", () => {
+  const argv = buildPiArgv({ task: "干活", why: "为什么" });
+  const message = argv[argv.length - 1]!;
+  assert.ok(message.includes("<pi-dispatch-why>为什么</pi-dispatch-why>"));
+  assert.ok(message.startsWith("干活"), "任务仍是 message 的开头");
+});
+
+test("拼命令：隔离契约进 user message，不进系统提示词", () => {
+  const argv = buildPiArgv({ task: "干活", isolation: "worktree" });
+  const block = argv[argv.indexOf("--append-system-prompt") + 1]!;
+  const message = argv[argv.length - 1]!;
+  assert.ok(!block.includes("<pi-dispatch-worktree>"), "系统提示词恒定");
+  assert.ok(message.includes("<pi-dispatch-worktree>"), "隔离契约在 user message 里");
+});
+
+test("拼命令：没有 why 也没有隔离时，user message 就是任务原文（argv 与今天逐字节相同）", () => {
+  const argv = buildPiArgv({ task: "干活" });
+  assert.equal(argv[argv.length - 1], "干活");
+  assert.equal(argv[argv.length - 2], "--", "任务仍在 -- 之后");
+});
+
+test("拼命令：user message 的顺序是 任务 → why → 隔离契约", () => {
+  const message = buildUserMessage({ task: "干活", why: "为什么", isolation: "worktree" });
+  const taskAt = message.indexOf("干活");
+  const whyAt = message.indexOf("<pi-dispatch-why>");
+  const treeAt = message.indexOf("<pi-dispatch-worktree>");
+  assert.ok(taskAt >= 0 && whyAt > taskAt, "why 在任务之后");
+  assert.ok(treeAt > whyAt, "隔离契约在 why 之后（靠近交付）");
+});
+
+test("拼命令：降级后的档位进 --model 后缀（a/b:low）", () => {
+  const argv = buildPiArgv({ task: "t", model: "a/b", thinkingLevel: "low" });
+  assert.equal(argv[argv.indexOf("--model") + 1], "a/b:low");
+});
+
+test("拼命令：没给档位时不拼后缀（a/b 不带冒号）", () => {
+  const modelOf = (argv: string[]): string => argv[argv.indexOf("--model") + 1]!;
+  assert.equal(modelOf(buildPiArgv({ task: "t", model: "a/b" })), "a/b", "没给档位 ⇒ 不带冒号");
+  assert.equal(
+    modelOf(buildPiArgv({ task: "t", model: "a/b", thinkingLevel: "  " })),
+    "a/b",
+    "空白串是坏值 ⇒ 不带冒号",
+  );
+  assert.equal(
+    modelOf(buildPiArgv({ task: "t", model: "a/b", thinkingLevel: "" })),
+    "a/b",
+    "空串是坏值 ⇒ 不带冒号",
+  );
 });

@@ -6,6 +6,8 @@ import {
   buildPiArgv,
   createSteerEvidenceTracker,
   deliveryUnverified,
+  createUsageTracker,
+  effectiveModel,
   parseChildStream,
   extractReportFromText,
   spawnChild,
@@ -38,14 +40,25 @@ import {
   sweepWorktrees,
   type GitRunner,
 } from "./worktree.ts";
+import {
+  BUDGET_STEER_TEXT,
+  DEFAULT_HARD_GRACE_MS,
+  evaluateBudget,
+  totalTokens,
+  usdOf,
+} from "./budget.ts";
+import { findThinkingModel, resolveThinkingLevel, type ThinkingModelInfo } from "./thinking.ts";
 import type { TaskRegistry } from "./registry.ts";
 import type {
+  BudgetReceipt,
+  ChildUsage,
   DispatchInput,
   DispatchOutcome,
   DispatchResult,
   HostMode,
   SteerOutcome,
   TaskRecord,
+  ThinkingReceipt,
   WorktreeInfo,
 } from "./types.ts";
 import { isTerminal } from "./types.ts";
@@ -101,6 +114,11 @@ export interface EngineDeps {
   repoRoot?: string;
   /** 是不是可用的 git 仓（喂安检 9；缺省 = 否 ⇒ 不许开隔离） */
   isGitRepo?: () => boolean;
+  /**
+   * 模型目录快照（思考档位校验用）。缺省 = 空目录 = 不校验、原样透传。
+   * 它是**数据**不是机器读：适配层从 ctx.modelRegistry 摊成纯数据传进来。
+   */
+  thinkingCatalog?: () => readonly ThinkingModelInfo[];
 }
 
 const DEFAULT_STOP_GRACE_MS = 5_000;
@@ -326,6 +344,13 @@ export class TaskEngine {
   readonly #git: GitRunner;
   readonly #repoRoot?: string;
   readonly #owner: { pid: number; startMs: number };
+  readonly #thinkingCatalog?: () => readonly ThinkingModelInfo[];
+  /** 受理时解析出的思考档位后缀（拼进 --model 的 :<档位>）。key = taskId。 */
+  readonly #thinkingSuffixes = new Map<string, string | undefined>();
+  /** 预算状态机：软门时刻 / 硬门已触发。key = taskId。 */
+  readonly #budgetStates = new Map<string, { softAt?: number; hard: boolean }>();
+  /** 硬门的时间兜底定时器（软门后宽限期到了还没交 ⇒ 收掉）。 */
+  readonly #budgetTimers = new Map<string, NodeJS.Timeout>();
   readonly #ready: Promise<void>;
   /** 在跑的孩子（占用座位） */
   readonly #children = new Map<string, ChildHandle>();
@@ -364,6 +389,7 @@ export class TaskEngine {
     this.#whyEnabled = cfg.whyEnabled;
     this.#allowScriptsDefault = cfg.allowScriptsDefault;
     this.#hostMode = cfg.hostMode;
+    this.#thinkingCatalog = deps.thinkingCatalog;
     this.#piVersion = deps.piVersion;
     this.#sessionModel = deps.sessionModel;
     this.#piPath = deps.piPath;
@@ -536,6 +562,8 @@ export class TaskEngine {
       ...rawInput,
       why: whyEnabled ? rawInput.why : undefined,
       allowScripts,
+      // 预算在受理时钉死：克隆一份，排队期间调用方改参数不影响这一单。
+      ...(rawInput.usageBudget ? { usageBudget: { ...rawInput.usageBudget } } : {}),
     };
     // 闸后、铸 id 前：钉死 base（受理时的 HEAD）——排队期间父仓 HEAD 前进也不漂移。
     // 钉不住就退回：闸在铸 id 前，不留记录不占座位。
@@ -558,6 +586,26 @@ export class TaskEngine {
       board = opened.board;
     }
     const taskId = randomUUID();
+    // 模型也在受理时钉死：排队期间父会话换模型，不许让 argv 用新模型配旧档位。
+    const acceptedModel = effectiveModel({
+      model: input.model,
+      sessionModel: this.#sessionModel?.(),
+    });
+    if (acceptedModel !== undefined) input.model = acceptedModel;
+    // 思考档位：受理时解析并钉死（跟预算一样是受理时的入参，排队期间改不动）。
+    const thinking = this.#resolveThinking(input);
+    if (thinking) this.#thinkingSuffixes.set(taskId, thinking.suffix);
+    // 预算回执的初始形态：上限钉死，已花为 0。
+    const budget = input.usageBudget
+      ? {
+          ...(input.usageBudget.maxUsd !== undefined ? { maxUsd: input.usageBudget.maxUsd } : {}),
+          ...(input.usageBudget.maxTokens !== undefined
+            ? { maxTokens: input.usageBudget.maxTokens }
+            : {}),
+          spentUsd: 0,
+          spentTokens: 0,
+        }
+      : undefined;
     const record: TaskRecord = {
       id: taskId,
       status: "queued",
@@ -578,6 +626,9 @@ export class TaskEngine {
         : {}),
       // 黑板的键只在开启时出现（默认关时 Object.keys 不变）
       ...(board ? { blackboard: board } : {}),
+      // 预算与档位的键只在开启/解析过时出现（默认关时 Object.keys 不变）
+      ...(budget ? { budget } : {}),
+      ...(thinking ? { thinking: thinking.receipt } : {}),
     };
     await this.#registry.submit({ kind: "spawn", record });
     this.#inputs.set(taskId, input);
@@ -614,31 +665,42 @@ export class TaskEngine {
     for (const resolve of waiters) resolve(record);
   }
 
-  async #runToTerminal(taskId: string, input: DispatchInput): Promise<DispatchResult> {
+  async #runToTerminal(taskId: string, input: DispatchInput): Promise<void> {
     try {
-      return await this.#executeRun(taskId, input);
+      await this.#executeRun(taskId, input);
     } catch {
       // 泵内异常（spawn 同步抛、磁盘写失败…）不许升级成宿主未处理拒绝
       const r = await this.#registry
         .submit({ kind: "resolve-exit", id: taskId, exitCode: -1 })
         .catch(() => undefined);
       if (r) this.#notifyTerminal(r.record);
-      return this.#notStartedResult(taskId, input, "任务内部错误（见日志）", "failed");
+    } finally {
+      this.#forgetTask(taskId);
     }
   }
 
-  async #executeRun(taskId: string, input: DispatchInput): Promise<DispatchResult> {
+  /** 任务走到终态后清掉所有 per-task 状态，避免长驻会话里只增不减。 */
+  #forgetTask(taskId: string): void {
+    const timer = this.#budgetTimers.get(taskId);
+    if (timer) clearTimeout(timer);
+    this.#budgetTimers.delete(taskId);
+    this.#budgetStates.delete(taskId);
+    this.#thinkingSuffixes.delete(taskId);
+    this.#budgetSteerFailed.delete(taskId);
+  }
+
+  async #executeRun(taskId: string, input: DispatchInput): Promise<void> {
     const entered = await this.#registry.submit({ kind: "transition", id: taskId, to: "running" });
     if (!entered.changed) {
       // 等座期间记录已被取消——不 spawn
-      return this.#notStartedResult(taskId, input, "任务在启动前已取消", "canceled");
+      return;
     }
     if (this.#teardown) {
       const r = await this.#registry
         .submit({ kind: "resolve-exit", id: taskId, exitCode: -1 })
         .catch(() => undefined);
       if (r) this.#notifyTerminal(r.record);
-      return this.#notStartedResult(taskId, input, "会话拆卸发生在启动前", "failed");
+      return;
     }
     // CPU 启动节流：名额只护「启动」这一段，不起子进程就还回去（不占座）
     await this.#acquireLaunchSlot();
@@ -658,7 +720,7 @@ export class TaskEngine {
           })
           .catch(() => undefined);
         if (r) this.#notifyTerminal(r.record);
-        return this.#notStartedResult(taskId, input, "等启动名额时被叫停", "canceled");
+        return;
       }
       // 启动名额内建 worktree：建不出来 ⇒ 失败。
       // 绝不降级共享 cwd、绝不 spawn（孩子在共享目录里干活比失败更糟）。
@@ -685,12 +747,7 @@ export class TaskEngine {
           })
           .catch(() => undefined);
         if (r) this.#notifyTerminal(r.record);
-        return this.#notStartedResult(
-          taskId,
-          input,
-          `worktree 创建失败：${prepared.error}`,
-          "failed",
-        );
+        return;
       }
       // 建盘是 await（git worktree add 最长 30s）：回来时任务可能已被叫停/会话已拆卸。
       // 此刻 #children 里还没有句柄，SIGTERM 无处发，shutdown 也走不到它 ⇒ 必须在这里复查。
@@ -715,14 +772,23 @@ export class TaskEngine {
           })
           .catch(() => undefined);
         if (r) this.#notifyTerminal(r.record);
-        return this.#notStartedResult(taskId, input, "取消发生在 worktree 检出之后", "canceled");
+        return;
       }
-      child = this.#spawnChild(input, taskId, prepared.worktree);
+      try {
+        child = this.#spawnChild(input, taskId, prepared.worktree);
+      } catch (error) {
+        const detail = `无法启动子进程：${error instanceof Error ? error.message : String(error)}`;
+        const r = await this.#registry
+          .submit({ kind: "resolve-exit", id: taskId, exitCode: -1, notStarted: true, detail })
+          .catch(() => undefined);
+        if (r) this.#notifyTerminal(r.record);
+        return;
+      }
       this.#children.set(taskId, child);
     } finally {
       this.#releaseLaunchSlot(); // 起了（或抛错）就交还名额，别占整个运行期
     }
-    return this.#pump(taskId, input, child);
+    await this.#pump(taskId, input, child);
   }
 
   /** 受理时钉 base：读仓库当前的 HEAD。读不到就返回失败（引擎据此退回，不留痕）。 */
@@ -768,7 +834,7 @@ export class TaskEngine {
     taskId: string,
     worktree: { path: string } | undefined,
   ): ChildHandle {
-    const argv = this.#buildArgv(input);
+    const argv = this.#buildArgv(input, taskId);
     const env = this.#childEnv(taskId, input);
     if (!worktree) {
       return this.#spawn(argv, env);
@@ -776,22 +842,147 @@ export class TaskEngine {
     return this.#spawn(argv, env, { cwd: worktree.path });
   }
 
-  #buildArgv(input: DispatchInput): string[] {
+  #buildArgv(input: DispatchInput, taskId: string): string[] {
+    // 受理时解析好的档位（已按模型目录校验/降级）；没解析过就用调用给的原值。
+    const resolved = this.#thinkingSuffixes.get(taskId);
+    const thinkingLevel = this.#thinkingSuffixes.has(taskId)
+      ? resolved
+      : (input.thinkingLevel ?? undefined);
     return buildPiArgv({
       task: input.task,
       why: input.why,
       model: input.model,
-      thinkingLevel: input.thinkingLevel,
+      thinkingLevel,
       readOnly: input.readOnly,
       projectContext: input.projectContext,
       allowScripts: input.allowScripts,
       isolation: input.isolation,
       blackboard: input.blackboard,
-      sessionModel: this.#sessionModel?.(),
       piVersion: this.#piVersion,
       piPath: this.#piPath,
       childExtensionPath: this.#childExtensionPath,
     });
+  }
+
+  /**
+   * 解析思考档位（受理时做一次，钉死）。
+   * 模型目录缺省是空的 ⇒ 查不到模型 ⇒ 原样透传（modelKnown: false）。
+   * 返回两样：回执（给父方看）与 argv 后缀（真正发给孩子的档位）。
+   */
+  #resolveThinking(input: DispatchInput):
+    | {
+        receipt: ThinkingReceipt;
+        suffix: string | undefined;
+      }
+    | undefined {
+    if (!input.thinkingLevel) return undefined;
+    const model = effectiveModel({
+      model: input.model,
+      sessionModel: this.#sessionModel?.(),
+    });
+    const catalog = this.#thinkingCatalog?.() ?? [];
+    const found = findThinkingModel(catalog, model);
+    const receipt = resolveThinkingLevel({ requested: input.thinkingLevel, model: found });
+    // 非思考模型：不拼后缀（= off，它压根不能思考）。
+    // 其余情况拼回执里的生效档位——它必在 supported 里 ⇒ pi 的 clamp 不会再改它。
+    const suffix = found && !found.reasoning ? undefined : receipt.effective;
+    return { receipt, suffix };
+  }
+
+  /**
+   * 判预算：软门写一条收尾转向（不打断在飞工具），硬门收掉孩子。
+   * 硬门触发时 status 仍是 canceled（不许装成 succeeded），部分正文照交。
+   */
+  async #checkBudget(
+    taskId: string,
+    input: DispatchInput,
+    usage: ChildUsage | null,
+  ): Promise<void> {
+    const budget = input.usageBudget;
+    if (!budget) return;
+    const state = this.#budgetStates.get(taskId) ?? { hard: false };
+    const decision = evaluateBudget({
+      budget,
+      spentUsd: usage ? usdOf(usage) : 0,
+      spentTokens: usage ? totalTokens(usage) : 0,
+      softAt: state.softAt,
+      hard: state.hard,
+      now: this.#now(),
+    });
+    if (decision.phase === "ok") return;
+    if (decision.phase === "soft" && state.softAt === undefined) {
+      state.softAt = this.#now();
+      this.#budgetStates.set(taskId, state);
+      // 先 arm 再 await：steer / attach 卡住或抛错时，硬门的时间兜底不能跟着失效。
+      this.#armBudgetTimer(taskId, input);
+      // 软门走现成的转向通道：写一条「收尾交付」指令，不打断在飞工具。
+      // 没装孩子扩展 / 没留痕目录 ⇒ 写不进去 ⇒ 只记 exhausted，靠硬门兜底。
+      const outcome = await this.steer(taskId, BUDGET_STEER_TEXT);
+      if (!outcome.ok) this.#budgetSteerFailed.add(taskId);
+      await this.#attachBudget(taskId, input, usage, state);
+      return;
+    }
+    if (decision.phase === "hard") {
+      state.hard = true;
+      this.#budgetStates.set(taskId, state);
+      try {
+        await this.#attachBudget(taskId, input, usage, state);
+      } finally {
+        // 记账失败也要收掉孩子：硬门不能依赖回执写盘成功。
+        await this.stop(taskId, `budget exhausted: ${decision.reason ?? "用量到点"}`);
+      }
+    }
+  }
+
+  /** 软门写不进去的标记（回执里明说「软门未送达」）。 */
+  readonly #budgetSteerFailed = new Set<string>();
+
+  /** 预算回执落账。 */
+  async #attachBudget(
+    taskId: string,
+    input: DispatchInput,
+    usage: ChildUsage | null,
+    state: { softAt?: number; hard: boolean },
+  ): Promise<void> {
+    const budget = input.usageBudget;
+    if (!budget) return;
+    const receipt: BudgetReceipt = {
+      ...(budget.maxUsd !== undefined ? { maxUsd: budget.maxUsd } : {}),
+      ...(budget.maxTokens !== undefined ? { maxTokens: budget.maxTokens } : {}),
+      spentUsd: usage ? usdOf(usage) : 0,
+      spentTokens: usage ? totalTokens(usage) : 0,
+      ...(state.softAt !== undefined ? { softAt: state.softAt } : {}),
+      ...(state.softAt !== undefined || state.hard ? { exhausted: true as const } : {}),
+      ...(this.#budgetSteerFailed.has(taskId) ? { softSteerFailed: true as const } : {}),
+    };
+    await this.#registry.submit({
+      kind: "attach-budget",
+      id: taskId,
+      budget: receipt,
+      exhausted: state.softAt !== undefined || state.hard,
+    });
+  }
+
+  /**
+   * 硬门的时间兜底：软门触发时 arm 一个 hardGraceMs 的定时器。
+   * 孩子卡在长工具里时不会有新用量事件 ⇒ 靠这个定时器收尸。
+   */
+  #armBudgetTimer(taskId: string, input: DispatchInput): void {
+    const budget = input.usageBudget;
+    if (!budget) return;
+    const grace = budget.hardGraceMs ?? DEFAULT_HARD_GRACE_MS;
+    const existing = this.#budgetTimers.get(taskId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.#budgetTimers.delete(taskId);
+      const state = this.#budgetStates.get(taskId);
+      if (!state || state.hard) return;
+      state.hard = true;
+      this.#budgetStates.set(taskId, state);
+      void this.stop(taskId, "budget exhausted: 软门后宽限期已过").catch(() => {});
+    }, grace);
+    timer.unref();
+    this.#budgetTimers.set(taskId, timer);
   }
 
   /** 深度 + 编号：孩子知道自己 depth 与父任务 id。 */
@@ -805,8 +996,11 @@ export class TaskEngine {
     );
   }
 
-  /** 盯住已经起好的孩子：超时 / 卡住 / 收四样 / 定终态。 */
-  async #pump(taskId: string, input: DispatchInput, child: ChildHandle): Promise<DispatchResult> {
+  /**
+   * 盯住已经起好的孩子：超时 / 卡住 / 收四样 / 定终态。
+   * 不返回结果：一次性宿主等的是 #awaitTerminal，最终结果由 #resultFromRecord 现算。
+   */
+  async #pump(taskId: string, input: DispatchInput, child: ChildHandle): Promise<void> {
     const timeoutMs =
       typeof input.timeoutMs === "number" && input.timeoutMs > 0 ? input.timeoutMs : undefined;
     const timer = timeoutMs
@@ -834,13 +1028,23 @@ export class TaskEngine {
     let text = "";
     let outputTruncated = false;
     const evidence = createSteerEvidenceTracker();
+    // 运行中用量通道：边喂 stdout 边累计（口径与退出时的 parseChildStream 完全一致）。
+    const usageTracker = createUsageTracker();
+    let lastTurns = -1;
     child.onOutput((chunk) => {
       activity.push(chunk);
       evidence.push(chunk);
+      usageTracker.push(chunk);
       text += chunk;
       if (text.length > STDOUT_KEEP_CHARS) {
         text = text.slice(-STDOUT_KEEP_CHARS); // 砍头留尾：报告/usage 在最末尾
         outputTruncated = true;
+      }
+      // 只在真的有新用量时判预算（同一个回合里的多个 chunk 不重复判）
+      const snap = usageTracker.snapshot();
+      if (snap.turns !== lastTurns) {
+        lastTurns = snap.turns;
+        void this.#checkBudget(taskId, input, snap.usage).catch(() => {});
       }
     });
 
@@ -852,6 +1056,13 @@ export class TaskEngine {
       });
     });
     if (timer) clearTimeout(timer);
+    // 硬门的时间兜底：孩子退出就撤掉定时器（没到点就不收尸）
+    const budgetTimer = this.#budgetTimers.get(taskId);
+    if (budgetTimer) clearTimeout(budgetTimer);
+    this.#budgetTimers.delete(taskId);
+    // 冲刷末尾的半行，让运行中用量与退出后的记账同数
+    usageTracker.finish();
+    const finalUsage = usageTracker.snapshot().usage;
     if (stallGuard) clearInterval(stallGuard);
     this.#steerClosed.add(taskId);
     this.#children.delete(taskId);
@@ -862,6 +1073,11 @@ export class TaskEngine {
     const parsed = parseChildStream(text);
     const finalText = parsed.text || text;
     const steerEvidence = evidence.finish();
+    // 预算回执的终值：已花的钱与 token 以观测为准（孩子自报的不算数）
+    if (input.usageBudget) {
+      const state = this.#budgetStates.get(taskId) ?? { hard: false };
+      await this.#attachBudget(taskId, input, finalUsage ?? parsed.observedUsageTotal, state);
+    }
 
     // 转向：运行中只记了 sent；退出时按真机事件证据补终态。
     // 先于 resolve-exit 写，终态记录和一次性宿主的结果都能看到。
@@ -927,8 +1143,6 @@ export class TaskEngine {
     // 终态落库后才还座位（先定终态，后还座位——顺序不能反）
     this.#notifyTerminal(result.record);
     this.#evictAndPurge("runtime");
-
-    return this.#resultFromRecord(taskId, input, result.record, finalText);
   }
 
   #resultFromRecord(
@@ -973,33 +1187,11 @@ export class TaskEngine {
       ...(record.blackboard ? { blackboard: record.blackboard } : {}),
       ...(record.steers ? { steers: record.steers } : {}),
       ...(record.reportStale ? { reportStale: true as const } : {}),
-    };
-  }
-
-  #notStartedResult(
-    taskId: string,
-    input: DispatchInput,
-    errorMessage: string,
-    status: "canceled" | "failed",
-  ): DispatchResult {
-    const record = this.#registry.get(taskId);
-    return {
-      status,
-      taskId,
-      text: "",
-      exitCode: -1,
-      started: false,
-      durationMs: 0,
-      errorMessage,
-      readOnlyTier: input.readOnly ?? "lenient",
-      outputPath: "",
-      whySuppressed: input.why ? !this.#whyEnabled() : undefined,
-      reportChannel: "none",
-      outputTruncated: false,
-      // 隔离的键只在开启时出现（默认关时 Object.keys 不变）
-      ...(input.isolation ? { isolation: input.isolation } : {}),
-      ...worktreeReceipt(record?.worktree),
-      ...(record?.blackboard ? { blackboard: record.blackboard } : {}),
+      // 预算与档位的键只在开启/解析过时出现（默认关时 Object.keys 不变）。
+      // 没跑起来（spawn 失败 / 排队被取消）就没有用量 ⇒ 不带预算回执。
+      ...(record.budget && startedAt > 0 ? { budget: record.budget } : {}),
+      ...(record.budgetExhausted && startedAt > 0 ? { budgetExhausted: true as const } : {}),
+      ...(record.thinking ? { thinking: record.thinking } : {}),
     };
   }
 

@@ -14,6 +14,9 @@
 //   · attachTuiSurface（204 行）：opts.owner 类型上无 null（?? 与 || 等价）；
 //     processStartMs 的 ps 失败兜底同上，非可达路径。
 //   其余变异点全部被杀（74 个里 14 个存活；runSteerCommand 13/13，见 mutator 输出）。
+//   · costHint（49 行）：**全部杀掉**（`?.` → `.`、`&&` → `||`、`> 0` → `>= 0`、
+//     `> 0` → `> 1`）——由「tui：行内带预算到点与档位降级提示」守：它同时覆盖
+//     「thinking 键不存在」（`?.` 那条）、「只降档没到点」与「什么都没发生」两种输入。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { TaskRegistry } from "../src/core/registry.ts";
@@ -104,6 +107,46 @@ test("tui：在飞与排队给出汇总行和逐条行", () => {
     rec({ id: "6666ffff", status: "queued", task: "一个" }),
   ];
   assert.equal(renderStatusText(oneEach, OWNER), "派单 在飞1 · 排队1");
+});
+
+test("tui：行内带预算到点与档位降级提示", () => {
+  const records = [
+    rec({
+      id: "1111aaaa",
+      status: "running",
+      task: "烧钱的活",
+      startedAt: 10,
+      budgetExhausted: true,
+      thinking: { requested: "high", effective: "low", adjusted: true, modelKnown: true },
+    }),
+    rec({
+      id: "2222bbbb",
+      status: "running",
+      task: "普通的活",
+      startedAt: 20,
+      thinking: { requested: "low", effective: "low", adjusted: false, modelKnown: true },
+    }),
+    // 只降了档、没到预算 ⇒ 只有一条提示（不许把两条都挂上）
+    rec({
+      id: "3333cccc",
+      status: "running",
+      task: "降过档的活",
+      startedAt: 30,
+      thinking: { requested: "medium", effective: "low", adjusted: true, modelKnown: true },
+    }),
+    // 压根没解析过档位（没给 thinkingLevel）⇒ thinking 键不存在
+    rec({ id: "4444dddd", status: "running", task: "没档位的活", startedAt: 40 }),
+  ];
+  const lines = renderWidgetLines(records, OWNER);
+  assert.ok(lines);
+  // 在飞按开始时刻升序
+  assert.match(lines[1]!, /#1111aaaa 在飞 烧钱的活｜预算到点｜档位 high→low/);
+  // 没到点、也没降档 ⇒ 不占位（提示只在真发生时出现）
+  assert.equal(lines[2], "#2222bbbb 在飞 普通的活");
+  // 只有档位提示 ⇒ 一条，不多不少
+  assert.equal(lines[3], "#3333cccc 在飞 降过档的活｜档位 medium→low");
+  // 没有 thinking 回执 ⇒ 不崩、不出提示
+  assert.equal(lines[4], "#4444dddd 在飞 没档位的活");
 });
 
 test("tui：任务描述取首行并截断", () => {

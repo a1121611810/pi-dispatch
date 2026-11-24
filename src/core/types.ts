@@ -111,6 +111,8 @@ export interface DispatchInput {
   isolation?: Isolation;
   /** 要不要开共享黑板。不给 = 不开。 */
   blackboard?: boolean;
+  /** 用量预算。不给 = 不设限（受理时钉死，排队期间改不动）。 */
+  usageBudget?: UsageBudget;
 }
 
 /** 安检不过时的理由。 */
@@ -137,6 +139,54 @@ export type ChildDelivery = {
   /** 畸形事件行数（不是合法事件的行）：好行照留，坏行计数 */
   malformed?: number;
 };
+
+/**
+ * 用量预算。软上限：用量在请求完成后才观测得到，越线的那一轮已经付过钱了。
+ * 两个上限都给时任一越线即到点（OR 语义）。
+ */
+export interface UsageBudget {
+  /** 累计成本上限（美元）。用孩子上报的 usage.cost.total 判。 */
+  maxUsd?: number;
+  /** 累计「处理过的 token」上限：input + output + cacheRead + cacheWrite。 */
+  maxTokens?: number;
+  /** 硬门相对软门的倍数（默认 2）。 */
+  hardFactor?: number;
+  /** 软门之后多久还没交付就硬收（毫秒，默认 120000）。 */
+  hardGraceMs?: number;
+}
+
+/** 预算回执：上限、已花、到点时刻。 */
+export interface BudgetReceipt {
+  maxUsd?: number;
+  maxTokens?: number;
+  /** 已观测到的累计成本（美元） */
+  spentUsd: number;
+  /** 已观测到的累计 token（含 cacheRead / cacheWrite） */
+  spentTokens: number;
+  /** 到点了（软门或硬门都算） */
+  exhausted?: true;
+  /** 软门触发时刻（毫秒） */
+  softAt?: number;
+  /** 软门没送达（没留痕目录 / 没装孩子扩展）——靠硬门兜底 */
+  softSteerFailed?: true;
+}
+
+/**
+ * 思考档位回执：父方要的档位与实际发给孩子的档位。
+ * `modelKnown: false` = 模型不在目录里 ⇒ 未校验、原样透传。
+ */
+export interface ThinkingReceipt {
+  /** 父方要的档位 */
+  requested?: string;
+  /** 实际发给孩子的档位（不发后缀 = undefined ⇒ 沿用会话默认） */
+  effective?: string;
+  /** 生效档位与请求档位不同（降级或 pi 口径的收档） */
+  adjusted: boolean;
+  /** 模型认出来了没有（false = 未校验） */
+  modelKnown: boolean;
+  /** 一句话说明：为什么是这个档 */
+  reason?: string;
+}
 
 /** 用量。子代理自报为空或零时，用主方观察到的顶上去。 */
 export interface ChildUsage {
@@ -219,6 +269,12 @@ export interface TaskRecord {
   steers?: SteerRecord[];
   /** 工具通道报告早于最后一次送达的转向——小窗资格失效 */
   reportStale?: true;
+  /** 预算回执（只在给了预算时出现——默认关时记录里不出现这个键） */
+  budget?: BudgetReceipt;
+  /** 预算到点（软门或硬门都算）——降级交付的旗标 */
+  budgetExhausted?: true;
+  /** 思考档位回执（只在解析过档位时出现） */
+  thinking?: ThinkingReceipt;
 }
 
 /** 派发的结果。长驻模式返回 handle，一次性模式返回完整结果。 */
@@ -263,6 +319,12 @@ export interface DispatchResult {
   steers?: SteerRecord[];
   /** 工具通道报告早于最后一次送达的转向 */
   reportStale?: true;
+  /** 预算回执（只在给了预算时带出） */
+  budget?: BudgetReceipt;
+  /** 预算到点（降级交付） */
+  budgetExhausted?: true;
+  /** 思考档位回执（只在解析过档位时带出） */
+  thinking?: ThinkingReceipt;
 }
 
 /** 转向受理结果。 */

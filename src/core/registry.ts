@@ -61,7 +61,13 @@ export type TaskCommand =
       steers: NonNullable<TaskRecord["steers"]>;
       reportStale?: boolean;
     }
-  | { kind: "attach-output"; id: string; outputPath: string; truncated?: boolean };
+  | { kind: "attach-output"; id: string; outputPath: string; truncated?: boolean }
+  | {
+      kind: "attach-budget";
+      id: string;
+      budget: NonNullable<TaskRecord["budget"]>;
+      exhausted?: boolean;
+    };
 
 export interface CommandResult {
   record: TaskRecord;
@@ -73,6 +79,7 @@ export interface CommandResult {
 type AttachWorktreeCommand = Extract<TaskCommand, { kind: "attach-worktree" }>;
 type AttachSteerCommand = Extract<TaskCommand, { kind: "attach-steer" }>;
 type ResolveExitCommand = Extract<TaskCommand, { kind: "resolve-exit" }>;
+type AttachBudgetCommand = Extract<TaskCommand, { kind: "attach-budget" }>;
 
 /**
  * worktree 回执：磁盘观测事实，不是生命周期——全状态可写（含终态），永不改 status。
@@ -84,6 +91,22 @@ export function applyAttachWorktree(
   command: AttachWorktreeCommand,
 ): CommandResult {
   const next: TaskRecord = { ...current, worktree: command.worktree };
+  return { record: next, fromStatus: current.status, changed: true };
+}
+
+/**
+ * 预算回执：全状态可写（含终态），永不改 status——它是观测事实，不是生命周期。
+ * 终态上的迟到写入是崩溃恢复对账，无害。
+ */
+export function applyAttachBudget(
+  current: TaskRecord,
+  command: AttachBudgetCommand,
+): CommandResult {
+  const next: TaskRecord = {
+    ...current,
+    budget: command.budget,
+    ...(command.exhausted ? { budgetExhausted: true as const } : {}),
+  };
   return { record: next, fromStatus: current.status, changed: true };
 }
 
@@ -272,6 +295,13 @@ export class TaskRegistry {
       case "attach-worktree": {
         const current = this.#require(command.id);
         const next = applyAttachWorktree(current, command);
+        this.#records.set(command.id, next.record);
+        this.#emit(next.record, current);
+        return next;
+      }
+      case "attach-budget": {
+        const current = this.#require(command.id);
+        const next = applyAttachBudget(current, command);
         this.#records.set(command.id, next.record);
         this.#emit(next.record, current);
         return next;

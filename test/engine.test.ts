@@ -9,6 +9,9 @@
 //   src/core/engine.ts 里 `this.#storage?.x` 的 `?.`——不是等价变异：没 storage 时
 //   `?.` 返回 undefined、`.` 抛 TypeError。由「引擎：没 storage 时 readOutput 返回
 //   undefined（不崩）」与「引擎：readArchivedRecord 没 storage 时返回 undefined」钉住。
+//   `this.#storage?.skippedRecords ?? 0` 的 `??` → `||`——无 storage 时左值 undefined、
+//   有 storage 时左值是 number（0 两向都得 0）⇒ 两向同值。左边那个 `?.` 不是等价变异，
+//   由「引擎：没 storage 时 skippedRecords 是 0（不崩、不编数）」钉住。
 //   shutdown 里 `this.#teardown = true` → false——派发在闸口就被 sessionEndingGate
 //   （读 #ending）拒掉，#teardown 是第二道防线；默认闸口下不可达 ⇒ 等价。
 //   exitDetail 的 `stderrTail.trim().split("\n").pop() ?? ""` → `||`——split 恒返回
@@ -47,6 +50,7 @@ import {
   childEnvFor,
   openBoardState,
   ownerIsActive,
+  prepareIsolationFor,
   ownerProvenDead,
   pinBaseCommit,
 } from "../src/core/engine.ts";
@@ -54,6 +58,8 @@ import { BlackboardStore } from "../src/core/blackboard.ts";
 import { TaskRegistry } from "../src/core/registry.ts";
 import { batchBySize, NotificationCenter } from "../src/core/notifications.ts";
 import { Storage, processStartMs } from "../src/core/storage.ts";
+import { BUDGET_STEER_TEXT } from "../src/core/budget.ts";
+import type { ThinkingModelInfo } from "../src/core/thinking.ts";
 import type { MachineReader, MachineSpec } from "../src/core/pool.ts";
 import type { ChildHandle } from "../src/core/child.ts";
 import type { Gate } from "../src/core/gates.ts";
@@ -102,8 +108,25 @@ function fakeSpawn(options: {
   };
 }
 
+/** 假 spawn 的捕获版：记下每次 argv，行为仍交给 fakeSpawn。 */
+function captureSpawn(options: Parameters<typeof fakeSpawn>[0]): {
+  argvs: string[][];
+  spawn: (argv: string[], env: NodeJS.ProcessEnv) => ChildHandle;
+} {
+  const argvs: string[][] = [];
+  const inner = fakeSpawn(options);
+  return {
+    argvs,
+    spawn: (argv, env) => {
+      argvs.push([...argv]);
+      return inner(argv, env);
+    },
+  };
+}
+
 function freshEngine(
   opts: {
+    registry?: TaskRegistry;
     machineReader?: MachineReader;
     spawn?: ReturnType<typeof fakeSpawn>;
     hostMode?: "long-lived" | "one-shot";
@@ -116,10 +139,12 @@ function freshEngine(
     repoRoot?: string;
     isGitRepo?: () => boolean;
     childExtensionPath?: string;
+    sessionModel?: () => string | undefined;
+    thinkingCatalog?: () => readonly ThinkingModelInfo[];
     now?: () => number;
   } = {},
 ) {
-  const registry = new TaskRegistry();
+  const registry = opts.registry ?? new TaskRegistry();
   const engine = new TaskEngine({
     registry,
     machineReader: opts.machineReader ?? machineReader(),
@@ -134,6 +159,8 @@ function freshEngine(
     repoRoot: opts.repoRoot,
     isGitRepo: opts.isGitRepo,
     childExtensionPath: opts.childExtensionPath,
+    sessionModel: opts.sessionModel,
+    thinkingCatalog: opts.thinkingCatalog,
     now: opts.now,
   });
   return { registry, engine };
@@ -1234,6 +1261,11 @@ test("引擎：readArchivedRecord 没 storage 时返回 undefined", async () => 
   assert.equal(await engine.readArchivedRecord("x"), undefined);
 });
 
+test("引擎：没 storage 时 skippedRecords 是 0（不崩、不编数）", () => {
+  const { engine } = freshEngine(); // storage: undefined
+  assert.equal(engine.skippedRecords, 0, "没留痕目录就没有跳过记录，别拿 1 顶");
+});
+
 test("引擎：readOutput 落到归档（热文件没了从压缩档读）", async () => {
   const root = mkdtempSync(join(tmpdir(), "dispatch-arch-"));
   const project = join(root, "proj");
@@ -1571,6 +1603,29 @@ test("引擎：退出码 -1 且没有 stderr ⇒ 死因写明「信号不明或�
     /exit code -1（信号不明或起不来）/,
     "起不来的 -1 不能和普通退出码 1 用同一句文案",
   );
+});
+
+test("引擎：stderr 末行正好 200 字不截（阈值是 > 200，不是 >=）", async () => {
+  // 边界差一格：200 字整还放得下，不该加省略号；201 字才截成「…+ 末 200 字」。
+  const exact = "z".repeat(200);
+  const atLimit = freshEngine({
+    spawn: fakeSpawn({ stdout: "x", exitCode: 1, stderr: exact }),
+    hostMode: "one-shot",
+  });
+  const atLimitMessage =
+    ((await atLimit.engine.dispatch({ task: "干活" })) as { errorMessage?: string }).errorMessage ??
+    "";
+  assert.equal(atLimitMessage, `exit code 1 — ${exact}`, "200 字整放得下，别加省略号");
+
+  const over = "z".repeat(201);
+  const oneMore = freshEngine({
+    spawn: fakeSpawn({ stdout: "x", exitCode: 1, stderr: over }),
+    hostMode: "one-shot",
+  });
+  const overMessage =
+    ((await oneMore.engine.dispatch({ task: "干活" })) as { errorMessage?: string }).errorMessage ??
+    "";
+  assert.equal(overMessage, `exit code 1 — …${"z".repeat(200)}`, "超一格才截，且截尾部");
 });
 
 test("引擎：超长 stderr 末行截的是尾部 200 字，不是从第 201 字起", async () => {
@@ -2441,6 +2496,46 @@ test("引擎：openBoardState——没留痕目录就算失败", () => {
   assert.match((result as { error: string }).error, /storage/);
 });
 
+test("引擎：openBoardState——建板抛错也算失败（不挂 error 冒充成功）", () => {
+  const root = mkdtempSync(join(tmpdir(), "dispatch-board-fail-"));
+  try {
+    const storage = new Storage(join(root, "dispatch"), join(root, "proj"));
+    mkdirSync(dirname(storage.blackboardsDir), { recursive: true });
+    // blackboards 位置被一个文件占了 ⇒ ensureOwner 的 mkdir 会抛 ENOTDIR
+    writeFileSync(storage.blackboardsDir, "占位");
+    const result = openBoardState(storage, { pid: process.pid, startMs: 1 }, "board-x");
+    assert.equal(result.ok, false, "开板失败就是失败，不能回 ok:true 却不带 board");
+    assert.match((result as { error: string }).error, /blackboard 开板失败/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("引擎：prepareIsolationFor——没记录 / 非隔离记录直接放行，不碰 git", async () => {
+  const { runner, calls } = fakeGit();
+  assert.deepEqual(
+    await prepareIsolationFor(runner, "/repo", undefined),
+    { ok: true },
+    "没有记录 ⇒ 放行（record?.isolation 不能当 record.isolation 解引用）",
+  );
+  const plain = { id: "t", status: "queued" as const, task: "x" };
+  assert.deepEqual(await prepareIsolationFor(runner, "/repo", plain), { ok: true });
+  assert.equal(calls.length, 0, "放行路径不该跑 git");
+});
+
+test("引擎：prepareIsolationFor——记录说开 worktree 但没基线 ⇒ 失败，不建盘", async () => {
+  const { runner, calls } = fakeGit();
+  const result = await prepareIsolationFor(runner, "/repo", {
+    id: "t",
+    status: "queued",
+    task: "x",
+    isolation: "worktree",
+  });
+  assert.equal(result.ok, false, "缺基线不能假成功（成功就会拿空 worktree 去 spawn）");
+  assert.match((result as { error: string }).error, /基线/);
+  assert.equal(calls.length, 0, "没基线就不该建盘");
+});
+
 test("引擎：boardIsActive——owner 双条件判活、关板/无 owner 判死、非终态引用判活", () => {
   const { storage } = isolationStorage();
   const boardId = "aaaaaaaa-2222-4333-8444-555555555555";
@@ -3002,4 +3097,488 @@ test("转向：孩子环境擦掉继承信箱，注入本任务路径", () => {
   assert.equal(env.PI_DISPATCH_STEER_FILE, "/new/steer.jsonl");
   const cleared = childEnvFor({ PI_DISPATCH_STEER_FILE: "/old/steer.jsonl" }, "t1");
   assert.equal(cleared.PI_DISPATCH_STEER_FILE, undefined);
+});
+
+// ── 引擎：用量预算（软门 / 硬门）与思考档位回执 ─────────────────────────
+
+/**
+ * 假 spawn：10ms 时喷一段 stdout，活到 exitAfterMs 再退出。
+ * 预算的软门要等 steer 落盘，是异步的 ⇒ 孩子必须活够，不能喷完就死。
+ * （集成测试：跑的是引擎真实的启动/退出时序，没有可注入的时钟。）
+ */
+function budgetSpawn(options: { stdout?: string; exitAfterMs?: number; exitCode?: number }): {
+  spawn: (argv: string[], env: NodeJS.ProcessEnv) => ChildHandle;
+  kills: NodeJS.Signals[];
+} {
+  const kills: NodeJS.Signals[] = [];
+  const spawn = (): ChildHandle => {
+    const outputListeners: Array<(chunk: string) => void> = [];
+    const exitListeners: Array<(code: number, stderr: string) => void> = [];
+    let finished = false;
+    const finish = (code: number): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      for (const l of exitListeners) l(code, "");
+    };
+    const timer = setTimeout(() => finish(options.exitCode ?? 0), options.exitAfterMs ?? 300);
+    setTimeout(() => {
+      if (finished) return;
+      const chunk = options.stdout ?? "";
+      if (chunk) for (const l of outputListeners) l(chunk);
+    }, 10);
+    return {
+      pid: 4242,
+      onOutput: (cb) => outputListeners.push(cb),
+      onExit: (cb) => {
+        exitListeners.push(cb);
+        if (finished) cb(options.exitCode ?? 0, "");
+      },
+      kill: (signal) => {
+        kills.push(signal);
+        finish(143);
+      },
+    };
+  };
+  return { spawn, kills };
+}
+
+/** 一条 assistant 的 message_end（可选正文 + 用量）。 */
+function usageLine(usage: Record<string, unknown>, text = "部分正文"): string {
+  return JSON.stringify({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text }], usage },
+  });
+}
+
+test("引擎：预算到点 ⇒ 降级交付（不 failed，回执标 budgetExhausted）", async () => {
+  const { storage, dir } = steerStorage();
+  const fake = budgetSpawn({
+    stdout: usageLine({ input: 10, output: 5, cacheRead: 100, cost: 0.0015 }) + "\n",
+    exitAfterMs: 300,
+  });
+  const { engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fake.spawn,
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活", usageBudget: { maxUsd: 0.001 } });
+  const result = outcome as {
+    status: string;
+    budgetExhausted?: boolean;
+    budget?: { exhausted?: boolean; spentUsd?: number };
+  };
+  assert.equal(result.status, "succeeded", "软门是降级交付，不是 failed");
+  assert.equal(result.budgetExhausted, true, "回执要标预算到点");
+  assert.equal(result.budget?.exhausted, true);
+  assert.equal(result.budget?.spentUsd, 0.0015);
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("引擎：预算到点 ⇒ 给孩子写一条收尾转向（软门，收据里看得见）", async () => {
+  const { storage, dir } = steerStorage();
+  const fake = budgetSpawn({
+    stdout: usageLine({ input: 10, output: 5, cost: 0.0015 }) + "\n",
+    exitAfterMs: 300,
+  });
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fake.spawn,
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活", usageBudget: { maxUsd: 0.001 } });
+  const started = outcome as { taskId: string };
+  const steers = registry.get(started.taskId)?.steers ?? [];
+  assert.equal(steers.length, 1, "软门插过一句话");
+  assert.equal(steers[0]!.text, BUDGET_STEER_TEXT);
+  assert.match(readFileSync(storage.steerPath(started.taskId), "utf8"), /预算到点/);
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+
+  // 没有转向通道 ⇒ 软门写不进去：回执明说「软门未送达」，靠硬门兜底
+  const noStorage = budgetSpawn({
+    stdout: usageLine({ input: 10, output: 5, cost: 0.0015 }) + "\n",
+    exitAfterMs: 300,
+  });
+  const second = freshEngine({ spawn: noStorage.spawn, hostMode: "one-shot" });
+  const out = await second.engine.dispatch({ task: "干活", usageBudget: { maxUsd: 0.001 } });
+  const undelivered = out as { budget?: { softSteerFailed?: boolean } };
+  assert.equal(undelivered.budget?.softSteerFailed, true, "软门写不进去要说出来");
+  await second.engine.shutdown();
+});
+
+test("引擎：硬门 ⇒ 收掉孩子（SIGTERM），部分正文照交", async () => {
+  const fake = budgetSpawn({
+    stdout: usageLine({ input: 10, output: 5, cost: 0.01 }, "半截正文") + "\n",
+    exitAfterMs: 5000,
+  });
+  const { engine } = freshEngine({ spawn: fake.spawn, hostMode: "one-shot" });
+  const outcome = await engine.dispatch({ task: "干活", usageBudget: { maxUsd: 0.001 } });
+  const result = outcome as { status: string; text: string; budgetExhausted?: boolean };
+  assert.equal(result.status, "canceled", "硬收不许装成 succeeded");
+  assert.equal(result.budgetExhausted, true);
+  assert.match(result.text, /半截正文/, "部分正文照交");
+  assert.deepEqual(fake.kills, ["SIGTERM"]);
+  await engine.shutdown();
+});
+
+test("引擎：软门后宽限期到点 ⇒ 收掉孩子（没有新用量也收）", async () => {
+  const fake = budgetSpawn({
+    stdout: usageLine({ input: 10, output: 5, cost: 0.0015 }) + "\n",
+    exitAfterMs: 500,
+  });
+  const { engine } = freshEngine({ spawn: fake.spawn, hostMode: "one-shot" });
+  const outcome = await engine.dispatch({
+    task: "干活",
+    usageBudget: { maxUsd: 0.001, hardGraceMs: 30 },
+  });
+  const result = outcome as { status: string; budgetExhausted?: boolean };
+  assert.equal(result.status, "canceled", "宽限期到点是被收掉，不是 succeeded");
+  assert.equal(result.budgetExhausted, true);
+  assert.deepEqual(fake.kills, ["SIGTERM"], "没有新用量也要靠定时器收尸");
+  await engine.shutdown();
+});
+
+test("引擎：软门转向卡住时，宽限定时器仍会收掉孩子（arm 在 await 之前）", async () => {
+  const { storage, dir } = steerStorage();
+  const registry = new TaskRegistry();
+  const submit = registry.submit.bind(registry);
+  registry.submit = async (command) => {
+    if (command.kind === "attach-steer") {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    return submit(command);
+  };
+  const fake = budgetSpawn({
+    stdout: usageLine({ input: 10, output: 5, cost: 0.0015 }) + "\n",
+    exitAfterMs: 100,
+  });
+  const { engine } = freshEngine({
+    registry,
+    storage,
+    childExtensionPath: "x",
+    spawn: fake.spawn,
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({
+    task: "干活",
+    usageBudget: { maxUsd: 0.001, hardGraceMs: 30 },
+  });
+  const result = outcome as { status: string };
+  assert.equal(result.status, "canceled");
+  assert.deepEqual(fake.kills, ["SIGTERM"], "steer 卡住不许拖死硬门兜底");
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("引擎：预算记账失败也要收掉孩子（硬门不依赖回执）", async () => {
+  const registry = new TaskRegistry();
+  const submit = registry.submit.bind(registry);
+  registry.submit = async (command) => {
+    if (command.kind === "attach-budget") throw new Error("disk full");
+    return submit(command);
+  };
+  const fake = budgetSpawn({
+    stdout: usageLine({ input: 10, output: 5, cost: 0.01 }) + "\n",
+    exitAfterMs: 5000,
+  });
+  let unhandled = 0;
+  const onUnhandled = (): void => {
+    unhandled += 1;
+  };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const { engine } = freshEngine({
+      registry,
+      spawn: fake.spawn,
+      hostMode: "one-shot",
+    });
+    const outcome = await engine.dispatch({ task: "干活", usageBudget: { maxUsd: 0.001 } });
+    const result = outcome as { status: string };
+    assert.equal(result.status, "canceled");
+    assert.deepEqual(fake.kills, ["SIGTERM"], "记账失败也必须收掉孩子");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(unhandled, 0, "预算检查的异常不许冒成未处理拒绝");
+    await engine.shutdown();
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+test("引擎：没给预算 ⇒ 不写转向也不收尸", async () => {
+  const { storage, dir } = steerStorage();
+  const fake = budgetSpawn({
+    stdout: usageLine({ input: 999, output: 999, cost: 99 }) + "\n",
+    exitAfterMs: 150,
+  });
+  const { registry, engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fake.spawn,
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活" });
+  const started = outcome as { taskId: string; status: string };
+  assert.equal(started.status, "succeeded");
+  assert.deepEqual(fake.kills, [], "没预算不许收尸");
+  assert.equal(registry.get(started.taskId)?.steers, undefined, "没预算不许写转向");
+  assert.equal(existsSync(storage.steerPath(started.taskId)), false);
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("引擎：预算回执带上限、已花的钱与 token", async () => {
+  const fake = budgetSpawn({
+    stdout: usageLine({ input: 10, output: 5, cacheRead: 100, cacheWrite: 7, cost: 0.002 }) + "\n",
+    exitAfterMs: 150,
+  });
+  const { engine } = freshEngine({ spawn: fake.spawn, hostMode: "one-shot" });
+  const outcome = await engine.dispatch({
+    task: "干活",
+    usageBudget: { maxUsd: 1, maxTokens: 1000 },
+  });
+  const result = outcome as { budget?: unknown };
+  assert.deepEqual(result.budget, {
+    maxUsd: 1,
+    maxTokens: 1000,
+    spentUsd: 0.002,
+    spentTokens: 122,
+  });
+  await engine.shutdown();
+});
+
+/** 本机 vendor-local 的真实档位图：medium / minimal / xhigh 是显式 null。 */
+const MAGPIE: ThinkingModelInfo = {
+  provider: "vendor-local",
+  id: "regex:group/main",
+  reasoning: true,
+  thinkingLevelMap: {
+    high: "high",
+    low: "low",
+    max: "max",
+    medium: null,
+    minimal: null,
+    off: "none",
+    xhigh: null,
+  },
+};
+
+/** 非思考模型：请求任何档位都只能落 off，argv 不拼后缀。 */
+const PLAIN: ThinkingModelInfo = {
+  provider: "acme",
+  id: "plain",
+  reasoning: false,
+};
+
+test("引擎：thinking 降级写进回执（requested/effective/reason）", async () => {
+  const { engine } = freshEngine({
+    spawn: fakeSpawn({}),
+    hostMode: "one-shot",
+    thinkingCatalog: () => [MAGPIE],
+  });
+  const outcome = await engine.dispatch({
+    task: "干活",
+    model: "regex:test-vendor/group/main",
+    thinkingLevel: "medium",
+  });
+  const result = outcome as {
+    thinking?: {
+      requested?: string;
+      effective?: string;
+      adjusted?: boolean;
+      modelKnown?: boolean;
+      reason?: string;
+    };
+  };
+  assert.equal(result.thinking?.requested, "medium");
+  assert.equal(result.thinking?.effective, "low", "vendor-local 没有 medium ⇒ 降到 low");
+  assert.equal(result.thinking?.adjusted, true);
+  assert.equal(result.thinking?.modelKnown, true);
+  assert.match(result.thinking?.reason ?? "", /medium/);
+});
+
+test("引擎：thinking 降级进 argv（medium ⇒ --model regex:test-vendor/group/main:low）", async () => {
+  const capture = captureSpawn({});
+  const { engine } = freshEngine({
+    spawn: capture.spawn,
+    hostMode: "one-shot",
+    thinkingCatalog: () => [MAGPIE],
+  });
+  const outcome = await engine.dispatch({
+    task: "干活",
+    model: "regex:test-vendor/group/main",
+    thinkingLevel: "medium",
+  });
+  assert.equal((outcome as { status: string }).status, "succeeded");
+  assert.equal(capture.argvs.length, 1);
+  const argv = capture.argvs[0]!;
+  assert.equal(
+    argv[argv.indexOf("--model") + 1],
+    "regex:test-vendor/group/main:low",
+    "argv 用的是校验后的档位，不是请求的 medium",
+  );
+  await engine.shutdown();
+});
+
+test("引擎：不给档位 ⇒ argv 不带档位后缀", async () => {
+  const capture = captureSpawn({});
+  const { engine } = freshEngine({
+    spawn: capture.spawn,
+    hostMode: "one-shot",
+    thinkingCatalog: () => [MAGPIE],
+  });
+  await engine.dispatch({ task: "干活", model: "regex:test-vendor/group/main" });
+  const argv = capture.argvs[0]!;
+  assert.equal(argv[argv.indexOf("--model") + 1], "regex:test-vendor/group/main");
+  await engine.shutdown();
+});
+
+test("引擎：非思考模型 ⇒ argv 不带档位后缀（off）", async () => {
+  const capture = captureSpawn({});
+  const { engine } = freshEngine({
+    spawn: capture.spawn,
+    hostMode: "one-shot",
+    thinkingCatalog: () => [PLAIN],
+  });
+  const outcome = await engine.dispatch({
+    task: "干活",
+    model: "acme/plain",
+    thinkingLevel: "high",
+  });
+  assert.equal((outcome as { thinking?: { effective?: string } }).thinking?.effective, "off");
+  const argv = capture.argvs[0]!;
+  assert.equal(argv[argv.indexOf("--model") + 1], "acme/plain", "非思考模型不拼 :off");
+  await engine.shutdown();
+});
+
+test("引擎：受理时钉死模型（排队期间会话模型变了也不换）", async () => {
+  const oneSeat = Math.floor(2.4 * GiB) + 512 * MiB + 100 * MiB;
+  let sessionModel = "regex:test-vendor/group/main";
+  const capture = captureSpawn({ delayMs: 250 });
+  const { registry, engine } = freshEngine({
+    machineReader: machineReader(oneSeat),
+    spawn: capture.spawn,
+    hostMode: "long-lived",
+    sessionModel: () => sessionModel,
+    thinkingCatalog: () => [MAGPIE],
+  });
+  const first = (await engine.dispatch({ task: "占座" })) as { taskId: string };
+  await waitForStatus(registry, first.taskId, "running");
+  const second = (await engine.dispatch({ task: "排队", thinkingLevel: "medium" })) as {
+    taskId: string;
+  };
+  assert.equal(registry.get(second.taskId)?.status, "queued", "第二单在排队");
+  sessionModel = "other/model";
+  await waitFor(registry, second.taskId, 5000);
+  assert.equal(capture.argvs.length, 2);
+  const argv = capture.argvs[1]!;
+  assert.equal(
+    argv[argv.indexOf("--model") + 1],
+    "regex:test-vendor/group/main:low",
+    "spawn 用受理时钉死的模型，不读排队期间变过的会话模型",
+  );
+  await engine.shutdown();
+});
+
+test("引擎：没交报告时预算照样判（账上也有数）", async () => {
+  const { storage, dir } = steerStorage();
+  const fake = budgetSpawn({
+    stdout: usageLine({ input: 10, output: 5, cacheRead: 100, cost: 0.0015 }, "只有正文") + "\n",
+    exitAfterMs: 300,
+  });
+  const { engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fake.spawn,
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活", usageBudget: { maxUsd: 0.001 } });
+  const result = outcome as {
+    reportChannel: string;
+    budgetExhausted?: boolean;
+    budget?: { spentUsd?: number; spentTokens?: number };
+  };
+  assert.equal(result.reportChannel, "none", "没交报告");
+  assert.equal(result.budgetExhausted, true, "预算照判");
+  assert.equal(result.budget?.spentUsd, 0.0015, "账照记");
+  assert.equal(result.budget?.spentTokens, 115);
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("引擎：孩子没起来 ⇒ 不带 budget 字段", async () => {
+  const { engine } = freshEngine({
+    spawn: () => {
+      throw new Error("boom");
+    },
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活", usageBudget: { maxUsd: 1 } });
+  const result = outcome as unknown as Record<string, unknown> & { status: string };
+  assert.equal(result.status, "failed");
+  assert.equal("budget" in result, false, "没跑起来就没有预算回执");
+  assert.equal("budgetExhausted" in result, false);
+  await engine.shutdown();
+});
+
+test("引擎：受理时钉死预算（排队期间改参数不生效）", async () => {
+  // 一座：第一个占住，第二个排队；排队期间调用方改上限
+  const oneSeat = Math.floor(2.4 * GiB) + 512 * MiB + 100 * MiB;
+  const fake = budgetSpawn({
+    stdout: usageLine({ input: 10, output: 5, cost: 0.002 }) + "\n",
+    exitAfterMs: 250,
+  });
+  const { registry, engine } = freshEngine({
+    machineReader: machineReader(oneSeat),
+    spawn: fake.spawn,
+    hostMode: "long-lived",
+  });
+  const first = await engine.dispatch({ task: "占座" });
+  const live = { maxUsd: 1 };
+  const queued = await engine.dispatch({ task: "排队", usageBudget: live });
+  const second = queued as { taskId: string };
+  assert.equal(registry.get(second.taskId)?.status, "queued", "第二单在排队");
+  live.maxUsd = 0.0001; // 若读的是活对象，这单会立刻到点
+  await waitFor(registry, second.taskId, 5000);
+  const record = registry.get(second.taskId)!;
+  assert.equal(record.budget?.maxUsd, 1, "受理时的上限钉死");
+  assert.equal(record.budgetExhausted, undefined, "改小的上限不生效");
+  await first;
+  await engine.shutdown();
+});
+
+test("引擎：软门后孩子交了差 ⇒ 报告旗标与预算旗标不互相掩盖", async () => {
+  const reportText = [
+    "正文。",
+    "```json",
+    '{ "summary": "交了", "why": "边界", "assessment": "有风险：缓存可能不命中" }',
+    "```",
+  ].join("\n");
+  const fake = budgetSpawn({
+    stdout: usageLine({ input: 10, output: 5, cost: 0.0015 }, reportText) + "\n",
+    exitAfterMs: 300,
+  });
+  const { storage, dir } = steerStorage();
+  const { engine } = freshEngine({
+    storage,
+    childExtensionPath: "x",
+    spawn: fake.spawn,
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活", usageBudget: { maxUsd: 0.001 } });
+  const result = outcome as {
+    status: string;
+    reportChannel: string;
+    report?: { summary?: string };
+    budgetExhausted?: boolean;
+  };
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.reportChannel, "prompt-json", "报告旗标照常记");
+  assert.equal(result.report?.summary, "交了");
+  assert.equal(result.budgetExhausted, true, "预算旗标独立");
+  await engine.shutdown();
+  rmSync(dir, { recursive: true, force: true });
 });

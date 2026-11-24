@@ -1,4 +1,5 @@
 import type { TaskRegistry } from "./registry.ts";
+import type { ThinkingReceipt } from "./types.ts";
 import { tallySteers, type SteerTally } from "./steer.ts";
 
 // 通知：后台任务完成的消息按批发给父方。
@@ -16,6 +17,10 @@ export interface TaskNotification {
   reportStale?: true;
   /** 转向收据计数（只在任务真的被转向过时出现） */
   steers?: SteerTally;
+  /** 预算到点（降级交付） */
+  budgetExhausted?: true;
+  /** 思考档位回执（只在解析过档位时出现） */
+  thinking?: ThinkingReceipt;
 }
 
 export const NOTIFICATION_BATCH_MAX_BYTES = 100 * 1024;
@@ -59,6 +64,8 @@ export class NotificationCenter {
         ...(next.verifyUnverified ? { verifyUnverified: true } : {}),
         ...(next.reportStale ? { reportStale: true as const } : {}),
         ...(next.steers && next.steers.length > 0 ? { steers: tallySteers(next.steers) } : {}),
+        ...(next.budgetExhausted ? { budgetExhausted: true as const } : {}),
+        ...(next.thinking ? { thinking: next.thinking } : {}),
       });
     });
   }

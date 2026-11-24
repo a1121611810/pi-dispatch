@@ -42,6 +42,18 @@ function snippet(task: string): string {
   return first.length > SNIPPET_MAX_CHARS ? `${first.slice(0, SNIPPET_MAX_CHARS)}…` : first;
 }
 
+/**
+ * 行内成本提示：预算到点 / 档位降级。
+ * 没有就不占位——面板行宽有限，提示只在真发生时出现。
+ */
+function costHint(record: TaskRecord): string {
+  const hints: string[] = [];
+  if (record.budgetExhausted) hints.push("预算到点");
+  if (record.thinking?.adjusted && record.thinking.requested && record.thinking.effective)
+    hints.push(`档位 ${record.thinking.requested}→${record.thinking.effective}`);
+  return hints.length > 0 ? `｜${hints.join("｜")}` : "";
+}
+
 /** 汇总行：在飞（含收队中）/排队 + 本会话终态四计数。 */
 function summaryLine(records: readonly TaskRecord[]): string {
   const flying = count(records, "running") + count(records, "stopping");
@@ -66,7 +78,8 @@ export function renderWidgetLines(
   if (active.length + queued.length === 0) return undefined;
   const byAge = (a: TaskRecord, b: TaskRecord): number => (a.startedAt ?? 0) - (b.startedAt ?? 0);
   const lines = [...active.sort(byAge), ...queued].map(
-    (r) => `#${r.id.slice(0, 8)} ${ACTIVE_TEXT[r.status] ?? r.status} ${snippet(r.task)}`,
+    (r) =>
+      `#${r.id.slice(0, 8)} ${ACTIVE_TEXT[r.status] ?? r.status} ${snippet(r.task)}${costHint(r)}`,
   );
   const budget = WIDGET_MAX_LINES - 1; // 汇总行占 1
   if (lines.length > budget) {

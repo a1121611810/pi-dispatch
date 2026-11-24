@@ -1,4 +1,11 @@
-import { hasC0, type DispatchInput, type ReadOnlyTier, type TaskRejection } from "./types.ts";
+import {
+  hasC0,
+  type DispatchInput,
+  type ReadOnlyTier,
+  type TaskRejection,
+  type UsageBudget,
+} from "./types.ts";
+import { buildUserMessage } from "./child.ts";
 
 // 安检：纯函数。给输入，只回答「过」或「不过加理由」。
 // 它不碰记录、不碰座位、不碰子代理——被拒了不留任何痕迹。
@@ -183,7 +190,74 @@ export function defaultGates(deps: {
     allowScriptsGate,
     textFieldsGate,
     projectContextGate,
+    usageBudgetGate,
+    messageBytesGate,
   ];
 }
 
 export type { ReadOnlyTier };
+
+/**
+ * 12 · usageBudget 的上限合法吗。
+ * 至少要给一个上限（两个都没给 = 没设预算，不如不设）。
+ * 上限必须是正的有限数——错值方向是「多花钱」，不 coerce。
+ * hardFactor 必须是 ≥ 1 的有限数（<1 会让硬门早于软门）。
+ * = 1 是合法值：硬门与软门同线、硬门先判 ⇒ 到点直接收掉（跳过降级交付）。
+ * hardGraceMs 必须是正的有限数，且不超过 Node 定时器上限——超了会被夹成 1ms，
+ * 变成「软门后立刻收尸」，不是「等很久」。
+ */
+export const usageBudgetGate: Gate = (input) => {
+  const raw = input.usageBudget as unknown;
+  if (raw === undefined) return null;
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw))
+    return rejection(`invalid usageBudget: ${String(raw)}（必须是对象）`);
+  const budget = raw as UsageBudget;
+  if (budget.maxUsd === undefined && budget.maxTokens === undefined)
+    return rejection("usageBudget 至少要给一个上限（maxUsd / maxTokens）");
+  if (budget.maxUsd !== undefined && (!Number.isFinite(budget.maxUsd) || budget.maxUsd <= 0))
+    return rejection(`invalid usageBudget.maxUsd: ${String(budget.maxUsd)}（必须是正的有限数）`);
+  if (
+    budget.maxTokens !== undefined &&
+    (!Number.isFinite(budget.maxTokens) || budget.maxTokens <= 0)
+  )
+    return rejection(
+      `invalid usageBudget.maxTokens: ${String(budget.maxTokens)}（必须是正的有限数）`,
+    );
+  if (
+    budget.hardFactor !== undefined &&
+    (!Number.isFinite(budget.hardFactor) || budget.hardFactor < 1)
+  )
+    return rejection(
+      `invalid usageBudget.hardFactor: ${String(budget.hardFactor)}（必须是 ≥ 1 的有限数，否则硬门早于软门）`,
+    );
+  if (
+    budget.hardGraceMs !== undefined &&
+    (!Number.isFinite(budget.hardGraceMs) ||
+      budget.hardGraceMs <= 0 ||
+      budget.hardGraceMs > MAX_TIMEOUT_MS)
+  )
+    return rejection(
+      `invalid usageBudget.hardGraceMs: ${String(budget.hardGraceMs)}（必须是 1..${MAX_TIMEOUT_MS} 的有限数）`,
+    );
+  return null;
+};
+
+/**
+ * 13 · user message 的体积与首字符合法吗。
+ * 任务与理由现在合并进**同一个 argv 参数**：两个各 ≤64 KiB 合并后可能撞上 Linux 的
+ * MAX_ARG_STRLEN（128 KiB）⇒ spawn 抛 E2BIG ⇒ 记 failed 而不是 rejected ⇒ 必须在闸上拦。
+ * 首字符是 @ 的位置参数被 pi 当文件路径读（正文被丢弃）——message 的首字符恒等于 task 的首字符，
+ * 这里再钉一道，防止将来有人在 task 前加前缀。
+ */
+export const messageBytesGate: Gate = (input) => {
+  const message = buildUserMessage({
+    task: input.task,
+    why: input.why,
+    isolation: input.isolation,
+  });
+  if (message.startsWith("@"))
+    return rejection("user message 不能以 @ 开头：pi 会把它当文件读，正文被丢弃");
+  if (Buffer.byteLength(message, "utf8") > MAX_TEXT_BYTES)
+    return rejection(`user message 超过 ${MAX_TEXT_BYTES} 字节上限（argv 装不下）`);
+  return null;
+};
