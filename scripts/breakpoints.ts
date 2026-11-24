@@ -54,6 +54,36 @@ export type Breakpoint = {
 //   不自动 merge / 不代提交 / 不建消息队列 / 不按孩子数判黑板 / 无跨会话板 —— 缺席类：
 //     没有对应代码路径可改，单行破坏点写不出来。各自靠单测/契约守——孩子契约要求
 //     交付前自行 commit（不代提交、不 merge）、openBoard 不看孩子数、blackboardView 拒别家板号。
+//
+// 成本控制（本轮）：
+//   ① 硬门走 stop（SIGTERM → SIGKILL）—— 已落破坏点：把硬门分支的 stop 换成空操作，
+//      由「引擎：硬门 ⇒ 收掉孩子（SIGTERM），部分正文照交」守。
+//   ② 预算判定与报告通道解耦（reportChannel=none 时预算照判）—— 已落破坏点：关掉
+//      运行中的用量检查，由「引擎：没交报告时预算照样判（账上也有数）」守。
+//   ③ 孩子没起来 ⇒ 不带 budget 字段 —— 已落破坏点：去掉 startedAt > 0 条件，
+//      由「引擎：孩子没起来 ⇒ 不带 budget 字段」守。
+//   ④ 受理时钉死预算（排队期间改参数不生效）—— 已落破坏点：改成共享原对象，
+//      由「引擎：受理时钉死预算（排队期间改参数不生效）」守。
+//   ⑤ 报告旗标与预算旗标不互相掩盖 —— 已落破坏点：把预算旗标改成只在没报告时出现，
+//      由「引擎：软门后孩子交了差 ⇒ 报告旗标与预算旗标不互相掩盖」守。
+//   ⑥ 跨子代理缓存共享 —— 外部类：收益在 provider 侧（缓存键 / TTL / 会话亲和），
+//      本仓没有可改代码；仓内只守「前缀逐字节恒定」（BP-9 / BP-48 / BP-49）。
+//   ⑦ 虚拟模型的 thinking 档位（路由后）—— 外部类：档位由 provider 路由决定，
+//      本仓不可测；走 test:mode 真机验证。
+//   ⑧ user message 顺序（任务 → why → 隔离契约）—— 已落破坏点：交换数组元素，
+//      由「拼命令：user message 的顺序是 任务 → why → 隔离契约」守。
+//      硬门先于软门仍由 BP-22 守（纯「先判哪个」的另一种写法杀不出差别）。
+//   ⑨ 黑板消息从不进提示词 / 报告契约文本一字不改 —— 结构类：没有那段拼提示词的代码。
+//      由 test/child.test.ts 既有附加块 golden 与「报告契约：三段分工 + 反话钉 + why 条件句」守。
+//   ⑩ provider 侧的预热经济性判定 —— 外部类：只有 pi 算「划不划算」，本仓只负责说不说 stop。
+//      由「成本：depth>0 的孩子关掉 cache 预热（action=stop）」守。
+//   ⑪ 不给子代理写 .pi/settings.json —— 结构类：没有写文件这条路径；预热改由
+//      cache_warming_decision 钩子返回 stop 关闭，不落任何 settings 文件。
+//
+// BP-20 的矩阵把「硬收过就一直硬门」写到引擎的 `hard: state.hard` 入参；但引擎可达状态下
+// 一旦进过硬门，hardByUsd / hardByTokens / hardByTime 仍恒为真（累计用量不回退、宽限时刻
+// 已过），把 `hard: state.hard` 改成 `hard: false` 杀不出差别 ⇒ 引擎侧是等价变异。
+// 可杀的语义在 budget.ts 的 `if (input.hard)`，由「预算：已经硬收过就一直是硬门」守。
 
 const CASES: Breakpoint[] = [
   // ── 安检 ────────────────────────────────────────────────────────────────
@@ -691,6 +721,15 @@ const CASES: Breakpoint[] = [
     why: "池子按固定值算，机器变挤了也不收紧",
   },
   {
+    feature: "显式 undefined 落回默认（只丢 undefined）",
+    file: "src/core/engine.ts",
+    from: "    Object.entries(source).filter(([, value]) => value !== undefined),",
+    to: "    Object.entries(source).filter(([, value]) => value === undefined),",
+    test: "test/engine-defined-only.test.ts",
+    red: "引擎：definedOnly 放行非 undefined 的注入（显式 undefined 才落回默认）",
+    why: "反向变异把非 undefined 的注入全滤掉：注入的 machineReader 被丢，引擎改用系统读数；而显式 undefined 被当场保留，读机器时 TypeError",
+  },
+  {
     feature: "交付核对·双向后缀",
     file: "src/core/child.ts",
     from: "  return claim === path || path.endsWith(`/${claim}`) || claim.endsWith(`/${path}`);",
@@ -1227,6 +1266,19 @@ const CASES: Breakpoint[] = [
     red: "tui：全部终态即清",
     why: "任务全终态后面板残留不消，一直占着编辑器上方",
   },
+  {
+    feature: "TUI 行内带预算到点与档位降级提示",
+    file: "src/tui.ts",
+    from:
+      "    (r) =>\n" +
+      "      `#${r.id.slice(0, 8)} ${ACTIVE_TEXT[r.status] ?? r.status} ${snippet(r.task)}${costHint(r)}`,",
+    to:
+      "    (r) =>\n" +
+      "      `#${r.id.slice(0, 8)} ${ACTIVE_TEXT[r.status] ?? r.status} ${snippet(r.task)}`,",
+    test: "test/tui.test.ts",
+    red: "tui：行内带预算到点与档位降级提示",
+    why: "面板上看不出哪一单超了预算、哪一单被降了档——父方只能翻 dispatch_list",
+  },
   // ── TUI 人转向 ────────────────────────────────────────────────────────────
   {
     feature: "TUI 转向选项从 1 编号",
@@ -1591,8 +1643,19 @@ const CASES: Breakpoint[] = [
   {
     feature: "启动名额只归还一次",
     file: "src/core/engine.ts",
-    from: '        return this.#notStartedResult(taskId, input, "等启动名额时被叫停", "canceled");',
-    to: '        this.#releaseLaunchSlot();\n        return this.#notStartedResult(taskId, input, "等启动名额时被叫停", "canceled");',
+    from:
+      '            detail: "等启动名额时被叫停",\n' +
+      "          })\n" +
+      "          .catch(() => undefined);\n" +
+      "        if (r) this.#notifyTerminal(r.record);\n" +
+      "        return;",
+    to:
+      '            detail: "等启动名额时被叫停",\n' +
+      "          })\n" +
+      "          .catch(() => undefined);\n" +
+      "        if (r) this.#notifyTerminal(r.record);\n" +
+      "        this.#releaseLaunchSlot();\n" +
+      "        return;",
     test: "test/engine.test.ts",
     red: "引擎：叫停等名额的任务只归还一次名额（之后启动仍受节流）",
     why: "叫停分支与 finally 各还一次 ⇒ #starting 变负，启动节流超发",
@@ -2279,6 +2342,725 @@ const CASES: Breakpoint[] = [
     test: "test/engine.test.ts",
     red: "通知：reportStale 只在 true 时出现，false 不留键",
     why: "父方看不到「报告早于最后一次转向」，把旧报告当最终结论",
+  },
+  // ── 成本控制：预算（§2.1） ──────────────────────────────────────────────
+  {
+    feature: "预算到点进软门（两个上限任一越线，OR 语义）",
+    file: "src/core/budget.ts",
+    from: "  if (overUsd || overTokens) {",
+    to: "  if (overUsd && overTokens) {",
+    test: "test/budget.test.ts",
+    red: "预算：两个上限都给了 ⇒ 任一越线即到点",
+    why: "只给了一个上限越线时预算不触发，超支没人管",
+  },
+  {
+    feature: "硬门倍数生效（evaluateBudget）",
+    file: "src/core/budget.ts",
+    from: "  const factor = budget.hardFactor ?? DEFAULT_HARD_FACTOR;",
+    to: "  const factor = budget.hardFactor ?? DEFAULT_HARD_FACTOR * 2;",
+    test: "test/budget.test.ts",
+    red: "预算：超过硬门倍数 ⇒ 进硬门",
+    why: "硬门要到 4 倍才触发，超支上界翻倍",
+  },
+  {
+    feature: "软门后宽限期到点进硬门（evaluateBudget）",
+    file: "src/core/budget.ts",
+    from: "  const hardByTime = input.softAt !== undefined && input.now - input.softAt >= grace;",
+    to: "  const hardByTime = input.softAt !== undefined && input.now - input.softAt > grace;",
+    test: "test/budget.test.ts",
+    red: "预算：软门后超过宽限期 ⇒ 进硬门（不靠新用量）",
+    why: "宽限期恰好到点时不收尸，孩子卡在长工具里永远不结束",
+  },
+  {
+    feature: "token 口径含 cacheRead（totalTokens）",
+    file: "src/core/budget.ts",
+    from: "(usage.cacheRead ?? 0)",
+    to: "(0)",
+    test: "test/budget.test.ts",
+    red: "预算：token 口径含 cacheRead（缓存型子代理的账不失真）",
+    why: "缓存型子代理在账上几乎不花钱，预算形同虚设",
+  },
+  {
+    feature: "token 口径含 cacheWrite（totalTokens）",
+    file: "src/core/budget.ts",
+    from: "(usage.cacheWrite ?? 0)",
+    to: "(0)",
+    test: "test/budget.test.ts",
+    red: "预算：token 口径含 cacheWrite",
+    why: "写缓存的量漏出账本",
+  },
+  {
+    feature: "没有 cost 时按 0 算（usdOf）",
+    file: "src/core/budget.ts",
+    from: "  return usage.cost ?? 0;",
+    to: "  return usage.cost ?? 1;",
+    test: "test/budget.test.ts",
+    red: "预算：美元口径取累计 cost（没有 cost 时按 0 算）",
+    why: "provider 不上报 cost 时凭空记 1 美元，美元上限立刻误触发",
+  },
+  {
+    feature: "到点判定用 >= 不是 >（evaluateBudget）",
+    file: "src/core/budget.ts",
+    from: "  const overUsd = budget.maxUsd !== undefined && input.spentUsd >= budget.maxUsd;",
+    to: "  const overUsd = budget.maxUsd !== undefined && input.spentUsd > budget.maxUsd;",
+    test: "test/budget.test.ts",
+    red: "预算：恰好等于上限 ⇒ 进软门（>= 不是 >）",
+    why: "恰好花到上限时不触发，再多花一轮才管",
+  },
+  {
+    feature: "低于上限不动（evaluateBudget）",
+    file: "src/core/budget.ts",
+    from: "  const overTokens = budget.maxTokens !== undefined && input.spentTokens >= budget.maxTokens;",
+    to: "  const overTokens = budget.maxTokens !== undefined && input.spentTokens >= 0;",
+    test: "test/budget.test.ts",
+    red: "预算：低于上限 ⇒ 不动",
+    why: "有 token 上限就立刻到点，预算变成「一跑就收」",
+  },
+  {
+    feature: "没到硬门倍数仍是软门（evaluateBudget）",
+    file: "src/core/budget.ts",
+    from: "  const hardByUsd = budget.maxUsd !== undefined && input.spentUsd >= budget.maxUsd * factor;",
+    to: "  const hardByUsd = budget.maxUsd !== undefined && input.spentUsd >= budget.maxUsd;",
+    test: "test/budget.test.ts",
+    red: "预算：没到硬门倍数 ⇒ 仍是软门",
+    why: "到点即硬收，软门的收尾转向被跳过",
+  },
+  {
+    feature: "硬收过就一直硬门（evaluateBudget 的 hard 入参）",
+    file: "src/core/budget.ts",
+    from: '  if (input.hard) return { phase: "hard", reason: "已经硬收过" };',
+    to: '  if (input.hard) return { phase: "soft", reason: "已经硬收过" };',
+    test: "test/budget.test.ts",
+    red: "预算：已经硬收过就一直是硬门（不回到软门）",
+    why: "硬收过又报软门，父方以为还能继续干",
+  },
+  {
+    feature: "没给预算 ⇒ phase ok（evaluateBudget）",
+    file: "src/core/budget.ts",
+    from: '  if (!budget) return { phase: "ok" };',
+    to: '  if (!budget) return { phase: "soft" };',
+    test: "test/budget.test.ts",
+    red: "预算：没给预算 ⇒ phase ok",
+    why: "没设预算的任务也被判到点，白插收尾转向",
+  },
+  {
+    feature: "硬门先于软门成立（evaluateBudget）",
+    file: "src/core/budget.ts",
+    from: "  if (hardByUsd || hardByTokens || hardByTime) {",
+    to: "  if (hardByTokens || hardByTime) {",
+    test: "test/budget.test.ts",
+    red: "预算：硬门先于软门成立时直接进硬门（不先软门）",
+    why: "美元已超硬门却只报软门，孩子被允许继续烧钱",
+  },
+  {
+    feature: "hardFactor=1 ⇒ 跳过软门直接进硬门（evaluateBudget）",
+    file: "src/core/budget.ts",
+    from: "  const factor = budget.hardFactor ?? DEFAULT_HARD_FACTOR;",
+    to: "  const factor = (budget.hardFactor ?? DEFAULT_HARD_FACTOR) * 2;",
+    test: "test/budget.test.ts",
+    red: "预算：hardFactor=1 ⇒ 跳过软门直接进硬门",
+    why: "hardFactor=1 的语义是「到点就收掉」——倍数被改写后软门又回来了，父方以为还有降级交付",
+  },
+  {
+    feature: "预算闸：至少一个上限（usageBudgetGate）",
+    file: "src/core/gates.ts",
+    from: "  if (budget.maxUsd === undefined && budget.maxTokens === undefined)",
+    to: "  if (false)",
+    test: "test/core-logic.test.ts",
+    red: "安检 17：usageBudget 至少要给一个上限（maxUsd / maxTokens）",
+    why: "空预算对象被当成设了预算，父方以为有上限",
+  },
+  {
+    feature: "上限必须是正的有限数（usageBudgetGate）",
+    file: "src/core/gates.ts",
+    from: "  if (budget.maxUsd !== undefined && (!Number.isFinite(budget.maxUsd) || budget.maxUsd <= 0))",
+    to: "  if (false)",
+    test: "test/core-logic.test.ts",
+    red: "安检 17b：usageBudget 的上限必须是正的有限数（0 / 负数 / NaN 都拒）",
+    why: "0 / 负数 / NaN 被 coerce 成有效上限，预算永不触发",
+  },
+  {
+    feature: "maxTokens 也必须是正的有限数（usageBudgetGate）",
+    file: "src/core/gates.ts",
+    from: "    (!Number.isFinite(budget.maxTokens) || budget.maxTokens <= 0)",
+    to: "    budget.maxTokens <= 0",
+    test: "test/core-logic.test.ts",
+    red: "安检 17b：usageBudget 的上限必须是正的有限数（0 / 负数 / NaN 都拒）",
+    why: "NaN / Infinity 的 token 上限被放行，预算永不触发",
+  },
+  {
+    feature: "hardFactor < 1 要拒（usageBudgetGate）",
+    file: "src/core/gates.ts",
+    from: "    (!Number.isFinite(budget.hardFactor) || budget.hardFactor < 1)",
+    to: "    (!Number.isFinite(budget.hardFactor) || false)",
+    test: "test/core-logic.test.ts",
+    red: "安检 17c：usageBudget 的 hardFactor 必须是 ≥1 的有限数（NaN / Infinity / 字符串都拒）",
+    why: "hardFactor < 1 让硬门早于软门，孩子被立刻收掉",
+  },
+  {
+    feature: "hardFactor 非有限数要拒（usageBudgetGate）",
+    file: "src/core/gates.ts",
+    from: "    (!Number.isFinite(budget.hardFactor) || budget.hardFactor < 1)",
+    to: "    (budget.hardFactor < 1)",
+    test: "test/core-logic.test.ts",
+    red: "安检 17c：usageBudget 的 hardFactor 必须是 ≥1 的有限数（NaN / Infinity / 字符串都拒）",
+    why: "NaN / Infinity / 字符串绕过校验，硬门用量条件失效",
+  },
+  {
+    feature: "hardGraceMs 不超过 setTimeout 上限（usageBudgetGate）",
+    file: "src/core/gates.ts",
+    from: "      budget.hardGraceMs > MAX_TIMEOUT_MS",
+    to: "      false",
+    test: "test/core-logic.test.ts",
+    red: "安检 17d：usageBudget 的 hardGraceMs 必须是正的有限数，且不超过 setTimeout 上限",
+    why: "超过 2^31-1 会被 Node 夹成 1ms，软门后立刻收尸",
+  },
+  {
+    feature: "usageBudget null / 非对象要拒（usageBudgetGate）",
+    file: "src/core/gates.ts",
+    from: '  if (raw === null || typeof raw !== "object" || Array.isArray(raw))',
+    to: "  if (false)",
+    test: "test/core-logic.test.ts",
+    red: "安检 17e：usageBudget=null / 非对象要拒（不能当没设预算）",
+    redKeyword: "TypeError",
+    why: "null 被当成没设预算，任务无上限运行",
+  },
+  {
+    feature: "user message 体积闸 ≤ 64 KiB（messageBytesGate）",
+    file: "src/core/gates.ts",
+    from: '  if (Buffer.byteLength(message, "utf8") > MAX_TEXT_BYTES)',
+    to: "  if (false)",
+    test: "test/core-logic.test.ts",
+    red: "安检 18：user message 超过 64 KiB 要拒（拼进一个 argv 装不下）",
+    why: "合并后的位置参数撞 MAX_ARG_STRLEN ⇒ spawn E2BIG ⇒ 记 failed 而不是 rejected",
+  },
+  {
+    feature: "user message 不能以 @ 开头（messageBytesGate）",
+    file: "src/core/gates.ts",
+    from: '  if (message.startsWith("@"))',
+    to: "  if (false)",
+    test: "test/core-logic.test.ts",
+    red: "安检 18b：user message 不能以 @ 开头（pi 会把它当文件读）",
+    why: "@ 开头被 pi 当文件路径，任务正文丢弃",
+  },
+  {
+    feature: "新闸接在默认闸序末尾（defaultGates）",
+    file: "src/core/gates.ts",
+    from: "    usageBudgetGate,",
+    to: "    messageBytesGate,",
+    test: "test/core-logic.test.ts",
+    red: "安检 10：默认闸序含隔离/黑板两道值闸",
+    why: "第 13 道位置被顶掉：档位与体积闸没挂上",
+  },
+  {
+    feature: "增量用量与终局口径一致（createUsageTracker）",
+    file: "src/core/child.ts",
+    from: "    usage = addUsage(usage, takeUsage(message.usage));",
+    to: "    usage = takeUsage(message.usage);",
+    test: "test/child.test.ts",
+    red: "收件：增量用量累加 = 终局 parseChildStream 的口径（同一段流，两条路同数）",
+    why: "运行中只算最后一轮，预算按偏小的数判",
+  },
+  {
+    feature: "增量用量跨 chunk 的半行不丢（createUsageTracker）",
+    file: "src/core/child.ts",
+    from: '      consume(buffer.slice(0, index));\n      buffer = buffer.slice(index + 1);\n      index = buffer.indexOf("\\n");\n    }\n    if (final && buffer) {',
+    to: '      consume(buffer.slice(0, index));\n      buffer = "";\n      index = buffer.indexOf("\\n");\n    }\n    if (final && buffer) {',
+    test: "test/child.test.ts",
+    red: "收件：增量用量跨 chunk 的半行不丢（usage 事件被切成两半也要算进去）",
+    why: "同一 chunk 里的多条事件只算第一条，用量漏账",
+  },
+  {
+    feature: "只认 assistant 的 message_end（createUsageTracker）",
+    file: "src/core/child.ts",
+    from: '    if (message.role !== "assistant") return;',
+    to: "    if (false) return;",
+    test: "test/child.test.ts",
+    red: "收件：增量用量只认 assistant 的 message_end（user / system 的 usage 不计）",
+    why: "user/system 的用量混进来，账比终局大",
+  },
+  {
+    feature: "预算到点 ⇒ 降级交付（#checkBudget 的软门分支）",
+    file: "src/core/engine.ts",
+    from: '  if (decision.phase === "soft" && state.softAt === undefined) {',
+    to: '  if (decision.phase === "ok" && state.softAt === undefined) {',
+    test: "test/engine.test.ts",
+    red: "引擎：预算到点 ⇒ 降级交付（不 failed，回执标 budgetExhausted）",
+    why: "软门永远不触发，到点后账上不标 budgetExhausted",
+  },
+  {
+    feature: "硬门走 stop（#checkBudget）",
+    file: "src/core/engine.ts",
+    from: '        await this.stop(taskId, `budget exhausted: ${decision.reason ?? "用量到点"}`);',
+    to: "        await Promise.resolve();",
+    test: "test/engine.test.ts",
+    red: "引擎：硬门 ⇒ 收掉孩子（SIGTERM），部分正文照交",
+    why: "硬门只记账不收尸，孩子继续烧到自然退出",
+  },
+  {
+    feature: "运行中用量检查不依赖报告通道（#pump）",
+    file: "src/core/engine.ts",
+    from: "        void this.#checkBudget(taskId, input, snap.usage).catch(() => {});",
+    to: "        void Promise.resolve();",
+    test: "test/engine.test.ts",
+    red: "引擎：没交报告时预算照样判（账上也有数）",
+    why: "运行中不判预算，没交报告的孩子超支也没人管",
+  },
+  {
+    feature: "孩子没起来不带 budget 回执（#resultFromRecord）",
+    file: "src/core/engine.ts",
+    from: "      ...(record.budget && startedAt > 0 ? { budget: record.budget } : {}),",
+    to: "      ...(record.budget ? { budget: record.budget } : {}),",
+    test: "test/engine.test.ts",
+    red: "引擎：孩子没起来 ⇒ 不带 budget 字段",
+    why: "spawn 失败也回一份 spent=0 的假预算账，父方以为跑过",
+  },
+  {
+    feature: "受理时钉死预算（#dispatchReady 克隆入参）",
+    file: "src/core/engine.ts",
+    from: "      ...(rawInput.usageBudget ? { usageBudget: { ...rawInput.usageBudget } } : {}),",
+    to: "      ...(rawInput.usageBudget ? { usageBudget: rawInput.usageBudget } : {}),",
+    test: "test/engine.test.ts",
+    red: "引擎：受理时钉死预算（排队期间改参数不生效）",
+    why: "排队期间调用方改预算对象，直接改到已受理任务的账上",
+  },
+  {
+    feature: "报告旗标与预算旗标不互相掩盖（#resultFromRecord）",
+    file: "src/core/engine.ts",
+    from: "      ...(record.budgetExhausted && startedAt > 0 ? { budgetExhausted: true as const } : {}),",
+    to: '      ...(record.budgetExhausted && record.reportChannel === "none" ? { budgetExhausted: true as const } : {}),',
+    test: "test/engine.test.ts",
+    red: "引擎：软门后孩子交了差 ⇒ 报告旗标与预算旗标不互相掩盖",
+    why: "交了报告就把预算到点旗标吞掉，父方把降级交付当正常完成",
+  },
+  {
+    feature: "软门写收尾转向（#checkBudget）",
+    file: "src/core/engine.ts",
+    from: "      const outcome = await this.steer(taskId, BUDGET_STEER_TEXT);",
+    to: '      const outcome = await this.steer(taskId, "");',
+    test: "test/engine.test.ts",
+    red: "引擎：预算到点 ⇒ 给孩子写一条收尾转向（软门，收据里看得见）",
+    why: "到点不给孩子收尾指令（空文案被拒），孩子继续干",
+  },
+  {
+    feature: "没给预算就不动作（#checkBudget）",
+    file: "src/core/engine.ts",
+    from: "    const budget = input.usageBudget;\n    if (!budget) return;\n    const state = this.#budgetStates.get(taskId) ?? { hard: false };",
+    to: "    const budget = input.usageBudget ?? { maxUsd: 0 };\n    if (!budget) return;\n    const state = this.#budgetStates.get(taskId) ?? { hard: false };",
+    test: "test/engine.test.ts",
+    red: "引擎：没给预算 ⇒ 不写转向也不收尸",
+    why: "没设预算的任务也按 0 上限判，一有用量就收尸",
+  },
+  {
+    feature: "软门后 arm 硬门定时器（#checkBudget）",
+    file: "src/core/engine.ts",
+    from: "      this.#armBudgetTimer(taskId, input);",
+    to: "      void 0;",
+    test: "test/engine.test.ts",
+    red: "引擎：软门后宽限期到点 ⇒ 收掉孩子（没有新用量也收）",
+    why: "软门后不 arm 定时器，孩子卡在长工具里永远没人收尸",
+  },
+  {
+    feature: "arm 在 steer 之前（#checkBudget 不 await 拖死硬门）",
+    file: "src/core/engine.ts",
+    from:
+      "      state.softAt = this.#now();\n" +
+      "      this.#budgetStates.set(taskId, state);\n" +
+      "      // 先 arm 再 await：steer / attach 卡住或抛错时，硬门的时间兜底不能跟着失效。\n" +
+      "      this.#armBudgetTimer(taskId, input);\n" +
+      "      // 软门走现成的转向通道：写一条「收尾交付」指令，不打断在飞工具。\n" +
+      "      // 没装孩子扩展 / 没留痕目录 ⇒ 写不进去 ⇒ 只记 exhausted，靠硬门兜底。\n" +
+      "      const outcome = await this.steer(taskId, BUDGET_STEER_TEXT);\n" +
+      "      if (!outcome.ok) this.#budgetSteerFailed.add(taskId);\n" +
+      "      await this.#attachBudget(taskId, input, usage, state);",
+    to:
+      "      state.softAt = this.#now();\n" +
+      "      this.#budgetStates.set(taskId, state);\n" +
+      "      // 软门走现成的转向通道：写一条「收尾交付」指令，不打断在飞工具。\n" +
+      "      // 没装孩子扩展 / 没留痕目录 ⇒ 写不进去 ⇒ 只记 exhausted，靠硬门兜底。\n" +
+      "      const outcome = await this.steer(taskId, BUDGET_STEER_TEXT);\n" +
+      "      if (!outcome.ok) this.#budgetSteerFailed.add(taskId);\n" +
+      "      await this.#attachBudget(taskId, input, usage, state);\n" +
+      "      this.#armBudgetTimer(taskId, input);",
+    test: "test/engine.test.ts",
+    red: "引擎：软门转向卡住时，宽限定时器仍会收掉孩子（arm 在 await 之前）",
+    why: "steer 卡住时定时器还没 arm，硬门的时间兜底跟着失效",
+  },
+  {
+    feature: "硬门记账失败也收掉孩子（try/finally）",
+    file: "src/core/engine.ts",
+    from:
+      "      try {\n" +
+      "        await this.#attachBudget(taskId, input, usage, state);\n" +
+      "      } finally {\n" +
+      "        // 记账失败也要收掉孩子：硬门不能依赖回执写盘成功。\n" +
+      '        await this.stop(taskId, `budget exhausted: ${decision.reason ?? "用量到点"}`);\n' +
+      "      }",
+    to:
+      "      await this.#attachBudget(taskId, input, usage, state);\n" +
+      '      await this.stop(taskId, `budget exhausted: ${decision.reason ?? "用量到点"}`);',
+    test: "test/engine.test.ts",
+    red: "引擎：预算记账失败也要收掉孩子（硬门不依赖回执）",
+    why: "回执写盘失败时孩子继续跑到自然退出，硬门形同虚设",
+  },
+  {
+    feature: "预算检查的拒绝不冒成 unhandledRejection",
+    file: "src/core/engine.ts",
+    from: "        void this.#checkBudget(taskId, input, snap.usage).catch(() => {});",
+    to: "        void this.#checkBudget(taskId, input, snap.usage);",
+    test: "test/engine.test.ts",
+    red: "引擎：预算记账失败也要收掉孩子（硬门不依赖回执）",
+    redKeyword: "disk full",
+    why: "预算检查抛错时在宿主里制造未处理拒绝",
+  },
+  {
+    feature: "回执带上限与已花的钱和 token（#attachBudget）",
+    file: "src/core/engine.ts",
+    from: "      spentUsd: usage ? usdOf(usage) : 0,\n      spentTokens: usage ? totalTokens(usage) : 0,\n      ...(state.softAt !== undefined ? { softAt: state.softAt } : {}),",
+    to: "      spentUsd: usage ? usdOf(usage) : 0,\n      spentTokens: 0,\n      ...(state.softAt !== undefined ? { softAt: state.softAt } : {}),",
+    test: "test/engine.test.ts",
+    red: "引擎：预算回执带上限、已花的钱与 token",
+    why: "回执里的 token 恒 0，父方看不到真实消耗",
+  },
+  {
+    feature: "回执带上已花的美元（#attachBudget）",
+    file: "src/core/engine.ts",
+    from: "      spentUsd: usage ? usdOf(usage) : 0,\n      spentTokens: usage ? totalTokens(usage) : 0,\n      ...(state.softAt !== undefined ? { softAt: state.softAt } : {}),",
+    to: "      spentUsd: 0,\n      spentTokens: usage ? totalTokens(usage) : 0,\n      ...(state.softAt !== undefined ? { softAt: state.softAt } : {}),",
+    test: "test/engine.test.ts",
+    red: "引擎：预算回执带上限、已花的钱与 token",
+    why: "回执里的美元恒 0，父方看不到真实花费",
+  },
+  {
+    feature: "工具 schema 带 usageBudget（DISPATCH_TASK_SCHEMA）",
+    file: "src/index.ts",
+    from: '        maxUsd: { type: "number", description: "累计成本上限（美元）。必须 > 0。" },',
+    to: '        maxUsdTypo: { type: "number", description: "累计成本上限（美元）。必须 > 0。" },',
+    test: "test/adapter.test.ts",
+    red: "适配层：dispatch_task 的 schema 带 usageBudget",
+    why: "模型看不到 maxUsd 字段，永远设不了美元上限",
+  },
+  {
+    feature: "列表三列（dispatch_list 的行）",
+    file: "src/index.ts",
+    from: "          budget: r.budget,",
+    to: "          budget: undefined,",
+    test: "test/adapter.test.ts",
+    red: "适配层：dispatch_list 的行带 budget / thinking / budgetExhausted 三列",
+    why: "列表里看不到预算账，父方只能靠通知",
+  },
+  {
+    feature: "终态通知带预算/档位提示（deliver 的文案）",
+    file: "src/index.ts",
+    from: '          n.budgetExhausted ? "｜预算到点（降级交付）" : "",',
+    to: '          "",',
+    test: "test/adapter.test.ts",
+    red: "适配层：终态通知在预算到点时带「降级交付」、降档时带「high→low」",
+    why: "降级交付被当成正常完成，父方不知道结果被截短",
+  },
+  // ── 成本控制：thinking（§2.2） ──────────────────────────────────────────
+  {
+    feature: "支持的档位原样发（resolveThinkingLevel）",
+    file: "src/core/thinking.ts",
+    from: "  if (supported.includes(requested)) {\n    return {\n      requested,\n      effective: requested,",
+    to: '  if (supported.includes(requested)) {\n    return {\n      requested,\n      effective: "low",',
+    test: "test/thinking.test.ts",
+    red: "思考档位：模型支持该档 ⇒ 原样发（不降级）",
+    why: "支持的档位也被降成 low，质量白丢",
+  },
+  {
+    feature: "模型不在目录里 ⇒ 未校验（resolveThinkingLevel）",
+    file: "src/core/thinking.ts",
+    from: "      modelKnown: false,",
+    to: "      modelKnown: true,",
+    test: "test/thinking.test.ts",
+    red: "思考档位：模型不在目录里 ⇒ 原样透传并说明未校验",
+    why: "没校验却报「已认出来」，父方误信实际档位",
+  },
+  {
+    feature: "非思考模型 ⇒ off（resolveThinkingLevel）",
+    file: "src/core/thinking.ts",
+    from: '  if (!model.reasoning) {\n    return {\n      requested,\n      effective: "off",',
+    to: '  if (!model.reasoning) {\n    return {\n      requested,\n      effective: "high",',
+    test: "test/thinking.test.ts",
+    red: "思考档位：非思考模型 ⇒ 不发后缀（= off）",
+    why: "非思考模型被报成 high，父方以为它在深思",
+  },
+  {
+    feature: "缺键 ⇒ 最接近的一档（resolveThinkingLevel）",
+    file: "src/core/thinking.ts",
+    from: "    effective: nearest,",
+    to: '    effective: "low",',
+    test: "test/thinking.test.ts",
+    red: "思考档位：xhigh/max 缺键 ⇒ 按 pi 口径落到最接近的一档（不静默降成 low）",
+    why: "缺键被静默降成 low，比 pi 的 clamp 更激进",
+  },
+  {
+    feature: "裸 id 唯一命中（findThinkingModel）",
+    file: "src/core/thinking.ts",
+    from: "  if (hits.length === 1) return hits[0];",
+    to: "  if (hits.length === 0) return hits[0];",
+    test: "test/thinking.test.ts",
+    red: "思考档位：裸 id 唯一命中也能找到模型",
+    why: "裸 id 查不到模型 ⇒ 不校验，白丢降级机会",
+  },
+  {
+    feature: "裸 id 撞多个 ⇒ 不校验（findThinkingModel）",
+    file: "src/core/thinking.ts",
+    from: "  if (hits.length > 1) return undefined;",
+    to: "  if (hits.length > 1) return hits[0];",
+    test: "test/thinking.test.ts",
+    red: "思考档位：裸 id 撞多个 ⇒ 不校验（原样透传）",
+    why: "撞多个时瞎挑一个，可能按别家模型的档位图校验",
+  },
+  {
+    feature: "回执说明降级原因（resolveThinkingLevel 的 reason）",
+    file: "src/core/thinking.ts",
+    from: "      reason: `该模型没有 ${requested} 档（thinkingLevelMap=null）⇒ 降到 ${effective}`,",
+    to: '      reason: "",',
+    test: "test/thinking.test.ts",
+    red: "思考档位：回执说明实际生效档位与降级原因",
+    why: "降级没有理由，父方无法判断是配置错还是模型不支持",
+  },
+  {
+    feature: "降级到 low（downgradeTarget）",
+    file: "src/core/thinking.ts",
+    from: '  if (cheaper.includes("low")) return "low";',
+    to: '  if (cheaper.includes("low")) return "off";',
+    test: "test/thinking.test.ts",
+    red: "思考档位：thinkingLevelMap 显式 null ⇒ 降到 low（vendor-local 的 medium）",
+    why: "该降到 low 的档位被降到 off，能力被砍光",
+  },
+  {
+    feature: "降级只往下不往上（downgradeTarget）",
+    file: "src/core/thinking.ts",
+    from: "  const cheaper = supported.filter((level) => costIndex(level) <= requestedIndex);",
+    to: "  const cheaper = supported.filter((level) => costIndex(level) >= requestedIndex);",
+    test: "test/thinking.test.ts",
+    red: "思考档位：降级只往下不往上（生效档位的成本序不得高于请求档位）",
+    why: "「降级」反而升档，重演 pi 把 medium 抬成 high 的涨价",
+  },
+  {
+    feature: "只发 supported 里的档位（resolveThinkingLevel）",
+    file: "src/core/thinking.ts",
+    from: "  if (supported.includes(requested)) {",
+    to: "  if (true) {",
+    test: "test/thinking.test.ts",
+    red: "思考档位：只发 supported 里的档位 ⇒ pi 的 clamp 不会再改它（档位必在支持集里）",
+    why: "不支持的档位照样发，pi 的 clamp 再把价格抬上去",
+  },
+  {
+    feature: "没有 thinkingLevelMap 也不炸（resolveThinkingLevel）",
+    file: "src/core/thinking.ts",
+    from: "  const mapped = model.thinkingLevelMap?.[requested];",
+    to: "  const mapped = model.thinkingLevelMap![requested];",
+    test: "test/thinking.test.ts",
+    red: "思考档位：reasoning=true 但没有 thinkingLevelMap ⇒ xhigh 落到 high（不炸）",
+    redKeyword: "TypeError",
+    why: "reasoning 模型没给档位图时读 undefined 直接抛 TypeError，派发整个失败",
+  },
+  {
+    feature: "降级后的档位进 --model 后缀（buildPiArgv）",
+    file: "src/core/child.ts",
+    from: "    const modelArg = thinking ? `${model}:${thinking}` : model;",
+    to: "    const modelArg = model;",
+    test: "test/child.test.ts",
+    red: "拼命令：降级后的档位进 --model 后缀（a/b:low）",
+    why: "校验出来的档位没进 argv，孩子仍按会话默认跑",
+  },
+  {
+    feature: "没给档位时不拼后缀（buildPiArgv）",
+    file: "src/core/child.ts",
+    from: "    const modelArg = thinking ? `${model}:${thinking}` : model;",
+    to: '    const modelArg = `${model}:${thinking ?? "high"}`;',
+    test: "test/child.test.ts",
+    red: "拼命令：没给档位时不拼后缀（a/b 不带冒号）",
+    why: "没给档位时擅自拼 high，替父方选了更贵的档",
+  },
+  {
+    feature: "引擎回执带 thinking（受理时写进初始记录）",
+    file: "src/core/engine.ts",
+    from: "      ...(thinking ? { thinking: thinking.receipt } : {}),",
+    to: "      ...(thinking ? { thinking: undefined } : {}),",
+    test: "test/engine.test.ts",
+    red: "引擎：thinking 降级写进回执（requested/effective/reason）",
+    why: "回执里没有档位，父方不知道实际跑了哪一档",
+  },
+  {
+    feature: "引擎 argv 用校验后的档位（#buildArgv）",
+    file: "src/core/engine.ts",
+    from:
+      "    const resolved = this.#thinkingSuffixes.get(taskId);\n" +
+      "    const thinkingLevel = this.#thinkingSuffixes.has(taskId)\n" +
+      "      ? resolved\n" +
+      "      : (input.thinkingLevel ?? undefined);",
+    to: "    const thinkingLevel = input.thinkingLevel ?? undefined;",
+    test: "test/engine.test.ts",
+    red: "引擎：thinking 降级进 argv（medium ⇒ --model regex:test-vendor/group/main:low）",
+    why: "argv 直接用请求档位（medium），降级结果没进 --model",
+  },
+  {
+    feature: "引擎受理时钉死模型（#dispatchReady）",
+    file: "src/core/engine.ts",
+    from:
+      "    const acceptedModel = effectiveModel({\n" +
+      "      model: input.model,\n" +
+      "      sessionModel: this.#sessionModel?.(),\n" +
+      "    });\n" +
+      "    if (acceptedModel !== undefined) input.model = acceptedModel;",
+    to:
+      "    const acceptedModel = effectiveModel({\n" +
+      "      model: input.model,\n" +
+      "      sessionModel: this.#sessionModel?.(),\n" +
+      "    });\n" +
+      "    if (false) input.model = acceptedModel;",
+    test: "test/engine.test.ts",
+    red: "引擎：受理时钉死模型（排队期间会话模型变了也不换）",
+    why: "排队期间父会话换模型，argv 用新模型配旧档位",
+  },
+  {
+    feature: "没给 model 时用会话模型查目录（effectiveModel）",
+    file: "src/core/child.ts",
+    from: "  const model = nonEmpty(options.model) ?? nonEmpty(options.sessionModel);",
+    to: "  const model = nonEmpty(options.model);",
+    test: "test/thinking.test.ts",
+    red: "思考档位：没给 model 时用会话模型查目录",
+    why: "继承会话模型时查不到目录 ⇒ 不校验",
+  },
+  // ── 成本控制：前缀稳定化（§2.3） ────────────────────────────────────────
+  {
+    feature: "附加块恒定（buildPiArgv）",
+    file: "src/core/child.ts",
+    from: '  argv.push("--append-system-prompt", CONTRACT_BLOCK);',
+    to: '  argv.push("--append-system-prompt", CONTRACT_BLOCK + (options.why ?? ""));',
+    test: "test/child.test.ts",
+    red: "拼命令：附加块恒定（why 不进系统提示词）",
+    why: "why 回到系统提示词，每个子代理的前缀都不同",
+  },
+  {
+    feature: "why 进 user message（buildUserMessage）",
+    file: "src/core/child.ts",
+    from: '    options.why ? `<pi-dispatch-why>${escapeXmlText(options.why)}</pi-dispatch-why>` : "",',
+    to: '    "",',
+    test: "test/child.test.ts",
+    red: "拼命令：why 进 user message",
+    why: "why 丢了：孩子不知道动机",
+  },
+  {
+    feature: "隔离契约进 user message（buildUserMessage）",
+    file: "src/core/child.ts",
+    from: '    options.isolation === "worktree" ? WORKTREE_CONTRACT_BLOCK : "",',
+    to: '    "",',
+    test: "test/child.test.ts",
+    red: "拼命令：隔离契约进 user message，不进系统提示词",
+    why: "隔离契约丢了：孩子不自建分支/不提交",
+  },
+  {
+    feature: "user message 顺序是 任务 → why → 隔离契约",
+    file: "src/core/child.ts",
+    from:
+      "    options.task,\n" +
+      '    options.why ? `<pi-dispatch-why>${escapeXmlText(options.why)}</pi-dispatch-why>` : "",\n' +
+      '    options.isolation === "worktree" ? WORKTREE_CONTRACT_BLOCK : "",',
+    to:
+      "    options.task,\n" +
+      '    options.isolation === "worktree" ? WORKTREE_CONTRACT_BLOCK : "",\n' +
+      '    options.why ? `<pi-dispatch-why>${escapeXmlText(options.why)}</pi-dispatch-why>` : "",',
+    test: "test/child.test.ts",
+    red: "拼命令：user message 的顺序是 任务 → why → 隔离契约",
+    why: "隔离契约跑到 why 前面，孩子先看到环境约束、后看到任务动机",
+  },
+  {
+    feature: "没有 why 也没有隔离时 user message == 任务原文（buildUserMessage）",
+    file: "src/core/child.ts",
+    from: "    options.task,",
+    to: "    `${options.task}\\n`,",
+    test: "test/child.test.ts",
+    red: "拼命令：没有 why 也没有隔离时，user message 就是任务原文（argv 与今天逐字节相同）",
+    why: "任务末尾多一个换行：argv 与今天不再逐字节相同",
+  },
+  {
+    feature: "附加块逐字节冻结（CONTRACT_BLOCK）",
+    file: "src/core/child.ts",
+    from: 'export const CONTRACT_BLOCK = [SUBAGENT_CONTEXT_BLOCK, REPORT_CONTRACT_BLOCK].join("\\n");',
+    to: 'export const CONTRACT_BLOCK = [SUBAGENT_CONTEXT_BLOCK, REPORT_CONTRACT_BLOCK].join("\\n\\n");',
+    test: "test/child.test.ts",
+    red: "golden：附加块逐字节等于冻结字面量（上下文 + 报告契约）",
+    why: "契约块分隔符变了，跨子代理前缀不再逐字节相同",
+  },
+  {
+    feature: "user message 逐字节冻结（buildUserMessage 的分隔符）",
+    file: "src/core/child.ts",
+    from: '    .filter(Boolean)\n    .join("\\n\\n");',
+    to: '    .filter(Boolean)\n    .join("\\n");',
+    test: "test/child.test.ts",
+    red: "golden：user message 逐字节等于冻结字面量（任务 + why + 隔离契约）",
+    why: "块间分隔符从两行变一行，冻结字面量对不上",
+  },
+  {
+    feature: "理由里的 XML 实体被转义（buildUserMessage）",
+    file: "src/core/child.ts",
+    from: '    options.why ? `<pi-dispatch-why>${escapeXmlText(options.why)}</pi-dispatch-why>` : "",',
+    to: '    options.why ? `<pi-dispatch-why>${options.why}</pi-dispatch-why>` : "",',
+    test: "test/child.test.ts",
+    red: "拼命令：理由里的 XML 实体被转义（不会伪造标签）",
+    why: "why 里的 </pi-dispatch-why> 能伪造块边界",
+  },
+  // ── 成本控制：关掉预热（§2.4） ──────────────────────────────────────────
+  {
+    feature: "孩子侧关预热（cacheWarmingDecision）",
+    file: "src/core/cache-warming.ts",
+    from: '  return depth > 0 ? { action: "stop" } : undefined;',
+    to: "  return depth > 0 ? undefined : undefined;",
+    test: "test/budget.test.ts",
+    red: "成本：depth>0 的孩子关掉 cache 预热（action=stop）",
+    why: "孩子的预热照跑，为没人用的热缓存花钱",
+  },
+  {
+    feature: "父会话不表态（cacheWarmingDecision）",
+    file: "src/core/cache-warming.ts",
+    from: '  return depth > 0 ? { action: "stop" } : undefined;',
+    to: '  return depth > 0 ? { action: "stop" } : { action: "stop" };',
+    test: "test/budget.test.ts",
+    red: "成本：父会话（depth=0）不表态（不返回 action，预热照旧）",
+    why: "父会话的预热被关掉（父会话长命，预热对它有用）",
+  },
+  {
+    feature: "depth=2 也关预热（cacheWarmingDecision）",
+    file: "src/core/cache-warming.ts",
+    from: '  return depth > 0 ? { action: "stop" } : undefined;',
+    to: '  return depth === 1 ? { action: "stop" } : undefined;',
+    test: "test/budget.test.ts",
+    red: "成本：depth=2 的孩子也关掉 cache 预热",
+    why: "套娃子代理漏关，整棵子树没关干净",
+  },
+  {
+    feature: "适配层注册预热钩子（工厂层）",
+    file: "src/index.ts",
+    from: '      pi.on("cache_warming_decision", () => cacheWarmingDecision(depth));',
+    to: '      pi.on("cache_warming_decision", () => undefined);',
+    test: "test/adapter.test.ts",
+    red: "适配层：子代理进程（depth>0）注册 cache_warming_decision 并返回 stop",
+    why: "钩子注册了却不说 stop，孩子照样预热",
+  },
+  {
+    feature: "父进程不注册钩子（工厂层的 depth 判断）",
+    file: "src/index.ts",
+    from: "    if (depth > 0) {",
+    to: "    if (true) {",
+    test: "test/adapter.test.ts",
+    red: "适配层：父进程不注册 cache_warming_decision",
+    redKeyword: "父会话预热照旧",
+    why: "父会话的预热也被关掉",
+  },
+  {
+    feature: "老版本 pi 注册未知事件不炸（工厂层的 try/catch）",
+    file: "src/index.ts",
+    from: '      pi.on("cache_warming_decision", () => cacheWarmingDecision(depth));\n    }\n  } catch {',
+    to: '      pi.on("cache_warming_decision", () => cacheWarmingDecision(depth));\n    }\n  } finally {',
+    test: "test/adapter.test.ts",
+    red: "适配层：pi 不认识 cache_warming_decision 时不炸",
+    why: "老版本 pi 上注册未知事件抛出，整条派发链断掉",
   },
 ];
 
