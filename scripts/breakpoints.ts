@@ -555,10 +555,10 @@ const CASES: Breakpoint[] = [
   {
     feature: "ps 输出锁 locale",
     file: "src/core/storage.ts",
-    from: '        env: { ...process.env, LC_ALL: "C" },',
-    to: "        env: process.env,",
+    from: '  return { ...process.env, LC_ALL: "C" };',
+    to: "  return process.env;",
     test: "test/storage.test.ts",
-    red: "locale：ps 子进程拿到 LC_ALL=C（不被别处的 locale 顶掉）",
+    red: "locale：ps 子进程的环境锁 LC_ALL=C（任何平台都钉得住）",
     why: "中文环境下启动时刻解析失败，活着的会话被标失联",
   },
   {

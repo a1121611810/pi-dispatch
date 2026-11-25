@@ -440,6 +440,15 @@ export function parseProcStatStarttime(stat: string): number | undefined {
   return Number.isFinite(ticks) ? ticks : undefined;
 }
 
+/**
+ * ps 子进程的环境：锁 LC_ALL=C——输出跟 locale 走，中文环境会是「三 11月/18 …」，
+ * Date.parse 得 NaN，活着的会话被标失联。抽成函数是为了任何平台都钉得住这条
+ * （CI 跑 Linux，走 /proc，压根不调 ps）。
+ */
+export function psLstartEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, LC_ALL: "C" };
+}
+
 /** 主方进程的启动时刻（毫秒）。macOS 用 ps -o lstart；Linux 用 /proc/<pid>/stat。 */
 export function processStartMs(pid: number): number | undefined {
   try {
@@ -447,8 +456,7 @@ export function processStartMs(pid: number): number | undefined {
       const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
-        // 输出跟 locale 走：中文环境会是「三 11月/18 …」，Date.parse 得 NaN
-        env: { ...process.env, LC_ALL: "C" },
+        env: psLstartEnv(),
       }).trim();
       const t = Date.parse(out);
       return Number.isNaN(t) ? undefined : t;

@@ -41,6 +41,7 @@ import {
   OUTPUT_TRUNCATED_MARK,
   parseProcStatStarttime,
   processStartMs,
+  psLstartEnv,
   Storage,
 } from "../src/core/storage.ts";
 import type { TaskRecord } from "../src/core/types.ts";
@@ -563,6 +564,19 @@ test("locale：ps 子进程拿到 LC_ALL=C（不被别处的 locale 顶掉）", 
     if (oldLcAll === undefined) delete process.env.LC_ALL;
     else process.env.LC_ALL = oldLcAll;
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("locale：ps 子进程的环境锁 LC_ALL=C（任何平台都钉得住）", () => {
+  // 上面那条走假 ps，只在 darwin 生效；CI 跑 Linux 走 /proc，压根不调 ps ⇒ 变异存活。
+  // 这里直接钉「无论外边 LC_ALL 是什么，交给 ps 的都是 C」。
+  const saved = process.env.LC_ALL;
+  process.env.LC_ALL = "zh_CN.UTF-8";
+  try {
+    assert.equal(psLstartEnv().LC_ALL, "C", "别处的 locale 顶不掉它");
+  } finally {
+    if (saved === undefined) delete process.env.LC_ALL;
+    else process.env.LC_ALL = saved;
   }
 });
 
