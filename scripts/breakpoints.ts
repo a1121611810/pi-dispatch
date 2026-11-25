@@ -3181,6 +3181,15 @@ const CASES: Breakpoint[] = [
     why: "files 漏了 dist，装出来是空包；塞 src 则用户背一份跑不了的源码",
   },
   {
+    feature: "清扫带宽限（粗粒度 mtime 的 fs 上不误杀刚建的桶）",
+    file: "scripts/test.ts",
+    from: "export const SWEEP_SLACK_MS = 2000;",
+    to: "export const SWEEP_SLACK_MS = 0;",
+    test: "test/test-runner.test.ts",
+    red: "门禁清扫：只删上一轮遗留的临时桶，本轮的不动（mutate 并行时不许误杀）",
+    why: "CI 的 overlayfs mtime 只到秒，半秒前建的桶被当成上一轮遗留删掉",
+  },
+  {
     feature: "截断的收据不给盖章（有自述就没法对质）",
     file: "src/core/child.ts",
     from: "    (record.delivery?.pathsTruncated && (record.report.files_touched?.length ?? 0) > 0) ||",

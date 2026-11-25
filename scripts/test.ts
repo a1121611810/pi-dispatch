@@ -69,6 +69,15 @@ export const TMP_LEFTOVER_PREFIXES = [
  *
  * 删不掉不算失败：清扫是副产品，不影响测试结论。
  */
+
+/**
+ * 清扫的宽限。文件系统的 mtime 粒度可能只有 1 秒（CI 的 overlayfs 实测：12:00:00.900
+ * 建的目录，mtime 落在 12:00:00.000），拿 ms 精度的时间戳直接比，会把「本轮刚建的」
+ * 算成上一轮遗留——Ubuntu 上就是这么误杀并发兄弟用例的。上一轮遗留至少是几分钟前的，
+ * 2 秒宽限漏不掉任何一个。
+ */
+export const SWEEP_SLACK_MS = 2000;
+
 export function sweepLeftoverTmp(startedAt: number, root = tmpdir()): number {
   let names: string[];
   try {
@@ -81,7 +90,8 @@ export function sweepLeftoverTmp(startedAt: number, root = tmpdir()): number {
     if (!TMP_LEFTOVER_PREFIXES.some((prefix) => name.startsWith(prefix))) continue;
     const full = join(root, name);
     try {
-      if (statSync(full).mtimeMs >= startedAt) continue; // 本轮或并发的，别动
+      // 本轮或并发的别动。晚一步再判：粗粒度 mtime 的 fs 上，刚建的目录会早于 startedAt
+      if (statSync(full).mtimeMs >= startedAt - SWEEP_SLACK_MS) continue;
       rmSync(full, { recursive: true, force: true });
       removed += 1;
     } catch {

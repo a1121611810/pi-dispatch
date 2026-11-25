@@ -38,12 +38,19 @@ test("门禁清扫：只删上一轮遗留的临时桶，本轮的不动（mutat
   // 把「上一轮」的 mtime 拨到 1 小时前；本轮与无关目录保持现在
   const past = new Date(now - 60 * 60 * 1000);
   utimesSync(leftover, past, past);
+  // 半秒前建的：粗粒度 mtime 的 fs（CI 的 overlayfs）上它会早于 startedAt，
+  // 宽限就是为它存在的 —— 没有这条，宽限改成 0 也是绿的（本机 APFS 粒度太细）
+  const recent = join(root, "dispatch-steer-recent");
+  mkdirSync(recent, { recursive: true });
+  const halfSecondAgo = new Date(now - 500);
+  utimesSync(recent, halfSecondAgo, halfSecondAgo);
 
   const removed = sweepLeftoverTmp(now, root);
 
   assert.equal(removed, 1, "只该删上一轮那一个");
   assert.equal(existsSync(leftover), false, "上一轮遗留必须被清掉");
   assert.equal(existsSync(current), true, "本轮新建的不许动（否则 mutate 并行会误杀）");
+  assert.equal(existsSync(recent), true, "半秒前建的也别动——mtime 粒度可能只到秒");
   assert.equal(existsSync(unrelated), true, "不是我们的前缀，碰都不许碰");
 
   rmSync(root, { recursive: true, force: true });
