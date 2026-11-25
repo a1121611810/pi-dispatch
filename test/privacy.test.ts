@@ -15,7 +15,7 @@ import {
   isExempt,
   scanText,
 } from "../scripts/privacy.ts";
-import { sanitize, REPLACEMENTS } from "../scripts/sanitize-fixture.ts";
+import { sanitize, sanitizeJsonl, REPLACEMENTS } from "../scripts/sanitize-fixture.ts";
 
 test("隐私：真名家目录要报出来", () => {
   const findings = scanText('const p = "/home/dev/develop/x";');
@@ -100,6 +100,31 @@ test("脱敏：project_context 整块留结构不留内容", () => {
   assert.ok(!out.includes("CodeGraph"));
 });
 
+test("脱敏：产物每行都必须是合法 JSON（解析器会静默跳过坏行 ⇒ 假绿）", () => {
+  // 这条是根治点：早先的脱敏把换行写成了真换行，产出 3 行非法 JSON；解析器把它们
+  // 当 malformed 跳过，「转向」那条用例照样绿——脱敏脚本自己造了假绿。
+  const line =
+    '{"type":"message_end","message":{"role":"assistant","project_context":"<project_context>\\n# X\\n</project_context>"}}';
+  const out = sanitizeJsonl(line);
+  assert.doesNotThrow(() => JSON.parse(out), "脱敏后必须是合法 JSON");
+  assert.ok(JSON.parse(out).message.project_context.includes("[REDACTED]"));
+});
+
+test("脱敏：整份 JSONL 走一遍，每行都得能解析", () => {
+  const source = [
+    '{"type":"session","cwd":"/home/dev/x","id":"01a200ed-7e02-7508-ac60-412b1c0ff1fe"}',
+    '{"type":"message_end","message":{"provider":"vendor-local","model":"regex:group/main"}}',
+    '{"type":"message_end","message":{"role":"assistant","project_context":"<project_context>\\n# Secret Rules\\n</project_context>"}}',
+  ].join("\n");
+  const out = sanitizeJsonl(source);
+  const lines = out.split("\n").filter(Boolean);
+  assert.equal(lines.length, 3);
+  for (const line of lines) assert.doesNotThrow(() => JSON.parse(line));
+  assert.ok(!out.includes("/home/dev"));
+  assert.ok(!out.includes("regex:group/main"));
+  assert.ok(!out.includes("Secret Rules"));
+});
+
 test("脱敏：会话 id 与绝对时刻换掉", () => {
   assert.equal(
     sanitize('"id":"01a200ed-7e02-7508-ac60-412b1c0ff1fe"'),
@@ -126,4 +151,13 @@ test("脱敏：仓库里那个 fixture 本身得是干净的", async () => {
     [],
     "fixture 里还有隐私——跑 node scripts/sanitize-fixture.ts 重新脱敏",
   );
+  // 每一行都得是合法 JSON：解析器把坏行当 malformed 跳过，坏行会让「转向」那条用例
+  // 读不到它要的东西却照样绿（实测踩过：脱敏产出 3 行非法 JSON，测试没发现）
+  const lines = raw.split("\n").filter(Boolean);
+  for (const [index, line] of lines.entries()) {
+    assert.doesNotThrow(
+      () => JSON.parse(line),
+      `第 ${index + 1} 行不是合法 JSON——跑 pnpm sanitize:fixture 重新脱敏`,
+    );
+  }
 });

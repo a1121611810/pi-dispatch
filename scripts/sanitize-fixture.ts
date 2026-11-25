@@ -15,13 +15,6 @@ export const REPLACEMENTS: readonly { from: RegExp; to: string; why: string }[] 
     why: "家目录路径",
   },
   {
-    // project_context 整块：作者的全局 agent 规则 + 仓库规则全文。真机上它就是这么大，
-    // 但内容不该跟出去——留结构（两个 project_instructions + 收尾），不留内容。
-    from: /<project_context>[\s\S]*?<\/project_context>/g,
-    to: '<project_context>\\nProject-specific instructions and guidelines:\\n\\n<project_instructions path="/home/dev/.pi/agent/AGENTS.md">\\n# Global Agent Rules\\n\\n[REDACTED]\\n</project_instructions>\\n\\n<project_instructions path="/home/dev/develop/pi-dispatch/AGENTS.md">\\n# AGENTS.md — pi-dispatch\\n\\n[REDACTED]\\n</project_instructions>\\n\\n</project_context>',
-    why: "全局/仓库 agent 配置全文",
-  },
-  {
     from: /"model":"group\/[a-z-]+"/g,
     to: '"model":"test/model"',
     why: "模型路由分组名",
@@ -53,8 +46,93 @@ export const REPLACEMENTS: readonly { from: RegExp; to: string; why: string }[] 
   },
 ];
 
+/**
+ * project_context 整块：作者的全局 agent 规则 + 仓库规则全文。真机上它就是这么大，
+ * 但内容不该跟出去——留结构（两个 project_instructions + 收尾），不留内容。
+ *
+ * 写法上有个坑踩过两次：这里的换行必须是 JSON 转义（两个字符 \n），写成真换行会把
+ * 整行变成非法 JSON；而且它嵌在**双引号**的 TS 字符串里，oxfmt 可能把它改成单引号，
+ * 里面的 \" 就不再是转义、JSON 直接坏掉。解析器把坏行当 malformed 跳过，所以
+ * 「转向」那条用例照样绿——脱敏脚本自己造了假绿。
+ *
+ * 所以这里用 String.raw + 反引号模板：内容里的 \n 原样交给 JSON.stringify 处理，
+ * 格式化器碰不到它。
+ */
+export const PROJECT_CONTEXT_REPLACEMENT = String.raw`<project_context>\nProject-specific instructions and guidelines:\n\n<project_instructions path=\"/home/dev/.pi/agent/AGENTS.md\">\n# Global Agent Rules\n\n[REDACTED]\n</project_instructions>\n\n<project_instructions path=\"/home/dev/develop/pi-dispatch/AGENTS.md\">\n# AGENTS.md — pi-dispatch\n\n[REDACTED]\n</project_instructions>\n\n</project_context>`;
+
 /** 对一段文本应用全部替换规则。 */
 export function sanitize(text: string): string {
+  let out = text;
+  for (const { from, to } of REPLACEMENTS) out = out.replace(from, to);
+  out = out.replace(/<project_context>[\s\S]*?<\/project_context>/g, PROJECT_CONTEXT_REPLACEMENT);
+  return out;
+}
+
+/**
+ * 逐行脱敏，并把每行重新 JSON.stringify 一遍。
+ *
+ * 为什么不直接用 sanitize() 的文本输出：文本替换可能产出非法 JSON（见上），而解析器
+ * 会静默跳过坏行 ⇒ 假绿。这里改成「解析 → 改字段 → 序列化」，输出必然合法。
+ * 解析不了的行原样保留（它本来就是坏的，脱敏不该改变它的性质）。
+ */
+export function sanitizeJsonl(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => {
+      if (!line.trim()) return line;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        return line;
+      }
+      return JSON.stringify(scrub(parsed));
+    })
+    .join("\n");
+}
+
+/** 递归改字段：路径、模型名、供应商名、uuid、时刻。 */
+function scrub(value: unknown): unknown {
+  if (typeof value === "string") return scrubString(value);
+  if (Array.isArray(value)) return value.map(scrub);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) {
+      if (key === "project_context") {
+        out[key] = PROJECT_CONTEXT_REPLACEMENT;
+        continue;
+      }
+      // 这些键的值是标识符（模型路由名 / 供应商 / uuid / 工具调用 id / 绝对时刻），
+      // 规则里的正则带引号匹配的是 `"key":"value"` 整体——但值在这里是独立的字符串，
+      // 不带引号，所以按键名改，别指望那条正则。
+      if (key === "model") {
+        out[key] = typeof item === "string" ? item.replace(/^group\/[a-z-]+$/, "test/model") : item;
+        continue;
+      }
+      if (key === "provider") {
+        out[key] = typeof item === "string" ? item.replace(/^[a-z]+$/, "test/provider") : item;
+        continue;
+      }
+      if (key === "id" && typeof item === "string" && /^[0-9a-f-]{36}$/.test(item)) {
+        out[key] = "00000000-0000-4000-8000-000000000000";
+        continue;
+      }
+      if (key === "id" && typeof item === "string" && item.startsWith("call_")) {
+        out[key] = "call_test000000000000";
+        continue;
+      }
+      if (key === "timestamp" && typeof item === "number" && item > 1_000_000_000_000) {
+        out[key] = 1_700_000_000_000;
+        continue;
+      }
+      out[key] = scrub(item);
+    }
+    return out;
+  }
+  return value;
+}
+
+function scrubString(text: string): string {
   let out = text;
   for (const { from, to } of REPLACEMENTS) out = out.replace(from, to);
   return out;
@@ -67,10 +145,26 @@ function main(): void {
     process.exit(2);
   }
   const before = readFileSync(input, "utf8");
-  const after = sanitize(before);
+  const after = sanitizeJsonl(before);
+  // 自检：产物必须每行都是合法 JSON——不然解析器会静默跳过，测试照样绿
+  let bad = 0;
+  for (const [index, line] of after.split("\n").entries()) {
+    if (!line.trim()) continue;
+    try {
+      JSON.parse(line);
+    } catch {
+      bad += 1;
+      console.error(`第 ${index + 1} 行不是合法 JSON`);
+    }
+  }
+  if (bad > 0) {
+    console.error(`脱敏产物有 ${bad} 行非法 JSON，不许提交`);
+    process.exit(1);
+  }
   writeFileSync(output, after, "utf8");
-  const changed = before === after ? "无变化" : "已脱敏";
-  console.log(`${input} → ${output}：${changed}（${before.length} → ${after.length} 字节）`);
+  console.log(
+    `${input} → ${output}：已脱敏（${before.length} → ${after.length} 字节，每行 JSON 合法）`,
+  );
 }
 
 if (process.argv[1]?.endsWith("sanitize-fixture.ts")) main();
