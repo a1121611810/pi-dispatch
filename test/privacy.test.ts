@@ -22,11 +22,14 @@ import {
 } from "../scripts/privacy.ts";
 import { sanitize, sanitizeJsonl, REPLACEMENTS } from "../scripts/sanitize-fixture.ts";
 
+/** 测试用的"真名样本"——拼出来，文件里没有明文的家目录路径。 */
+const FAKE_HOME = "/Users/" + "real-user";
+
 test("隐私：真名家目录要报出来", () => {
-  const findings = scanText('const p = "/Users/real-user/develop/x";');
+  const findings = scanText(`const p = "${FAKE_HOME}/develop/x";`);
   assert.equal(findings.length, 1);
   assert.equal(findings[0]!.kind, "home-path");
-  assert.equal(findings[0]!.text, "/Users/real-user");
+  assert.equal(findings[0]!.text, FAKE_HOME);
 });
 
 test("隐私：占位符家目录放行（/Users/x/… 是文档里的示例写法）", () => {
@@ -37,7 +40,7 @@ test("隐私：占位符家目录放行（/Users/x/… 是文档里的示例写�
 });
 
 test("隐私：行号要准（报错得能直接定位）", () => {
-  const text = "line1\nline2\nconst p = '/Users/real-user/x';\nline4";
+  const text = `line1\nline2\nconst p = '${FAKE_HOME}/x';\nline4`;
   const findings = scanText(text);
   assert.equal(findings.length, 1);
   assert.equal(findings[0]!.line, 3);
@@ -81,6 +84,16 @@ test("隐私：模型路由组名与供应商前缀要报出来（能推出定�
   assert.ok(config.some((f) => f.kind === "route:vendor-config-path"));
 });
 
+test("隐私：裸的已知路由组名要报出来（文档里的散文写法）", () => {
+  for (const name of KNOWN_ROUTE_GROUP_NAMES) {
+    const found = scanText(`流量走 ${name} 这条`);
+    assert.ok(
+      found.some((f) => f.kind === "route:route-group-bare"),
+      `${name} 应当报出来`,
+    );
+  }
+});
+
 test("隐私：路由名占位符放行（示例与测试值不是真路由组）", () => {
   for (const name of ALLOWED_ROUTE_NAMES) {
     assert.deepEqual(scanText(`model = "${name}"`), [], `${name} 应当放行`);
@@ -119,7 +132,7 @@ test("隐私：规则文件与夹具用例自己豁免（它们里的家目录�
 });
 
 test("脱敏：家目录路径换成占位符", () => {
-  assert.equal(sanitize("/Users/real-user/x"), "/home/dev/x");
+  assert.equal(sanitize(`${FAKE_HOME}/x`), "/home/dev/x");
 });
 
 test("脱敏：模型路由名与供应商名换掉", () => {
@@ -150,7 +163,7 @@ test("脱敏：产物每行都必须是合法 JSON（解析器会静默跳过坏
 
 test("脱敏：整份 JSONL 走一遍，每行都得能解析", () => {
   const source = [
-    '{"type":"session","cwd":"/Users/real-user/x","id":"01a200ed-7e02-7508-ac60-412b1c0ff1fe"}',
+    `{"type":"session","cwd":"${FAKE_HOME}/x","id":"01a200ed-7e02-7508-ac60-412b1c0ff1fe"}`,
     `{"type":"message_end","message":{"provider":"${PRIVATE_VENDORS[0]}","model":"group/some-route"}}`,
     '{"type":"message_end","message":{"role":"assistant","project_context":"<project_context>\\n# Secret Rules\\n</project_context>"}}',
   ].join("\n");
@@ -158,7 +171,7 @@ test("脱敏：整份 JSONL 走一遍，每行都得能解析", () => {
   const lines = out.split("\n").filter(Boolean);
   assert.equal(lines.length, 3);
   for (const line of lines) assert.doesNotThrow(() => JSON.parse(line));
-  assert.ok(!out.includes("/Users/real-user"));
+  assert.ok(!out.includes(FAKE_HOME));
   assert.ok(!out.includes("group/some-route"));
   assert.ok(!out.includes("Secret Rules"));
 });
@@ -192,7 +205,10 @@ test("隐私：文档里不许有真路由名（数字留着，名字换成假�
   ];
   for (const doc of docs) {
     const raw = readFileSync(join(root, doc), "utf8");
-    assert.ok(!raw.includes(`${ROUTE_GROUP_PREFIX}/main-tier`), `${doc} 还有真路由组名`);
+    assert.ok(
+      !raw.includes(`${ROUTE_GROUP_PREFIX}/${KNOWN_ROUTE_GROUP_NAMES[0]}`),
+      `${doc} 还有真路由组名`,
+    );
     for (const name of KNOWN_ROUTE_GROUP_NAMES) {
       assert.ok(!raw.includes(name), `${doc} 还有裸的真路由组名 ${name}`);
     }

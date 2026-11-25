@@ -3181,6 +3181,15 @@ const CASES: Breakpoint[] = [
     why: "files 漏了 dist，装出来是空包；塞 src 则用户背一份跑不了的源码",
   },
   {
+    feature: "隐私扫描：裸的已知路由组名要报出来",
+    file: "scripts/privacy.ts",
+    from: "  ...KNOWN_ROUTE_GROUP_NAMES.map((name) => ({",
+    to: "  ...KNOWN_ROUTE_GROUP_NAMES.slice(0, 0).map((name) => ({",
+    test: "test/privacy.test.ts",
+    red: "隐私：裸的已知路由组名要报出来（文档里的散文写法）",
+    why: "裸形态的路由组名不再被报——文档里散文化写的真名就这么跟出去了",
+  },
+  {
     feature: "隐私扫描：模型路由组名要报出来",
     file: "scripts/privacy.ts",
     from: "  if (!routeExempt) {",
