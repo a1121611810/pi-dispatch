@@ -663,10 +663,9 @@ test("真起进程：exit 事件与 close 事件的顺序——退出码要等 c
 });
 
 test("真起进程：pi --version 能跑（确认可执行文件路径可用）", () => {
-  const cli = join(
-    "/home/dev/develop/pi-dispatch",
-    "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
-  );
+  // 从测试文件自身位置推仓根：写死绝对路径的话，只有作者那台机器能跑（CI 抓到的）
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const cli = join(repoRoot, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
   const out = execFileSync(process.execPath, [cli, "--version"], { encoding: "utf8" });
   assert.match(out, /\d+\.\d+/);
 });
