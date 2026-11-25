@@ -2031,6 +2031,34 @@
         </p>
       </div>
 
+      <div class="card">
+        <h3>缓存复用可观测：首轮复用率 + 前缀形状</h3>
+        <p>
+          前缀稳了不等于缓存命中。命中与否此前<b>完全不可观测</b>——只看得见总用量，分不出「首轮就共享上了」和「全程都能复用」。所以引擎从事件流留<b>逐轮明细</b>（<code>observedTurns</code>），算两个数：
+        </p>
+        <p>
+          <b>首轮复用率</b> = 首轮 <code>cacheRead / (input + cacheRead + cacheWrite)</code>。只看第
+          0 轮——后续轮天然会升高，混在一起会互相抵消，把首轮冷启动掩盖掉。<b>增量命中率</b> = 本轮
+          <code>cacheRead / min(上一轮 prompt, 本轮 prompt)</code>；取较小值是因为本轮 prompt 可能被
+          compaction 截短，此时上轮全部都可能被复用。
+        </p>
+        <p>
+          <b>前缀形状</b>（<code>tools</code> 排序后 + <code>isolated</code> +
+          <code>repoRoot</code>）是天然的组
+          key。<b>不做哈希</b>：组数很少，存形状更可读、能直接看出分叉维度，也少一个可被等价变异的哈希实现。
+        </p>
+        <p>
+          ⚠️ <b>复用率低不等于前缀有问题。</b>三种情况都会低：形状是孤儿（没有兄弟可共享）⇒
+          形状问题；亲和头失效 / 路由翻转 ⇒ 路由问题；这个前缀从没被写过（新任务、新仓库）⇒
+          <b>正常</b>。所以单看复用率只能判「机制状态」，判不了原因——原因要看形状分组。
+        </p>
+        <p style="margin-bottom: 0">
+          <b>只进记录，不进正文。</b>判定与形状随回执的
+          <code>cache</code>
+          字段走，<b>不改孩子的交付物</b>——正文逐字节就是孩子写的那些字，不掺观测注释。
+        </p>
+      </div>
+
       <h3>思考档位：派发前按模型校验</h3>
       <p>
         pi 的 <code>clampThinkingLevel</code> 会<b>往上找</b>可用档位：vendor-local 的

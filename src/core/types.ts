@@ -1,5 +1,6 @@
 // 派发核心的类型定义。
 // 核心层不 import pi —— 所有与宿主相关的形状都在这里定义，由适配层翻译。
+import type { CacheObservation } from "./cache-metrics.ts";
 
 /** 任务状态。四个终态哪儿也去不了。 */
 export type TaskStatus =
@@ -247,6 +248,8 @@ export interface TaskRecord {
   reportChannel?: ReportChannel;
   /** 孩子的真实用量（引擎从事件流逐轮累加，不依赖孩子交报告） */
   usage?: ChildUsage;
+  /** 缓存复用观测（引擎算，不依赖孩子交报告） */
+  cache?: CacheObservation;
   /** 孩子的真实交付轨迹（引擎抽的，不是模型自述） */
   delivery?: ChildDelivery;
   /** 自述的文件和收据一个都对不上——没有实测支撑 */
@@ -295,6 +298,8 @@ export interface DispatchResult {
   /** finishedAt - startedAt（ms） */
   durationMs: number;
   usage?: ChildUsage;
+  /** 缓存复用观测（引擎算，不依赖孩子交报告） */
+  cache?: CacheObservation;
   errorMessage?: string;
   readOnlyTier: ReadOnlyTier;
   outputPath: string;

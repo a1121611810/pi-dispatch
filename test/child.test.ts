@@ -1976,6 +1976,34 @@ test("收件：增量用量在没有用量事件时是 null（与终局口径一
   assert.equal(tracker.snapshot().turns, 0);
 });
 
+test("用量：tracker 留住逐轮明细", () => {
+  const tracker = createUsageTracker();
+  tracker.push(REAL_USAGE_STREAM.slice(0, REAL_USAGE_STREAM.indexOf("\n") + 1));
+  tracker.push(REAL_USAGE_STREAM.slice(REAL_USAGE_STREAM.indexOf("\n") + 1));
+  tracker.finish();
+  assert.equal(tracker.turns.length, 7, "真机样本 7 轮 assistant，逐轮明细一条不许丢");
+  assert.equal(tracker.turns.length, tracker.snapshot().turns, "明细条数 == 计数");
+  assert.equal(tracker.turns[0]!.input, 2605, "第 0 轮就是首轮");
+  assert.equal(tracker.turns[0]!.cacheRead, 128);
+  assert.equal(tracker.turns[0]!.promptTokens, 2605 + 128 + 0);
+});
+
+test("用量：逐轮明细的累计等于总额", () => {
+  const tracker = createUsageTracker();
+  tracker.push(REAL_USAGE_STREAM);
+  tracker.finish();
+  const snap = tracker.snapshot();
+  const sum = (key: "input" | "output" | "cacheRead" | "cacheWrite"): number =>
+    tracker.turns.reduce((total, turn) => total + turn[key], 0);
+  assert.equal(sum("input"), snap.usage?.input);
+  assert.equal(sum("output"), snap.usage?.output);
+  assert.equal(sum("cacheRead"), snap.usage?.cacheRead);
+  assert.equal(sum("cacheWrite"), snap.usage?.cacheWrite);
+  for (const turn of tracker.turns) {
+    assert.equal(turn.promptTokens, turn.input + turn.cacheRead + turn.cacheWrite);
+  }
+});
+
 // ── 前缀稳定化：附加块恒定，变的内容进 user message ──────────────────────
 
 test("拼命令：附加块恒定（why 不进系统提示词）", () => {

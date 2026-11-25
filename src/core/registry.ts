@@ -48,6 +48,8 @@ export type TaskCommand =
       delivery?: TaskRecord["delivery"];
       /** 引擎观测到的真实用量（与报告独立：孩子没交报告，账也要有） */
       usage?: TaskRecord["usage"];
+      /** 引擎算的缓存复用观测（与报告独立：孩子没交报告，观测也要有） */
+      cache?: TaskRecord["cache"];
       /** 自述对不上收据（没有实测支撑） */
       unverified?: boolean;
       /** 谎报自检（声称的命令一条都没观测到） */
@@ -284,6 +286,7 @@ export class TaskRegistry {
           reportChannel: command.channel,
           delivery: command.delivery ?? current.delivery,
           usage: command.usage ?? current.usage,
+          cache: command.cache ?? current.cache,
           ...(command.unverified ? { deliveryUnverified: true } : {}),
           ...(command.verifyUnverified ? { verifyUnverified: true } : {}),
           ...(command.vacuous ? { assessmentVacuous: true } : {}),

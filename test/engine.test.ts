@@ -3582,3 +3582,40 @@ test("引擎：软门后孩子交了差 ⇒ 报告旗标与预算旗标不互相
   await engine.shutdown();
   rmSync(dir, { recursive: true, force: true });
 });
+
+// ── 引擎：缓存复用观测（回执带判定 + 首轮复用率） ───────────────────────
+
+test("引擎：回执带上缓存观测（判定 + 首轮复用率）", async () => {
+  const stream = [
+    usageLine({ input: 100, output: 5, cacheRead: 900 }, "结论"),
+    usageLine({ input: 900, output: 7, cacheRead: 100 }, "结论"),
+  ].join("\n");
+  const { engine } = freshEngine({
+    spawn: fakeSpawn({ stdout: `${stream}\n`, exitCode: 0 }),
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活" });
+  const result = outcome as {
+    status: string;
+    cache?: { verdict?: string; reuse?: number; shape?: { isolated?: boolean } };
+  };
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.cache?.verdict, "healthy", "首轮 cacheRead 900/1000 ⇒ healthy");
+  assert.equal(result.cache?.reuse, 0.9, "首轮复用率 0.9（只看第 0 轮）");
+  assert.equal(result.cache?.shape?.isolated, false, "默认不开隔离");
+  await engine.shutdown();
+});
+
+test("引擎：首轮没共享时判定如实记录，但不改正文（提示留给记录，不污染交付物）", async () => {
+  const stream = usageLine({ input: 2000, output: 5, cacheWrite: 800 }, "结论");
+  const { engine } = freshEngine({
+    spawn: fakeSpawn({ stdout: `${stream}\n`, exitCode: 0 }),
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活" });
+  const result = outcome as { status: string; text: string; cache?: { verdict?: string } };
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.cache?.verdict, "not-reusing", "首轮 cacheRead=0 ⇒ not-reusing");
+  assert.equal(result.text, "结论", "正文逐字节就是孩子的交付物，不掺观测注释");
+  await engine.shutdown();
+});

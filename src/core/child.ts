@@ -337,6 +337,8 @@ export interface ParsedChildStream {
   observedUsage: ChildUsage | null;
   /** 所有轮次的用量合计（每轮 usage 是单次请求量，账要按累计算） */
   observedUsageTotal: ChildUsage | null;
+  /** 逐轮用量明细（缓存复用分析要它；累计 == observedUsageTotal） */
+  observedTurns: TurnUsage[];
   /** 流里实测到的孩子模型/provider */
   observedModel: string | null;
   observedProvider: string | null;
@@ -363,6 +365,8 @@ interface StreamAcc {
   observedUsage: ChildUsage | null;
   /** 所有轮次的用量合计（每轮 usage 是单次请求量，账要按累计算） */
   usageTotal: ChildUsage | null;
+  /** 逐轮用量明细（缓存复用分析要它；累计 == usageTotal） */
+  turns: TurnUsage[];
   observedModel: string | null;
   observedProvider: string | null;
   tools: Record<string, number>;
@@ -415,6 +419,7 @@ function emptyStreamAcc(): StreamAcc {
     toolReport: null,
     observedUsage: null,
     usageTotal: null,
+    turns: [],
     observedModel: null,
     observedProvider: null,
     // 无原型对象：工具名 "__proto__" / "constructor" 也能正常计数
@@ -506,6 +511,32 @@ function takeUsage(usage: NonNullable<NonNullable<StreamEvent["message"]>["usage
   };
 }
 
+/** 一轮 assistant 回合的用量明细：缓存复用分析要它（首轮 = 数组第 0 个）。 */
+export interface TurnUsage {
+  /** 本轮 prompt 的未命中 token */
+  input: number;
+  output: number;
+  /** 本轮命中缓存的 token */
+  cacheRead: number;
+  cacheWrite: number;
+  /** 本轮 prompt 总 token（input + cacheRead + cacheWrite） */
+  promptTokens: number;
+}
+
+/** ChildUsage → TurnUsage：缺席字段按 0（与 addUsage 的口径一致），promptTokens 当场钉死。 */
+function turnUsageOf(usage: ChildUsage): TurnUsage {
+  const input = usage.input ?? 0;
+  const cacheRead = usage.cacheRead ?? 0;
+  const cacheWrite = usage.cacheWrite ?? 0;
+  return {
+    input,
+    output: usage.output ?? 0,
+    cacheRead,
+    cacheWrite,
+    promptTokens: input + cacheRead + cacheWrite,
+  };
+}
+
 /** 有限数才留（NaN / Infinity 一律当没给）。 */
 function finiteNumber(value: number | undefined): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
@@ -529,6 +560,8 @@ function takeAssistant(message: NonNullable<StreamEvent["message"]>, acc: Stream
   if (message.usage) {
     const usage = takeUsage(message.usage);
     acc.observedUsage = usage;
+    // 逐轮明细：首轮复用率要从第 0 轮算，只有总额时分不出「首轮」与「全程」
+    acc.turns.push(turnUsageOf(usage));
     // 正文取最后一条，用量要累加——每一轮都花了钱
     acc.usageTotal = addUsage(acc.usageTotal, usage);
   }
@@ -672,11 +705,13 @@ export interface UsageTracker {
   finish(): void;
   /** 累计用量 + assistant 回合数。 */
   snapshot(): { usage: ChildUsage | null; turns: number };
+  /** 逐轮明细——缓存命中分析要它。turns.length 恒等于 snapshot().turns。 */
+  turns: TurnUsage[];
 }
 
 export function createUsageTracker(): UsageTracker {
   let usage: ChildUsage | null = null;
-  let turns = 0;
+  const turns: TurnUsage[] = [];
   let buffer = "";
   const consume = (line: string): void => {
     const event = parseLine(line);
@@ -684,7 +719,7 @@ export function createUsageTracker(): UsageTracker {
     const message = event.message;
     if (message.role !== "assistant") return;
     if (!message.usage) return;
-    turns += 1;
+    turns.push(turnUsageOf(takeUsage(message.usage)));
     usage = addUsage(usage, takeUsage(message.usage));
   };
   const drain = (final: boolean): void => {
@@ -708,8 +743,9 @@ export function createUsageTracker(): UsageTracker {
       drain(true);
     },
     snapshot() {
-      return { usage, turns };
+      return { usage, turns: turns.length };
     },
+    turns,
   };
 }
 
@@ -776,6 +812,7 @@ export function parseChildStream(stdout: string): ParsedChildStream {
     toolReport: acc.toolReport,
     observedUsage: acc.observedUsage,
     observedUsageTotal: acc.usageTotal,
+    observedTurns: acc.turns,
     observedModel: acc.observedModel,
     observedProvider: acc.observedProvider,
     delivery: {

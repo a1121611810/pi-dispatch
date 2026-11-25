@@ -48,6 +48,7 @@ import {
   usdOf,
 } from "./budget.ts";
 import { findThinkingModel, resolveThinkingLevel, type ThinkingModelInfo } from "./thinking.ts";
+import { observeCache } from "./cache-metrics.ts";
 import type { TaskRegistry } from "./registry.ts";
 import type {
   BudgetReceipt,
@@ -1072,6 +1073,13 @@ export class TaskEngine {
     const outputPath = this.#storage ? this.#storage.persistOutput(taskId, text) : "";
     const parsed = parseChildStream(text);
     const finalText = parsed.text || text;
+    // 缓存复用观测：逐轮明细来自 parseChildStream（与记账同一口径），
+    // 形状取 pi 实际给孩子声明的工具清单（观测，不是预测）+ 隔离档位 + 仓库根。
+    const cacheObservation = observeCache(parsed.observedTurns, {
+      tools: parsed.declaredTools,
+      isolated: input.isolation === "worktree",
+      ...(this.#repoRoot ? { repoRoot: this.#repoRoot } : {}),
+    });
     const steerEvidence = evidence.finish();
     // 预算回执的终值：已花的钱与 token 以观测为准（孩子自报的不算数）
     if (input.usageBudget) {
@@ -1120,6 +1128,7 @@ export class TaskEngine {
       channel,
       delivery: parsed.delivery,
       usage: parsed.observedUsageTotal ?? undefined,
+      cache: cacheObservation,
       unverified,
       verifyUnverified: verifyFailed,
       vacuous: assessmentVacuous(report),
@@ -1169,6 +1178,8 @@ export class TaskEngine {
       started: startedAt > 0,
       durationMs: startedAt && finishedAt ? finishedAt - startedAt : 0,
       usage: record.usage ?? record.report?.usage,
+      // 缓存观测跟用量并列（键只在引擎观测到时出现）
+      ...(record.cache ? { cache: record.cache } : {}),
       errorMessage:
         record.status === "succeeded" ? undefined : (record.stopReason ?? record.status),
       readOnlyTier: input.readOnly ?? "lenient",
