@@ -62,11 +62,9 @@ function record(id: string, status: TaskRecord["status"] = "succeeded"): TaskRec
 // ── 桶名编码 ──────────────────────────────────────────────────────────────
 
 test("桶名编码：照抄 pi 的会话目录编码", () => {
-  assert.equal(
-    encodeBucket("/home/dev/develop/pi-dispatch"),
-    "--Users-real-user-develop-pi-dispatch--",
-  );
   assert.equal(encodeBucket("/Users/x/proj"), "--Users-x-proj--");
+  // 深层路径也要逐段换成 -（示例路径别用真名，用占位符）
+  assert.equal(encodeBucket("/Users/x/develop/some-proj"), "--Users-x-develop-some-proj--");
 });
 
 test("桶名编码：分隔符全换 -", () => {

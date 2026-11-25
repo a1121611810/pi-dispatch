@@ -45,7 +45,17 @@ TMPDIR=$(getconf DARWIN_USER_TEMP_DIR) pnpm test
 | `GLOSSARY.md`              | 术语表：功能点 / 破坏点 / 假绿 / 验红……        |
 | 测试文件头                 | 等价变异说明（mutator 杀不掉的，写清为何等价） |
 | `scripts/breakpoints.ts`   | 假绿账本，可执行                               |
+| `scripts/privacy.ts`       | 隐私扫描规则（家目录 / 密钥 / 邮箱）           |
 | 本文件                     | 只写环境查不到的：顺序、坑、约定               |
+
+## 别把本机的东西带进仓库
+
+真机抓的样本（`test/fixtures/*.jsonl`）和文档里的路径示例，最容易带出家目录、
+模型路由名、全局 agent 配置。新抓的样本先跑 `pnpm sanitize:fixture <in> <out>` 脱敏，
+再提交。`pnpm check:privacy` 扫全部入库文件，命中就红——CI 也跑它。
+
+规则与豁免清单在 `scripts/privacy.ts`；`scripts/privacy.ts` / `scripts/privacy-gate.ts` /
+`scripts/sanitize-fixture.ts` / `test/privacy.test.ts` 这四个文件自己豁免（里面的路径是故意的）。
 
 ## 仓库约定
 

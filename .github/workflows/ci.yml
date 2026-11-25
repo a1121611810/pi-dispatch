@@ -26,6 +26,8 @@ jobs:
       - run: pnpm lint
       - run: pnpm check
       - run: pnpm test
+      # 真机样本和文档示例最会把作者的家目录/密钥带出来——扫入库文件，命中就红
+      - run: pnpm check:privacy
       # 322 条破坏点逐个改源码再复原：必须单 job 串行，不能和别的变异测试并行
       - run: pnpm check:breakpoints
       # 故意不跑 pnpm mutate：本机实测 57 分钟（1291 个位点）。
