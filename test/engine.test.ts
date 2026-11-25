@@ -3352,8 +3352,8 @@ test("引擎：预算回执带上限、已花的钱与 token", async () => {
 
 /** 本机 vendor-local 的真实档位图：medium / minimal / xhigh 是显式 null。 */
 const MAGPIE: ThinkingModelInfo = {
-  provider: "vendor-local",
-  id: "regex:group/main",
+  provider: "test-vendor",
+  id: "group/main",
   reasoning: true,
   thinkingLevelMap: {
     high: "high",
@@ -3381,7 +3381,7 @@ test("引擎：thinking 降级写进回执（requested/effective/reason）", asy
   });
   const outcome = await engine.dispatch({
     task: "干活",
-    model: "regex:test-vendor/group/main",
+    model: "test-vendor/group/main",
     thinkingLevel: "medium",
   });
   const result = outcome as {
@@ -3400,7 +3400,7 @@ test("引擎：thinking 降级写进回执（requested/effective/reason）", asy
   assert.match(result.thinking?.reason ?? "", /medium/);
 });
 
-test("引擎：thinking 降级进 argv（medium ⇒ --model regex:test-vendor/group/main:low）", async () => {
+test("引擎：thinking 降级进 argv（medium ⇒ --model test-vendor/group/main:low）", async () => {
   const capture = captureSpawn({});
   const { engine } = freshEngine({
     spawn: capture.spawn,
@@ -3409,7 +3409,7 @@ test("引擎：thinking 降级进 argv（medium ⇒ --model regex:test-vendor/gr
   });
   const outcome = await engine.dispatch({
     task: "干活",
-    model: "regex:test-vendor/group/main",
+    model: "test-vendor/group/main",
     thinkingLevel: "medium",
   });
   assert.equal((outcome as { status: string }).status, "succeeded");
@@ -3417,7 +3417,7 @@ test("引擎：thinking 降级进 argv（medium ⇒ --model regex:test-vendor/gr
   const argv = capture.argvs[0]!;
   assert.equal(
     argv[argv.indexOf("--model") + 1],
-    "regex:test-vendor/group/main:low",
+    "test-vendor/group/main:low",
     "argv 用的是校验后的档位，不是请求的 medium",
   );
   await engine.shutdown();
@@ -3430,9 +3430,9 @@ test("引擎：不给档位 ⇒ argv 不带档位后缀", async () => {
     hostMode: "one-shot",
     thinkingCatalog: () => [MAGPIE],
   });
-  await engine.dispatch({ task: "干活", model: "regex:test-vendor/group/main" });
+  await engine.dispatch({ task: "干活", model: "test-vendor/group/main" });
   const argv = capture.argvs[0]!;
-  assert.equal(argv[argv.indexOf("--model") + 1], "regex:test-vendor/group/main");
+  assert.equal(argv[argv.indexOf("--model") + 1], "test-vendor/group/main");
   await engine.shutdown();
 });
 
@@ -3456,7 +3456,7 @@ test("引擎：非思考模型 ⇒ argv 不带档位后缀（off）", async () =
 
 test("引擎：受理时钉死模型（排队期间会话模型变了也不换）", async () => {
   const oneSeat = Math.floor(2.4 * GiB) + 512 * MiB + 100 * MiB;
-  let sessionModel = "regex:test-vendor/group/main";
+  let sessionModel = "test-vendor/group/main";
   const capture = captureSpawn({ delayMs: 250 });
   const { registry, engine } = freshEngine({
     machineReader: machineReader(oneSeat),
@@ -3477,7 +3477,7 @@ test("引擎：受理时钉死模型（排队期间会话模型变了也不换�
   const argv = capture.argvs[1]!;
   assert.equal(
     argv[argv.indexOf("--model") + 1],
-    "regex:test-vendor/group/main:low",
+    "test-vendor/group/main:low",
     "spawn 用受理时钉死的模型，不读排队期间变过的会话模型",
   );
   await engine.shutdown();

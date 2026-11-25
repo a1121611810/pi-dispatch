@@ -40,8 +40,8 @@ import { effectiveModel } from "../src/core/child.ts";
 
 /** 本机 vendor-local 的真实档位图：medium / minimal / xhigh 是显式 null（不支持）。 */
 const MAGPIE: ThinkingModelInfo = {
-  provider: "vendor-local",
-  id: "regex:group/main",
+  provider: "test-vendor",
+  id: "group/main",
   reasoning: true,
   thinkingLevelMap: {
     high: "high",
@@ -227,9 +227,9 @@ test("思考档位：reasoning=true 但没有 thinkingLevelMap ⇒ xhigh 落到 
 
 test("思考档位：裸 id 唯一命中也能找到模型", () => {
   const catalog = [MAGPIE, NO_EXTENDED];
-  assert.equal(findThinkingModel(catalog, "regex:group/main"), MAGPIE, "裸 id 唯一命中");
+  assert.equal(findThinkingModel(catalog, "group/main"), MAGPIE, "裸 id 唯一命中");
   assert.equal(
-    findThinkingModel(catalog, "regex:test-vendor/group/main"),
+    findThinkingModel(catalog, "test-vendor/group/main"),
     MAGPIE,
     "provider/id 精确命中",
   );
@@ -278,7 +278,7 @@ test("思考档位：没给档位 ⇒ 沿用会话默认（不擅自替父方降
 
 test("思考档位：没给 model 时用会话模型查目录", () => {
   const catalog = [MAGPIE];
-  const model = effectiveModel({ model: undefined, sessionModel: "regex:test-vendor/group/main" });
+  const model = effectiveModel({ model: undefined, sessionModel: "test-vendor/group/main" });
   const found = findThinkingModel(catalog, model);
   const result = resolveThinkingLevel({ requested: "medium", model: found });
   assert.equal(result.modelKnown, true, "会话模型要真的拿去查目录");

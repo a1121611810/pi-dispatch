@@ -15,6 +15,49 @@ export const EXEMPT_FILES: readonly string[] = [
   "test/privacy.test.ts",
 ];
 
+/**
+ * 成本分析文档豁免：这几份文档的核心内容就是分析真实路由组的定价与命中率，
+ * 换成假值就变成没有数字的空壳。它们是本仓最有价值的产出，不做脱敏。
+ */
+export const EXEMPT_ROUTE_FILES: readonly string[] = [
+  "docs/spec/cache-hit-analysis.md",
+  "docs/spec/cache-strategy-2026-11-25.md",
+  "docs/spec/cost-control-plan.md",
+  "docs/spec/cost-control.md",
+];
+
+/**
+ * 基础设施布局的模式。
+ *
+ * 「模型路由组名」和「供应商前缀」与家目录同级——它们能推出你的模型供应商、
+ * 定价结构与本机配置布局（`~/.config/<vendor>/providers.json` 这种路径也在其中）。
+ * 所以一并扫。
+ */
+/**
+ * 私有供应商名（自建网关 / 个人路由）。这些名字本身就能认出是谁的机器，
+ * 所以要扫。公共供应商（anthropic/openai/google…）不扫——它们不指向个人。
+ * 新增自建网关时往这里加一条。
+ */
+export const PRIVATE_VENDORS: readonly string[] = ["vendor-local"];
+
+export const ROUTE_PATTERNS: readonly { name: string; re: RegExp }[] = [
+  // 路由组：group/xxx（main-tier、quality-tier、analysis-tier…）
+  // 必须带 g 标志：下面用 while + exec 扫全部命中，不带 g 时 lastIndex 不推进 ⇒ 死循环
+  { name: "model-route-group", re: /\bgroup\/[a-z][a-z0-9-]{2,}\b/g },
+  // 私有供应商前缀：vendor-local/xxx
+  { name: "vendor-prefix", re: /\bvendor-local\/[A-Za-z0-9._-]+/g },
+  // 本机配置路径：~/.config/vendor-local/…
+  { name: "vendor-config-path", re: /\.config\/vendor-local\//g },
+];
+
+/** 占位符白名单：这些是示例/测试值，不是真路由组。 */
+export const ALLOWED_ROUTE_NAMES: readonly string[] = [
+  "group/main",
+  "group/example",
+  "group/x",
+  "test-vendor",
+];
+
 /** 允许出现在路径示例里的家目录用户名——其余一律当作泄漏。 */
 export const ALLOWED_HOME_USERS: readonly string[] = [
   "x",
@@ -66,6 +109,8 @@ function isAllowedUser(user: string): boolean {
 export function scanText(text: string, file = "<text>"): Finding[] {
   const findings: Finding[] = [];
   const lines = text.split("\n");
+  // 路由名/供应商：成本分析文档豁免（它们的分析对象就是真路由组）
+  const routeExempt = EXEMPT_ROUTE_FILES.includes(file);
 
   const homeRe = new RegExp(`/(?:${HOME_ROOTS.join("|")})/([A-Za-z0-9._-]+)`, "g");
   lines.forEach((line, index) => {
@@ -104,6 +149,19 @@ export function scanText(text: string, file = "<text>"): Finding[] {
       }
     }
   });
+
+  if (!routeExempt) {
+    for (const { name, re } of ROUTE_PATTERNS) {
+      lines.forEach((line, index) => {
+        re.lastIndex = 0;
+        let found: RegExpExecArray | null;
+        while ((found = re.exec(line)) !== null) {
+          if (ALLOWED_ROUTE_NAMES.includes(found[0])) continue;
+          findings.push({ file, line: index + 1, kind: `route:${name}`, text: found[0] });
+        }
+      });
+    }
+  }
 
   return findings;
 }

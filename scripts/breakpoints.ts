@@ -2896,7 +2896,7 @@ const CASES: Breakpoint[] = [
       "      : (input.thinkingLevel ?? undefined);",
     to: "    const thinkingLevel = input.thinkingLevel ?? undefined;",
     test: "test/engine.test.ts",
-    red: "引擎：thinking 降级进 argv（medium ⇒ --model regex:test-vendor/group/main:low）",
+    red: "引擎：thinking 降级进 argv（medium ⇒ --model test-vendor/group/main:low）",
     why: "argv 直接用请求档位（medium），降级结果没进 --model",
   },
   {
@@ -3179,6 +3179,24 @@ const CASES: Breakpoint[] = [
     test: "test/packaging.test.ts",
     red: "打包：只发运行件——dist 在，src/test/scripts 不在",
     why: "files 漏了 dist，装出来是空包；塞 src 则用户背一份跑不了的源码",
+  },
+  {
+    feature: "隐私扫描：模型路由组名要报出来",
+    file: "scripts/privacy.ts",
+    from: "  if (!routeExempt) {",
+    to: "  if (false) {",
+    test: "test/privacy.test.ts",
+    red: "隐私：模型路由组名与供应商前缀要报出来（能推出定价与供应商）",
+    why: "路由组名与供应商前缀不再被报——它们能推出定价结构与本机配置布局",
+  },
+  {
+    feature: "隐私扫描：路由名占位符要放行",
+    file: "scripts/privacy.ts",
+    from: "          if (ALLOWED_ROUTE_NAMES.includes(found[0])) continue;",
+    to: "          continue;",
+    test: "test/privacy.test.ts",
+    red: "隐私：路由名占位符放行（示例与测试值不是真路由组）",
+    why: "占位符也被报成泄漏——门禁天天假红，没人看它",
   },
   {
     feature: "隐私扫描：真名家目录要报出来",

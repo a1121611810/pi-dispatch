@@ -10,9 +10,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   ALLOWED_HOME_USERS,
+  ALLOWED_ROUTE_NAMES,
   EXEMPT_FILES,
+  EXEMPT_ROUTE_FILES,
   isBinaryFile,
   isExempt,
+  PRIVATE_VENDORS,
   scanText,
 } from "../scripts/privacy.ts";
 import { sanitize, sanitizeJsonl, REPLACEMENTS } from "../scripts/sanitize-fixture.ts";
@@ -64,6 +67,39 @@ test("隐私：保留域名的邮箱不算（测试里故意用不可达的）",
   const real = scanText("mail me at real-user@personal.dev");
   assert.equal(real.length, 1);
   assert.equal(real[0]!.kind, "email");
+});
+
+test("隐私：模型路由组名与供应商前缀要报出来（能推出定价与供应商）", () => {
+  const group = scanText('const model = "regex:group/main";');
+  assert.equal(group.length, 1);
+  assert.equal(group[0]!.kind, "route:model-route-group");
+  const vendor = scanText('const model = "regex:test-vendor/group/main";');
+  assert.ok(vendor.some((f) => f.kind === "route:vendor-prefix"));
+  const config = scanText("数据来自 ~/.config/vendor-local/affinity.json");
+  assert.ok(config.some((f) => f.kind === "route:vendor-config-path"));
+});
+
+test("隐私：路由名占位符放行（示例与测试值不是真路由组）", () => {
+  for (const name of ALLOWED_ROUTE_NAMES) {
+    assert.deepEqual(scanText(`model = "${name}"`), [], `${name} 应当放行`);
+  }
+  // 对照：白名单外的仍要报。没这条的话，白名单判断被改成「全部 continue」也是绿的
+  assert.ok(scanText('model = "group/some-real-route"').length > 0, "白名单外的路由名仍要报出来");
+  for (const vendor of PRIVATE_VENDORS) {
+    assert.ok(
+      scanText(`model = "${vendor}/group/x"`).length > 0,
+      `私有供应商 ${vendor} 仍要报出来`,
+    );
+  }
+});
+
+test("隐私：成本分析文档豁免路由名扫描（分析对象就是真路由组）", () => {
+  const doc = "docs/spec/cost-control.md";
+  assert.deepEqual(scanText('model = "regex:group/main"', doc), [], "成本文档不报");
+  assert.ok(scanText('model = "regex:group/main"').length > 0, "同样的内容换个文件就报");
+  for (const file of EXEMPT_ROUTE_FILES) {
+    assert.deepEqual(scanText("regex:group/main vendor-local/x", file), [], `${file} 应当豁免`);
+  }
 });
 
 test("隐私：二进制文件不扫（扫出来是乱码）", () => {

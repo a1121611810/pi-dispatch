@@ -78,7 +78,7 @@ const REAL_STREAM = [
   '{"type":"agent_start"}',
   '{"type":"turn_start"}',
   '{"type":"message_start","message":{"role":"assistant","content":[],"stopReason":"pending"}}',
-  '{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"read the file"},{"type":"text","text":"12"}],"api":"openai-completions","provider":"vendor-local","model":"regex:group/main","usage":{"input":2484,"output":3,"cacheRead":128,"cacheWrite":0,"totalTokens":2615,"cost":{"input":0.0003726,"output":0.0000018,"cacheRead":0.00000192,"cacheWrite":0,"total":0.00037632}}}}',
+  '{"type":"message_end","message":{"role":"assistant","content":[{"type":"thinking","thinking":"read the file"},{"type":"text","text":"12"}],"api":"openai-completions","provider":"vendor-local","model":"group/main","usage":{"input":2484,"output":3,"cacheRead":128,"cacheWrite":0,"totalTokens":2615,"cost":{"input":0.0003726,"output":0.0000018,"cacheRead":0.00000192,"cacheWrite":0,"total":0.00037632}}}}',
   '{"type":"tool_execution_start","toolCallId":"call_1","toolName":"read","args":{"path":"/etc/hosts"}}',
   '{"type":"tool_execution_start","toolCallId":"call_2","toolName":"bash","args":{"command":"grep -n localhost /etc/hosts"}}',
   '{"type":"tool_execution_end","toolCallId":"call_1","toolName":"read","result":{"content":[]},"isError":false,"durationMs":5}',
@@ -323,7 +323,7 @@ test("拼命令：契约块里的工具名与常量一致", () => {
 test("收件：真机样本里抽出正文、模型、用量", () => {
   const parsed = parseChildStream(REAL_STREAM);
   assert.equal(parsed.text, "12", "正文是最后一条 assistant 的 text");
-  assert.equal(parsed.observedModel, "regex:group/main");
+  assert.equal(parsed.observedModel, "group/main");
   assert.equal(parsed.observedProvider, "vendor-local");
   assert.equal(parsed.observedUsage?.input, 2484);
   assert.equal(parsed.observedUsage?.output, 3);
