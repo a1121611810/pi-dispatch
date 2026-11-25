@@ -21,6 +21,18 @@ pi 的扩展：派子代理（队列 / 座位池 / 生命周期），收四样�
 5. 新分支 / 解析器 / 钱或安全 → `pnpm mutate`：能杀则杀，杀不掉的写进对应测试文件头的「等价变异」段（写明为何在可达输入上等价）。
 6. 行为变了 → `docs/spec/core-spec.html` 同步。
 
+## 本机的坑
+
+`pnpm test` 的 worktree 腿吃 `TMPDIR`。宿主把 `TMPDIR` 指到别处时（Alma 的 Bash 就把它设成 `~/.config/alma/scratch`），「worktree：分支建在受理时钉死的 baseCommit 上」会假红，报 `fatal: not a git repository` 或 `Unable to read current working directory`。**与代码无关**——stash 掉全部改动后照样失败。
+
+跑门禁前先钉死：
+
+```bash
+TMPDIR=$(getconf DARWIN_USER_TEMP_DIR) pnpm test
+```
+
+`pnpm check:breakpoints` 和 `pnpm mutate` 同理会跑测试，也带同一个前缀。
+
 ## 何时跑真机
 
 `pnpm test:mode` 花真模型钱，只在改了这三处后手动跑：拼命令（`buildPiArgv`）、事件流解析（`parseChildStream`）、报告通道 / 用量。外加：TUI 人看面（`src/tui.ts` 的渲染/接线/清面）——完成线含 tui 腿「在飞上过屏、跑完面板即清」全 ✅。其余腿的完成线照旧：全部用例 ✅，含「没交报告账上也有数」（`reportChannel=none` 时用量仍非零）。
