@@ -13,9 +13,11 @@ import {
   ALLOWED_ROUTE_NAMES,
   EXEMPT_FILES,
   EXEMPT_ROUTE_FILES,
+  KNOWN_ROUTE_GROUP_NAMES,
   isBinaryFile,
   isExempt,
   PRIVATE_VENDORS,
+  ROUTE_GROUP_PREFIX,
   scanText,
 } from "../scripts/privacy.ts";
 import { sanitize, sanitizeJsonl, REPLACEMENTS } from "../scripts/sanitize-fixture.ts";
@@ -190,10 +192,12 @@ test("隐私：文档里不许有真路由名（数字留着，名字换成假�
   ];
   for (const doc of docs) {
     const raw = readFileSync(join(root, doc), "utf8");
-    assert.ok(!raw.includes("group/main"), `${doc} 还有真路由组名`);
-    assert.ok(!raw.includes("main-tier"), `${doc} 还有裸的真路由组名`);
-    assert.ok(!raw.includes("vendor-local"), `${doc} 还有真供应商名`);
-    assert.ok(!raw.includes("quality-tier"), `${doc} 还有真路由组名`);
+    assert.ok(!raw.includes(`${ROUTE_GROUP_PREFIX}/main-tier`), `${doc} 还有真路由组名`);
+    for (const name of KNOWN_ROUTE_GROUP_NAMES) {
+      assert.ok(!raw.includes(name), `${doc} 还有裸的真路由组名 ${name}`);
+    }
+    assert.ok(!raw.includes(PRIVATE_VENDORS[0]!), `${doc} 还有真供应商名`);
+
     // 数字得留着——文档的价值在实测数字，不在名字
     assert.ok(/\d/.test(raw), `${doc} 的实测数字不该被一起清掉`);
   }

@@ -40,6 +40,12 @@ export const PRIVATE_VENDORS: readonly string[] = ["mag" + "pie"];
 /** 路由组前缀（group/…）。真名只在这个数据行。 */
 export const ROUTE_GROUP_PREFIX = "group";
 
+/**
+ * 已知的真实路由组名（裸形态，不带 group/ 前缀）。文档里出现裸形态时也算泄漏。
+ * 同样**拼出来**——明文会把这行数据变成泄漏点。
+ */
+export const KNOWN_ROUTE_GROUP_NAMES: readonly string[] = ["cheap" + "-first", "smart" + "-split"];
+
 /** 从数据构造正则：名字里可能有正则元字符，一律转义。 */
 function patternOf(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -61,6 +67,11 @@ export const ROUTE_PATTERNS: readonly { name: string; re: RegExp }[] = [
   ...PRIVATE_VENDORS.map((vendor) => ({
     name: "vendor-config-path",
     re: new RegExp(`\\.config/${patternOf(vendor)}/`, "g"),
+  })),
+  // 裸的已知路由组名（不带 group/ 前缀）——文档里的散文写法
+  ...KNOWN_ROUTE_GROUP_NAMES.map((name) => ({
+    name: "route-group-bare",
+    re: new RegExp(`\\b${patternOf(name)}\\b`, "g"),
   })),
 ];
 
