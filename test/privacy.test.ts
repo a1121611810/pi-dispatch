@@ -70,10 +70,10 @@ test("隐私：保留域名的邮箱不算（测试里故意用不可达的）",
 });
 
 test("隐私：模型路由组名与供应商前缀要报出来（能推出定价与供应商）", () => {
-  const group = scanText('const model = "regex:group/main";');
+  const group = scanText('const model = "group/main";');
   assert.equal(group.length, 1);
   assert.equal(group[0]!.kind, "route:model-route-group");
-  const vendor = scanText('const model = "regex:test-vendor/group/main";');
+  const vendor = scanText('const model = "vendor-local/group/main";');
   assert.ok(vendor.some((f) => f.kind === "route:vendor-prefix"));
   const config = scanText("数据来自 ~/.config/vendor-local/affinity.json");
   assert.ok(config.some((f) => f.kind === "route:vendor-config-path"));
@@ -95,10 +95,10 @@ test("隐私：路由名占位符放行（示例与测试值不是真路由组�
 
 test("隐私：成本分析文档豁免路由名扫描（分析对象就是真路由组）", () => {
   const doc = "docs/spec/cost-control.md";
-  assert.deepEqual(scanText('model = "regex:group/main"', doc), [], "成本文档不报");
-  assert.ok(scanText('model = "regex:group/main"').length > 0, "同样的内容换个文件就报");
+  assert.deepEqual(scanText('model = "group/main"', doc), [], "成本文档不报");
+  assert.ok(scanText('model = "group/main"').length > 0, "同样的内容换个文件就报");
   for (const file of EXEMPT_ROUTE_FILES) {
-    assert.deepEqual(scanText("regex:group/main vendor-local/x", file), [], `${file} 应当豁免`);
+    assert.deepEqual(scanText("group/main vendor-local/x", file), [], `${file} 应当豁免`);
   }
 });
 
@@ -121,7 +121,7 @@ test("脱敏：家目录路径换成占位符", () => {
 });
 
 test("脱敏：模型路由名与供应商名换掉", () => {
-  assert.equal(sanitize('"model":"regex:group/main"'), '"model":"test/model"');
+  assert.equal(sanitize('"model":"group/main"'), '"model":"test/model"');
   assert.equal(sanitize('"provider":"vendor-local"'), '"provider":"test/provider"');
 });
 
@@ -149,7 +149,7 @@ test("脱敏：产物每行都必须是合法 JSON（解析器会静默跳过坏
 test("脱敏：整份 JSONL 走一遍，每行都得能解析", () => {
   const source = [
     '{"type":"session","cwd":"/home/dev/x","id":"01a200ed-7e02-7508-ac60-412b1c0ff1fe"}',
-    '{"type":"message_end","message":{"provider":"vendor-local","model":"regex:group/main"}}',
+    '{"type":"message_end","message":{"provider":"vendor-local","model":"group/main"}}',
     '{"type":"message_end","message":{"role":"assistant","project_context":"<project_context>\\n# Secret Rules\\n</project_context>"}}',
   ].join("\n");
   const out = sanitizeJsonl(source);
@@ -157,7 +157,7 @@ test("脱敏：整份 JSONL 走一遍，每行都得能解析", () => {
   assert.equal(lines.length, 3);
   for (const line of lines) assert.doesNotThrow(() => JSON.parse(line));
   assert.ok(!out.includes("/home/dev"));
-  assert.ok(!out.includes("regex:group/main"));
+  assert.ok(!out.includes("group/main"));
   assert.ok(!out.includes("Secret Rules"));
 });
 

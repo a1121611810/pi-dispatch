@@ -762,7 +762,7 @@ cp ~/.config/vendor-local/providers.json \
 | 上游                              | 窗口内冷启动率    | 窗口外冷启动率 |
 | --------------------------------- | ----------------- | -------------- |
 | **minimax-cn/MiniMax-M3.1-Flash** | **32.0%** (n=206) | 8.3% (n=24)    |
-| regex:group/main                 | 4.8% (n=3549)     | 0.7% (n=39357) |
+| regex:group/main            | 4.8% (n=3549)     | 0.7% (n=39357) |
 | deepseek/deepseek-flash           | 2.5% (n=81)       | 1.6% (n=3167)  |
 
 **⇒ 窗口内 minimax 接了大盘子，而它那批请求的 `in` 中位是 1118（vs 全局 774）⇒ 大 prompt 集中 ⇒ 冷启动率高。**
