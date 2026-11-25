@@ -1,5 +1,5 @@
 import type { TaskRegistry } from "./registry.ts";
-import type { ThinkingReceipt } from "./types.ts";
+import type { ClaimCoverage, Deliverable, ThinkingReceipt } from "./types.ts";
 import { tallySteers, type SteerTally } from "./steer.ts";
 
 // 通知：后台任务完成的消息按批发给父方。
@@ -9,6 +9,12 @@ export interface TaskNotification {
   taskId: string;
   status: string;
   at: number;
+  /** 交付判词：退出码之外的第二条轴 */
+  deliverable?: Deliverable;
+  /** 改动自述只对上一部分 */
+  deliveryPartial?: ClaimCoverage;
+  /** 自检自述只对上一部分 */
+  verifyPartial?: ClaimCoverage;
   /** 自述对不上收据（没有实测支撑） */
   deliveryUnverified?: boolean;
   /** 谎报自检（声称的命令没观测到） */
@@ -60,6 +66,9 @@ export class NotificationCenter {
         taskId: next.id,
         status: next.status,
         at: next.finishedAt ?? Date.now(),
+        ...(next.deliverable ? { deliverable: next.deliverable } : {}),
+        ...(next.deliveryPartial ? { deliveryPartial: next.deliveryPartial } : {}),
+        ...(next.verifyPartial ? { verifyPartial: next.verifyPartial } : {}),
         ...(next.deliveryUnverified ? { deliveryUnverified: true } : {}),
         ...(next.verifyUnverified ? { verifyUnverified: true } : {}),
         ...(next.reportStale ? { reportStale: true as const } : {}),

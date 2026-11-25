@@ -887,3 +887,54 @@ test("状态机：attach-steer 输出按 seq 升序，不靠输入顺序", () =>
     [1, 2, 3],
   );
 });
+
+// ── 交付判词：退出码之外的第二条轴 ────────────────────────────────────────
+
+test("状态机：判词取核对结果，不取退出码——空跑退 0 是 succeeded + absent", () => {
+  const current: TaskRecord = {
+    id: "v",
+    status: "running",
+    task: "t",
+    startedAt: 1,
+    delivery: { tools: {}, paths: [], commands: [], errors: 0, textChars: 0 },
+  };
+  const next = applyResolveExit(current, { kind: "resolve-exit", id: "v", exitCode: 0 });
+  assert.equal(next?.to, "succeeded", "进程事实：退出 0 就是 succeeded");
+  assert.equal(next?.patch.deliverable, "absent", "交付事实：什么都没交");
+});
+
+test("状态机：判词四档——unclaimed / unverified / partial / verified", () => {
+  const delivery = { tools: {}, paths: [], commands: [], errors: 0, textChars: 10 };
+  const base: TaskRecord = { id: "v", status: "running", task: "t", startedAt: 1, delivery };
+  const resolve = (record: TaskRecord) =>
+    applyResolveExit(record, { kind: "resolve-exit", id: "v", exitCode: 0 })?.patch.deliverable;
+  const report = { summary: "s", why: "w", assessment: "有风险" };
+
+  assert.equal(resolve({ ...base, report }), "unclaimed", "有报告没自述：只读任务的诚实形态");
+  assert.equal(
+    resolve({ ...base, report: { ...report, files_touched: ["a.ts"] }, deliveryUnverified: true }),
+    "unverified",
+    "有自述零命中",
+  );
+  assert.equal(
+    resolve({
+      ...base,
+      report: { ...report, files_touched: ["a.ts"] },
+      deliveryPartial: { claimed: 5, matched: 1 },
+    }),
+    "partial",
+    "有自述只对上一部分",
+  );
+  assert.equal(
+    resolve({ ...base, report: { ...report, files_touched: ["a.ts"] } }),
+    "verified",
+    "有自述全对上",
+  );
+});
+
+test("状态机：失败终态不带判词（没有交付可言）", () => {
+  const current: TaskRecord = { id: "v", status: "running", task: "t", startedAt: 1 };
+  const next = applyResolveExit(current, { kind: "resolve-exit", id: "v", exitCode: 2 });
+  assert.equal(next?.to, "failed");
+  assert.equal("deliverable" in (next?.patch ?? {}), false, "失败不是「交付不合格」，是没有交付");
+});

@@ -129,7 +129,7 @@ export interface TaskRejection {
 export type ChildDelivery = {
   /** 实际调用的工具与次数（按工具名） */
   tools: Record<string, number>;
-  /** 实际碰过的路径（去重，按出现顺序） */
+  /** 实际改过的路径（只收写类工具的 args.path，去重、按出现顺序；读过的不算） */
   paths: string[];
   /** 实际跑过的 bash 命令（原样记串不解析；去重、有上限）——对质「自检跑了没」的观测侧 */
   commands: string[];
@@ -139,6 +139,10 @@ export type ChildDelivery = {
   textChars: number;
   /** 畸形事件行数（不是合法事件的行）：好行照留，坏行计数 */
   malformed?: number;
+  /** 路径收据到上限被丢弃过：截断只是丢了证据，判「对不上」时要放行 */
+  pathsTruncated?: true;
+  /** 命令收据按「留最近 N 条」丢过旧条目 */
+  commandsTruncated?: true;
 };
 
 /**
@@ -202,6 +206,25 @@ export interface ChildUsage {
 /** 报告的到达通道。none = 什么都没交，要说出来，不要装成交了。 */
 export type ReportChannel = "tool" | "prompt-json" | "none";
 
+/**
+ * 交付判词。退出码只说进程怎么了；这一列说交付有没有实测支撑，两件事分开记。
+ * 定终态时由 registry 算一次，永不改 status——status 是进程事实，不是质量结论。
+ */
+export type Deliverable =
+  /** 有自述，且每条自述都在收据里对上了 */
+  | "verified"
+  /** 有报告、没有可核对的自述（只读分析任务的诚实形态） */
+  | "unclaimed"
+  /** 有自述，只有一部分对上 */
+  | "partial"
+  /** 有自述但零命中、assessment 空转、或工具报告早于最后一次转向 */
+  | "unverified"
+  /** 没交报告，正文也是空的（空跑） */
+  | "absent";
+
+/** 自述覆盖度：声称几条、对上了几条。只在 0 < matched < claimed 时记。 */
+export type ClaimCoverage = { claimed: number; matched: number };
+
 /** 一条转向的收据状态。sent = 只写了盘；queued = 孩子队列见过；delivered = user 回显；seen = 回显后有过 assistant 回合；undelivered = 退出时无证据。 */
 export type SteerState = "sent" | "queued" | "delivered" | "seen" | "undelivered";
 
@@ -258,6 +281,12 @@ export interface TaskRecord {
   verifyUnverified?: boolean;
   /** assessment 空转（缺/过短/全正面）——小窗资格粗筛结果，信任只走记账规则 */
   assessmentVacuous?: boolean;
+  /** 交付判词：退出码之外的第二条轴，定终态时算一次 */
+  deliverable?: Deliverable;
+  /** 改动自述只对上一部分（0 < matched < claimed） */
+  deliveryPartial?: ClaimCoverage;
+  /** 自检自述只对上一部分 */
+  verifyPartial?: ClaimCoverage;
   /** 产出落盘位置 */
   outputPath?: string;
   /** 孩子 stdout 超尾部上限被截断 */
@@ -313,6 +342,12 @@ export interface DispatchResult {
   verifyUnverified?: boolean;
   /** assessment 空转（缺/过短/全正面）——小窗资格粗筛结果，信任只走记账规则 */
   assessmentVacuous?: boolean;
+  /** 交付判词：退出码之外的第二条轴 */
+  deliverable?: Deliverable;
+  /** 改动自述只对上一部分 */
+  deliveryPartial?: ClaimCoverage;
+  /** 自检自述只对上一部分 */
+  verifyPartial?: ClaimCoverage;
   outputTruncated: boolean;
   /** 隔离档位（只在开了时带出） */
   isolation?: Isolation;

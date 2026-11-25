@@ -59,7 +59,7 @@ function summaryLine(records: readonly TaskRecord[]): string {
   const flying = count(records, "running") + count(records, "stopping");
   return (
     `派单｜在飞 ${flying} · 排队 ${count(records, "queued")} · ` +
-    `成功 ${count(records, "succeeded")} · 失败 ${count(records, "failed")} · ` +
+    `跑完 ${count(records, "succeeded")} · 失败 ${count(records, "failed")} · ` +
     `取消 ${count(records, "canceled")} · 丢失 ${count(records, "lost")}`
   );
 }

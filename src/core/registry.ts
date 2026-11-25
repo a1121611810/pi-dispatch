@@ -1,5 +1,7 @@
+import { deliverableOf } from "./child.ts";
 import {
   isTerminal,
+  type ClaimCoverage,
   type SteerState,
   type TaskRecord,
   type TaskStatus,
@@ -56,6 +58,10 @@ export type TaskCommand =
       verifyUnverified?: boolean;
       /** assessment 空转（小窗资格粗筛） */
       vacuous?: boolean;
+      /** 改动自述只对上一部分（0 < matched < claimed） */
+      deliveryPartial?: ClaimCoverage;
+      /** 自检自述只对上一部分 */
+      verifyPartial?: ClaimCoverage;
     }
   | {
       kind: "attach-steer";
@@ -112,6 +118,11 @@ export function applyAttachBudget(
   return { record: next, fromStatus: current.status, changed: true };
 }
 
+/** 成功终态才带判词：退出码 0 也要说清交付有没有实测支撑，两件事分开记。 */
+function deliverablePatch(current: TaskRecord, to: TaskStatus): Partial<TaskRecord> {
+  return to === "succeeded" ? { deliverable: deliverableOf(current) } : {};
+}
+
 /**
  * resolve-exit 的判定：
  *   stopping（建盘/等启动名额期间被叫停）⇒ canceled（notStarted 清 startedAt）；
@@ -124,10 +135,12 @@ export function applyResolveExit(
   command: ResolveExitCommand,
 ): { to: TaskStatus; patch: Partial<TaskRecord> } | undefined {
   if (current.status === "stopping") {
+    const to: TaskStatus = command.exitCode === 0 ? "succeeded" : "canceled";
     return {
       // 孩子已经成功退出（退出码 0）时 stop 来晚了：记 succeeded，不是 canceled
-      to: command.exitCode === 0 ? "succeeded" : "canceled",
+      to,
       patch: {
+        ...deliverablePatch(current, to),
         ...(command.notStarted ? { startedAt: undefined } : {}),
         // 叫停过也要记真实退出码：孩子确实以 143 退出的，账上不该回落 -1
         exitCode: command.exitCode,
@@ -142,6 +155,8 @@ export function applyResolveExit(
     return {
       to: command.exitCode === 0 ? "succeeded" : "failed",
       patch: {
+        // 判词跟同一条退出码判据走：只有 succeeded 才带（别的终态没有「交付」可言）
+        ...deliverablePatch(current, command.exitCode === 0 ? "succeeded" : "failed"),
         // 孩子压根没起（建 worktree 失败 / 等名额被叫停）：startedAt 要清——
         // 记录里 startedAt 有值必须恒等于「孩子真起过」。
         ...(command.notStarted ? { startedAt: undefined } : {}),
@@ -290,6 +305,8 @@ export class TaskRegistry {
           ...(command.unverified ? { deliveryUnverified: true } : {}),
           ...(command.verifyUnverified ? { verifyUnverified: true } : {}),
           ...(command.vacuous ? { assessmentVacuous: true } : {}),
+          ...(command.deliveryPartial ? { deliveryPartial: command.deliveryPartial } : {}),
+          ...(command.verifyPartial ? { verifyPartial: command.verifyPartial } : {}),
         };
         this.#records.set(command.id, next);
         this.#emit(next, current);

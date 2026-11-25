@@ -94,7 +94,7 @@ test("tui：在飞与排队给出汇总行和逐条行", () => {
   assert.equal(lines.length, 4);
   // 在飞 = running + stopping，两个都要在场（差一个总数就错）
   assert.match(lines[0]!, /在飞 2 · 排队 1/);
-  assert.match(lines[0]!, /成功 1 · 失败 0 · 取消 0 · 丢失 0/);
+  assert.match(lines[0]!, /跑完 1 · 失败 0 · 取消 0 · 丢失 0/);
   // 在飞按开始时刻升序：先派的在上
   assert.match(lines[1]!, /#2222bbbb 收队 收一半的活/);
   assert.match(lines[2]!, /#1111aaaa 在飞 读日志/);

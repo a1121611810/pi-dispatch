@@ -46,16 +46,13 @@ const SMALL_WINDOW_HEAD = 4 * 1024;
 const SMALL_WINDOW_TAIL = 4 * 1024;
 const BIG_WINDOW_MAX_CHARS = 50 * 1024;
 
-/** 小窗三要件：回执在、非空转、核对挂过——全满足才享受 8KB 档，否则 50KB 档（无回执兜底窗）。 */
+/**
+ * 小窗资格：判词说交付有实测支撑才享受 8KB 档，否则 50KB 档（无回执兜底窗）。
+ * 判词由 registry 在定终态时算（deliverableOf）——这里不再复制一遍五个条件。
+ * unclaimed 也算可信：只读分析任务本来就没有可核对项，没证据不等于假话。
+ */
 function hasReliableReport(result: DispatchResult): boolean {
-  return Boolean(
-    result.report &&
-    result.reportChannel !== "none" &&
-    !result.assessmentVacuous &&
-    !result.deliveryUnverified &&
-    !result.verifyUnverified &&
-    !result.reportStale,
-  );
+  return result.deliverable === "verified" || result.deliverable === "unclaimed";
 }
 
 export function excerptDeliverable(result: DispatchResult): DispatchResult {
@@ -411,7 +408,12 @@ export function deliver(pi: ExtensionAPI, notifications: NotificationCenter): vo
   for (const batch of notifications.drain()) {
     const text = batch
       .map((n) => {
+        const partial = n.deliveryPartial ?? n.verifyPartial;
         const hint = [
+          n.deliverable === "absent" ? "｜空跑：退出码 0 但什么都没交" : "",
+          n.deliverable === "partial" && partial
+            ? `｜交付只对上 ${partial.matched}/${partial.claimed} 条（查 dispatch_list 复核）`
+            : "",
           n.deliveryUnverified ? "｜报告里的改动没有实测支撑（查 dispatch_list 复核）" : "",
           n.verifyUnverified ? "｜报告声称的自检没有实测支撑（查 dispatch_list 复核）" : "",
           n.reportStale ? "｜工具报告早于最后一次转向（以最终正文为准）" : "",
@@ -545,6 +547,9 @@ function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
           deliveryUnverified: r.deliveryUnverified,
           verifyUnverified: r.verifyUnverified,
           assessmentVacuous: r.assessmentVacuous,
+          deliverable: r.deliverable,
+          deliveryPartial: r.deliveryPartial,
+          verifyPartial: r.verifyPartial,
           outputPath: r.outputPath,
           outputTruncated: r.outputTruncated,
           isolation: r.isolation,

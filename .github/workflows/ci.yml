@@ -1,0 +1,58 @@
+name: ci
+
+# 门禁的唯一执法点。破坏点表（scripts/breakpoints.ts）不进 npm 包——它要 src/ 与 test/
+# 才能跑，装到用户机器上是个死脚本。所以「验证纪律跟出去」靠这里：每次 push/PR 全跑，
+# 发布只从跑绿的 tag 出，并且带 provenance 把 tarball 绑到 commit 与 workflow。
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      # pnpm install 会跑 prepare → pnpm build，所以 dist 在这里就有了
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm fmt:check
+      - run: pnpm lint
+      - run: pnpm check
+      - run: pnpm test
+      # 322 条破坏点逐个改源码再复原：必须单 job 串行，不能和别的变异测试并行
+      - run: pnpm check:breakpoints
+      # 故意不跑 pnpm mutate：本机实测 57 分钟（1291 个位点）。
+      # 它是发版前的人工门禁（AGENTS「只能本地」），CI 不替它把关。
+
+  publish:
+    needs: gate
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # 前提两条，任一不成立这一步就红（不是代码问题）：
+    #   ① 仓库是公开的——provenance 靠 OIDC 取签名，私有仓拿不到；
+    #   ② npm 上已经有 @a1121611810 这个 scope 且在你名下（npm org create）。
+    # 私有仓也不许放弃可追溯性的话，改成像 omp 建议的那样：去掉 --provenance，
+    # 用签名 tag + 版本矩阵里的 commit 列顶着。
+    permissions:
+      contents: read
+      id-token: write # provenance 要它
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile
+      # prepublishOnly 在这里再跑一遍廉价门禁：tag 是人打的，别信上一次 run
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

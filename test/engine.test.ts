@@ -520,7 +520,7 @@ test("引擎：卡住——静默超过阈值收尸", async () => {
 test("引擎：收四样——正文 / 报告 / 用量 / 收据", async () => {
   const stream = [
     '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"结论"}],"usage":{"input":10,"output":5}}}',
-    '{"type":"tool_execution_start","toolName":"read","args":{"path":"/a"}}',
+    '{"type":"tool_execution_start","toolName":"edit","args":{"path":"/a"}}',
   ].join("\n");
   const { engine } = freshEngine({
     spawn: fakeSpawn({ stdout: stream, exitCode: 0 }),
@@ -534,7 +534,7 @@ test("引擎：收四样——正文 / 报告 / 用量 / 收据", async () => {
   };
   assert.equal(result.status, "succeeded");
   assert.equal(result.text, "结论");
-  assert.equal(result.delivery?.tools.read, 1);
+  assert.equal(result.delivery?.tools.edit, 1);
   assert.deepEqual(result.delivery?.paths, ["/a"]);
 });
 
@@ -3618,4 +3618,84 @@ test("引擎：首轮没共享时判定如实记录，但不改正文（提示�
   assert.equal(result.cache?.verdict, "not-reusing", "首轮 cacheRead=0 ⇒ not-reusing");
   assert.equal(result.text, "结论", "正文逐字节就是孩子的交付物，不掺观测注释");
   await engine.shutdown();
+});
+
+// ── 交付判词：exit 0 不再等于「干成了」 ───────────────────────────────────
+
+test("引擎：空跑退出 0 ⇒ status 仍 succeeded、deliverable=absent（账不冒充交付）", async () => {
+  const { registry, engine } = freshEngine({
+    spawn: fakeSpawn({ stdout: "", exitCode: 0 }),
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活" });
+  const result = outcome as { status: string; taskId: string; deliverable?: string };
+  assert.equal(result.status, "succeeded", "进程事实照记：退出码 0");
+  assert.equal(result.deliverable, "absent", "交付事实：什么都没交");
+  assert.equal(
+    registry.get(result.taskId)?.deliverable,
+    "absent",
+    "判词要落账——只在结果里带出等于没记",
+  );
+});
+
+test("引擎：报告没给可核对项 ⇒ deliverable=unclaimed（不冒充 verified）", async () => {
+  const stream = JSON.stringify({
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: [
+        {
+          type: "text",
+          text: '看完了\n```json\n{"summary":"ok","assessment":"边界场景还没有覆盖全，长尾输入没有测到，存在回归风险；建议下一轮补测试再复核一次。"}\n```',
+        },
+      ],
+    },
+  });
+  const { engine } = freshEngine({
+    spawn: fakeSpawn({ stdout: stream, exitCode: 0 }),
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "看看" });
+  const result = outcome as { status: string; deliverable?: string };
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.deliverable, "unclaimed", "有报告没自述：只读形态，不罚也不夸");
+});
+
+test("引擎：五条自述只对上一条 ⇒ deliverable=partial（硬旗不亮，但不是清白）", async () => {
+  const stream = [
+    '{"type":"tool_execution_start","toolName":"edit","args":{"path":"/repo/src/a.ts"}}',
+    JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text:
+              "改完了\n```json\n" +
+              JSON.stringify({
+                summary: "ok",
+                files_touched: ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts", "src/e.ts"],
+              }) +
+              "\n```",
+          },
+        ],
+      },
+    }),
+  ].join("\n");
+  const { engine } = freshEngine({
+    spawn: fakeSpawn({ stdout: stream, exitCode: 0 }),
+    hostMode: "one-shot",
+  });
+  const outcome = await engine.dispatch({ task: "干活" });
+  const result = outcome as {
+    status: string;
+    deliverable?: string;
+    deliveryUnverified?: boolean;
+    deliveryPartial?: { claimed: number; matched: number };
+  };
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.deliveryUnverified, undefined, "一条对上就不是零命中，硬旗不亮");
+  assert.deepEqual(result.deliveryPartial, { claimed: 5, matched: 1 });
+  assert.equal(result.deliverable, "partial", "部分对上也失去「可信交付」");
 });

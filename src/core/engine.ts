@@ -5,8 +5,10 @@ import {
   assessmentVacuous,
   buildPiArgv,
   createSteerEvidenceTracker,
+  deliveryCoverage,
   deliveryUnverified,
   createUsageTracker,
+  verifyCoverage,
   effectiveModel,
   parseChildStream,
   extractReportFromText,
@@ -1114,6 +1116,9 @@ export class TaskEngine {
     }
     const unverified = deliveryUnverified(report, parsed.delivery);
     const verifyFailed = verifyUnverified(report, parsed.delivery);
+    // 部分命中：一条对上不能洗白整张表，但也不到「零命中」那种硬指控
+    const deliveryPartial = deliveryCoverage(report, parsed.delivery);
+    const verifyPartial = verifyCoverage(report, parsed.delivery);
     // 观测 worktree：孩子跑完了，留下什么看磁盘。
     // 观测失败只记 captureError，不回改终态（终态是既成事实）。
     const base = this.#registry.get(taskId)?.worktree;
@@ -1132,6 +1137,8 @@ export class TaskEngine {
       unverified,
       verifyUnverified: verifyFailed,
       vacuous: assessmentVacuous(report),
+      deliveryPartial,
+      verifyPartial,
     });
     await this.#registry.submit({
       kind: "attach-output",
@@ -1191,6 +1198,9 @@ export class TaskEngine {
       deliveryUnverified: record.deliveryUnverified,
       verifyUnverified: record.verifyUnverified,
       assessmentVacuous: record.assessmentVacuous,
+      deliverable: record.deliverable,
+      deliveryPartial: record.deliveryPartial,
+      verifyPartial: record.verifyPartial,
       outputTruncated: record.outputTruncated ?? false,
       // 隔离的键只在开启时出现（默认关时 Object.keys 不变）
       ...(record.isolation ? { isolation: record.isolation } : {}),

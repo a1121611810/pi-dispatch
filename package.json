@@ -1,7 +1,6 @@
 {
-  "name": "pi-dispatch",
-  "version": "0.0.0",
-  "private": true,
+  "name": "@a1121611810/pi-dispatch",
+  "version": "0.1.0",
   "description": "Programmable subagent dispatch for pi: queue, spawn, watch, stop, and account for child agents",
   "keywords": [
     "dispatch",
@@ -28,6 +27,9 @@
   },
   "scripts": {
     "build": "rolldown -c",
+    "prepare": "pnpm build",
+    "prepack": "pnpm build",
+    "prepublishOnly": "pnpm fmt:check && pnpm lint && pnpm check && pnpm test",
     "check": "tsrs -p tsconfig.json",
     "lint": "oxlint",
     "fmt": "oxfmt",

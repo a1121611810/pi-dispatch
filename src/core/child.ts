@@ -2,7 +2,15 @@ import { spawn } from "node:child_process";
 import { constants as osConstants } from "node:os";
 import { BLACKBOARD_READ, BLACKBOARD_WRITE } from "./blackboard.ts";
 import { steerSeqFromText, textOfContent, type SteerEvidence } from "./steer.ts";
-import type { ChildDelivery, ChildReport, ChildUsage, Isolation, ReportChannel } from "./types.ts";
+import type {
+  ChildDelivery,
+  ChildReport,
+  ChildUsage,
+  ClaimCoverage,
+  Deliverable,
+  Isolation,
+  ReportChannel,
+} from "./types.ts";
 
 // 起子代理：拼命令 + spawn。
 // 「子代理的话不可信，子代理的动作可信」——这里只负责让它跑起来并把原始输出接住。
@@ -372,6 +380,9 @@ interface StreamAcc {
   tools: Record<string, number>;
   paths: string[];
   commands: string[];
+  /** 收据撞到上限丢过条目：截断是丢了证据，判「对不上」时要放行 */
+  pathsTruncated: boolean;
+  commandsTruncated: boolean;
   errors: number;
   /** 畸形事件行数（不是合法事件）：好行照留，坏行计数。 */
   malformed: number;
@@ -426,6 +437,8 @@ function emptyStreamAcc(): StreamAcc {
     tools: Object.create(null) as Record<string, number>,
     paths: [],
     commands: [],
+    pathsTruncated: false,
+    commandsTruncated: false,
     errors: 0,
     malformed: 0,
     declaredTools: [],
@@ -462,28 +475,40 @@ export function declaredToolNames(sections: unknown): string[] {
   return names;
 }
 
-/** 记一条碰过的路径：只收文件类工具给的 args.path，去重、有上限。 */
-function recordPath(args: { path?: unknown } | undefined, paths: string[]): void {
+/**
+ * 记一条改过的路径：只收写类工具给的 args.path。
+ * 读类工具（read/grep/find/ls）不算——读过不等于改过，否则「自述改了 N 个文件」
+ * 只要把那 N 个文件读一遍就能对上（实测可洗白）。到上限就丢并置 truncated。
+ */
+function recordPath(toolName: string, args: { path?: unknown } | undefined, acc: StreamAcc): void {
+  if (READ_ONLY_TOOLS.includes(toolName)) return;
   const path = args?.path;
   if (typeof path !== "string" || !path) return;
-  if (paths.includes(path) || paths.length >= MAX_PATHS) return;
-  paths.push(path);
+  if (acc.paths.includes(path)) return;
+  if (acc.paths.length >= MAX_PATHS) {
+    acc.pathsTruncated = true;
+    return;
+  }
+  acc.paths.push(path);
 }
 
 /** 记一条跑过的命令：只收 bash——只有它的效果就是命令行（codemode 最终也走 bash 执行）。原样记串不解析；保最近 N 条（交付前的验证命令在尾部）。 */
 function recordCommand(
   toolName: string,
   args: { command?: unknown } | undefined,
-  commands: string[],
+  acc: StreamAcc,
 ): void {
   if (toolName !== "bash") return;
   const command = args?.command;
   if (typeof command !== "string" || !command) return;
   const kept =
     command.length > COMMAND_KEEP_CHARS ? `${command.slice(0, COMMAND_KEEP_CHARS)}…` : command;
-  if (commands.includes(kept)) return;
-  commands.push(kept);
-  if (commands.length > MAX_COMMANDS) commands.shift();
+  if (acc.commands.includes(kept)) return;
+  acc.commands.push(kept);
+  if (acc.commands.length > MAX_COMMANDS) {
+    acc.commands.shift();
+    acc.commandsTruncated = true;
+  }
 }
 
 /** 工具轨迹：start 计次并记路径/命令，end 计错。 */
@@ -491,9 +516,9 @@ function takeToolEvent(event: StreamEvent, acc: StreamAcc): void {
   if (event.type === "tool_execution_start") {
     const name = typeof event.toolName === "string" ? event.toolName : "unknown";
     acc.tools[name] = (acc.tools[name] ?? 0) + 1;
-    // 路径只收文件类工具的 args.path（bash 的 args 没有 path）；命令串走 recordCommand
-    recordPath(event.args, acc.paths);
-    recordCommand(name, event.args, acc.commands);
+    // 路径只收写类工具的 args.path（读类工具与 bash 不算）；命令串走 recordCommand
+    recordPath(name, event.args, acc);
+    recordCommand(name, event.args, acc);
   } else if (event.type === "tool_execution_end") {
     if (event.isError === true || event.result?.isError === true) acc.errors++;
   }
@@ -822,6 +847,8 @@ export function parseChildStream(stdout: string): ParsedChildStream {
       errors: acc.errors,
       textChars: acc.text.length,
       ...(acc.malformed > 0 ? { malformed: acc.malformed } : {}),
+      ...(acc.pathsTruncated ? { pathsTruncated: true as const } : {}),
+      ...(acc.commandsTruncated ? { commandsTruncated: true as const } : {}),
     },
     declaredTools: acc.declaredTools,
     steerEvidence: evidenceOf(acc),
@@ -912,7 +939,8 @@ function normalizeUsage(usage: ChildUsage | undefined): ChildUsage | undefined {
 }
 
 /**
- * assessment 是否空转——小窗资格粗筛，不是信任判官（信任只走记账：可核对不上倒扣，对上得分）。
+ * assessment 是否空转——小窗资格粗筛，不是判词。判词只走 deliverableOf（零命中=unverified，
+ * 部分命中=partial）：仓里没有分数/倒扣那套记账，谁也别照着注释想象它存在。
  * 启发式三判据：缺/空、过短（<40 字符）、负面清单信号词零命中。伪问题骗得过词表也进不了正分，无妨。
  */
 const ASSESSMENT_SIGNALS = [
@@ -965,8 +993,17 @@ export function deliveryUnverified(
   delivery: ChildDelivery | undefined,
 ): boolean {
   const claims = report?.files_touched ?? [];
-  if (claims.length === 0 || !delivery) return false;
+  // 截断过就不判：丢的是收据条目，不是「没改过」的证据
+  if (claims.length === 0 || !delivery || delivery.pathsTruncated) return false;
   return !claims.some((claim) => delivery.paths.some((path) => pathMatches(claim, path)));
+}
+
+/**
+ * 自检自述里的命令（去空白）。对质与覆盖度共用同一口径——
+ * 分成两处复制的话，一处改了另一处不变，硬旗和覆盖度就会对同一份自述给出不同答案。
+ */
+function commandClaims(report: ChildReport | undefined): Array<{ command: string }> {
+  return (report?.verified ?? []).filter((claim) => claim.command.trim().length > 0);
 }
 
 /**
@@ -982,8 +1019,9 @@ export function verifyUnverified(
   report: ChildReport | undefined,
   delivery: ChildDelivery | undefined,
 ): boolean {
-  const claims = (report?.verified ?? []).filter((c) => c.command.trim().length > 0);
-  if (claims.length === 0 || !delivery) return false;
+  const claims = commandClaims(report);
+  // 截断过就不判：观测只留最近 N 条，旧命令被挤掉不是「没跑过」
+  if (claims.length === 0 || !delivery || delivery.commandsTruncated) return false;
   return !claims.some((claim) =>
     commandSegments(claim.command).some((claimSeg) =>
       delivery.commands.some((command) =>
@@ -991,6 +1029,87 @@ export function verifyUnverified(
       ),
     ),
   );
+}
+
+/**
+ * 改动自述的覆盖度：声称几条、对上几条。只在「部分对上」时返回（全对上/零对上都不返回）。
+ * 与 deliveryUnverified 同一套匹配（路径结尾对齐分隔符）；截断过就不算——
+ * 丢的是证据，不是罪证，这时候判「对不上」是冤枉真干活的孩子。
+ */
+export function deliveryCoverage(
+  report: ChildReport | undefined,
+  delivery: ChildDelivery | undefined,
+): ClaimCoverage | undefined {
+  const claims = report?.files_touched ?? [];
+  if (!delivery || delivery.pathsTruncated) return undefined;
+  const hit = claims.filter((claim) => delivery.paths.some((path) => pathMatches(claim, path)));
+  return hit.length > 0 && hit.length < claims.length
+    ? { claimed: claims.length, matched: hit.length }
+    : undefined;
+}
+
+/** 自检自述的覆盖度。同构于 deliveryCoverage，匹配走段级 × token 级。 */
+export function verifyCoverage(
+  report: ChildReport | undefined,
+  delivery: ChildDelivery | undefined,
+): ClaimCoverage | undefined {
+  const claims = commandClaims(report);
+  if (!delivery || delivery.commandsTruncated) return undefined;
+  const seen = claims.filter((claim) =>
+    commandSegments(claim.command).some((claimSeg) =>
+      delivery.commands.some((command) =>
+        commandSegments(command).some((observedSeg) => segmentsMatch(claimSeg, observedSeg)),
+      ),
+    ),
+  );
+  return seen.length > 0 && seen.length < claims.length
+    ? { claimed: claims.length, matched: seen.length }
+    : undefined;
+}
+
+/** deliverableOf 的入参：TaskRecord 结构上就满足它，所以 registry 直接丢记录进来。 */
+export interface DeliverableInput {
+  report?: ChildReport | undefined;
+  delivery?: ChildDelivery | undefined;
+  deliveryUnverified?: boolean;
+  verifyUnverified?: boolean;
+  assessmentVacuous?: boolean;
+  reportStale?: true | undefined;
+  deliveryPartial?: ClaimCoverage;
+  verifyPartial?: ClaimCoverage;
+}
+
+/**
+ * 交付判词。退出码只说进程怎么了，这一列说交付有没有实测支撑——两条轴分开记。
+ * 只在定终态时算一次（registry 是唯一合法写入者），永不改 status。
+ *   absent     没交报告、正文也是空的（空跑：跑了个寂寞）
+ *   unverified 有正文没报告，或自述零命中，或 assessment 空转，或报告早于转向
+ *   partial    有自述，只对上一部分
+ *   unclaimed  有报告但没有可核对的自述——只读分析任务的诚实形态，不罚
+ *   verified   有自述且全对上
+ */
+export function deliverableOf(record: DeliverableInput): Deliverable {
+  if (!record.report && (record.delivery?.textChars ?? 0) === 0) return "absent";
+  if (!record.report) return "unverified";
+  if (
+    record.deliveryUnverified ||
+    record.verifyUnverified ||
+    record.assessmentVacuous ||
+    record.reportStale
+  ) {
+    return record.deliveryPartial || record.verifyPartial ? "partial" : "unverified";
+  }
+  if (record.deliveryPartial || record.verifyPartial) return "partial";
+  // 收据被上限截断：那一维有自述就没法对质了。不点指控旗（丢的是证据不是罪证），
+  // 但也绝不盖章——否则「先攒满 20 条收据，再随便写」就是一条洗白通道（实测可达）。
+  if (
+    (record.delivery?.pathsTruncated && (record.report.files_touched?.length ?? 0) > 0) ||
+    (record.delivery?.commandsTruncated && (record.report.verified?.length ?? 0) > 0)
+  ) {
+    return "unverified";
+  }
+  const claims = (record.report.files_touched?.length ?? 0) + (record.report.verified?.length ?? 0);
+  return claims === 0 ? "unclaimed" : "verified";
 }
 
 /** 空白归一 + 去截尾省略号：截断产生的 … 在 token 化前当通配抹掉。 */

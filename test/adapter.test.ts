@@ -478,10 +478,29 @@ test("归约：可靠回执 ⇒ 8KB 小窗且标记点名 report", () => {
         assessment: "主流程已验证。边界场景还没覆盖全，存在回归风险。",
       },
       reportChannel: "tool",
+      deliverable: "verified",
     }) as never,
   );
   assert.ok(out.text.includes("摘要见 report"));
   assert.ok(out.text.length < 12 * 1024, "8KB 窗 + 标记");
+});
+
+test("归约：小窗只认判词——报告齐全但判词没到（或不是 verified/unclaimed）⇒ 大窗", () => {
+  const report = {
+    summary: "s",
+    why: "w",
+    assessment: "主流程已验证。边界场景还没覆盖全，存在回归风险。",
+  };
+  const noVerdict = excerptDeliverable(resultWith({ report, reportChannel: "tool" }) as never);
+  assert.ok(!noVerdict.text.includes("摘要见 report"), "没有判词就不许换小窗");
+  const partial = excerptDeliverable(
+    resultWith({ report, reportChannel: "tool", deliverable: "partial" }) as never,
+  );
+  assert.ok(!partial.text.includes("摘要见 report"), "部分对上也吃大窗");
+  const unclaimed = excerptDeliverable(
+    resultWith({ report, reportChannel: "tool", deliverable: "unclaimed" }) as never,
+  );
+  assert.ok(unclaimed.text.includes("摘要见 report"), "只读任务的诚实形态不罚");
 });
 
 test("归约：回执空转或核对挂了 ⇒ 落回大窗", () => {
@@ -490,6 +509,7 @@ test("归约：回执空转或核对挂了 ⇒ 落回大窗", () => {
       report: { summary: "s", why: "w", assessment: "整体非常顺利圆满达成。" },
       reportChannel: "tool",
       assessmentVacuous: true,
+      deliverable: "unverified",
     }) as never,
   );
   assert.ok(!vacuous.text.includes("摘要见 report"), "空回执不享受小窗");
@@ -502,6 +522,7 @@ test("归约：回执空转或核对挂了 ⇒ 落回大窗", () => {
       },
       reportChannel: "tool",
       deliveryUnverified: true,
+      deliverable: "unverified",
     }) as never,
   );
   assert.ok(!unverified.text.includes("摘要见 report"), "核对挂了失去小窗资格");
@@ -517,6 +538,7 @@ test("归约：报告早于最后一次转向 ⇒ 落回大窗", () => {
       },
       reportChannel: "tool",
       reportStale: true,
+      deliverable: "unverified",
     }) as never,
   );
   assert.ok(!out.text.includes("摘要见 report"), "stale 报告不能享受小窗");
@@ -532,6 +554,7 @@ test("归约：谎报自检 ⇒ 落回大窗", () => {
       },
       reportChannel: "tool",
       verifyUnverified: true,
+      deliverable: "unverified",
     }) as never,
   );
   assert.ok(!out.text.includes("摘要见 report"), "谎报自检失去小窗资格");
@@ -558,6 +581,7 @@ test("归约：恰好等于窗口预算 ⇒ 原样过（不插 0 字符省略标
         assessment: "主流程已验证。边界场景还没覆盖全，存在回归风险。",
       },
       reportChannel: "tool",
+      deliverable: "verified",
     }) as never,
   );
   assert.equal(out.text, text, "恰好装得下就不截（<= 不是 <）");

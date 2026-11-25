@@ -27,6 +27,12 @@
 //   segmentsMatch 的任何分支（空数组在前缀/经序里都返回 false）⇒ 等价。
 //   tokensRunInOrder 的 `i < b.length` → <=——越界那一轮比较的是 undefined 与字符串，
 //   恒不相等 ⇒ 等价。
+//   deliveryCoverage 的 `report?.files_touched ?? []`、verifyCoverage 的 `report?.verified ?? []`
+//   —与上面两条同形：左值只可能是数组或 undefined，数组恒真 ⇒ 等价。
+//   deliverableOf 的两处 `?? 0`（delivery?.textChars、files_touched?.length）——左值是
+//   有限数或 undefined，为 0 时 ?? 与 || 都给 0 ⇒ 等价。
+//   verifyCoverage 过滤器里的 `c.command.trim().length > 0` 0→1——只差「声称了 1 个字符的命令」，
+//   而 1 字符不是 shell 命令，可达输入上没有区别 ⇒ 等价（空串仍被两侧一起滤掉）。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -41,6 +47,8 @@ import {
   createUsageTracker,
   buildPiArgv,
   createSteerEvidenceTracker,
+  deliverableOf,
+  deliveryCoverage,
   deliveryUnverified,
   extractReportFromText,
   parseChildStream,
@@ -48,6 +56,7 @@ import {
   spawnChild,
   normalizeReport,
   supportsNoMcp,
+  verifyCoverage,
   verifyUnverified,
   CHILD_REPORT_SCHEMA,
   CHILD_REPORT_TOOL_NAME,
@@ -321,19 +330,25 @@ test("收件：真机样本里抽出正文、模型、用量", () => {
   assert.equal(parsed.observedUsage?.cacheRead, 128);
 });
 
-test("收件：收据统计工具调用次数与路径", () => {
+test("收件：收据统计工具调用次数；真机样本只读过，路径清单因此是空的", () => {
   const parsed = parseChildStream(REAL_STREAM);
   assert.equal(parsed.delivery.tools.read, 1);
   assert.equal(parsed.delivery.tools.bash, 1);
-  assert.deepEqual(parsed.delivery.paths, ["/etc/hosts"]);
+  assert.deepEqual(parsed.delivery.paths, [], "读过不等于改过");
   assert.equal(parsed.delivery.errors, 0);
   assert.equal(parsed.delivery.textChars, 2);
 });
 
-test("收件：bash 的路径不进清单（它的 args 里没有 path，不猜命令行）", () => {
+test("收件：读不算改过——read/grep 的 path 不进收据，bash 的也不进", () => {
   const parsed = parseChildStream(REAL_STREAM);
-  assert.equal(parsed.delivery.paths.length, 1, "只有 read 的 path");
-  assert.ok(!parsed.delivery.paths.some((p) => p.includes("grep")));
+  assert.deepEqual(parsed.delivery.paths, [], "read 的 path 不算改动");
+  assert.equal((parsed.delivery.paths as string[]).filter((p) => p.includes("grep")).length, 0);
+  const mixed = [
+    '{"type":"tool_execution_start","toolName":"read","args":{"path":"/a"}}',
+    '{"type":"tool_execution_start","toolName":"edit","args":{"path":"/b"}}',
+    '{"type":"tool_execution_start","toolName":"write","args":{"path":"/c"}}',
+  ].join("\n");
+  assert.deepEqual(parseChildStream(mixed).delivery.paths, ["/b", "/c"], "只有写类工具算改过");
 });
 
 test("收件：工具出错要计数", () => {
@@ -699,28 +714,40 @@ test("收件：同一工具调多次要累加次数", () => {
 
 test("收件：路径去重（同一路径只记一次）", () => {
   const stream = [
-    '{"type":"tool_execution_start","toolName":"read","args":{"path":"/a"}}',
-    '{"type":"tool_execution_start","toolName":"read","args":{"path":"/a"}}',
-    '{"type":"tool_execution_start","toolName":"read","args":{"path":"/b"}}',
+    '{"type":"tool_execution_start","toolName":"edit","args":{"path":"/a"}}',
+    '{"type":"tool_execution_start","toolName":"edit","args":{"path":"/a"}}',
+    '{"type":"tool_execution_start","toolName":"edit","args":{"path":"/b"}}',
   ].join("\n");
   assert.deepEqual(parseChildStream(stream).delivery.paths, ["/a", "/b"]);
 });
 
-test("收件：路径清单有上限（超出的不记）", () => {
+test("收件：路径清单有上限（超出的不记，但记下截断过）", () => {
   const lines: string[] = [];
   for (let i = 0; i < 30; i++) {
-    lines.push(`{"type":"tool_execution_start","toolName":"read","args":{"path":"/p${i}"}}`);
+    lines.push(`{"type":"tool_execution_start","toolName":"edit","args":{"path":"/p${i}"}}`);
   }
-  const paths = parseChildStream(lines.join("\n")).delivery.paths;
-  assert.equal(paths.length, 20, "路径清单上限 20");
+  const delivery = parseChildStream(lines.join("\n")).delivery;
+  assert.equal(delivery.paths.length, 20, "路径清单上限 20");
+  assert.equal(delivery.pathsTruncated, true, "丢过证据要说出来：截断时判「对不上」是冤枉");
+});
+
+test("收件：命令清单留最近 20 条，丢过就记下截断", () => {
+  const lines: string[] = [];
+  for (let i = 0; i < 21; i++) {
+    lines.push(`{"type":"tool_execution_start","toolName":"bash","args":{"command":"cmd${i}"}}`);
+  }
+  const delivery = parseChildStream(lines.join("\n")).delivery;
+  assert.equal(delivery.commands.length, 20, "只留最近 20 条");
+  assert.equal(delivery.commands[0], "cmd1", "丢的是最旧的（交付前的验证命令在尾部）");
+  assert.equal(delivery.commandsTruncated, true);
 });
 
 test("收件：args 不是对象或 path 不是字符串时不记路径", () => {
   const stream = [
-    '{"type":"tool_execution_start","toolName":"read"}',
-    '{"type":"tool_execution_start","toolName":"read","args":{}}',
-    '{"type":"tool_execution_start","toolName":"read","args":{"path":123}}',
-    '{"type":"tool_execution_start","toolName":"read","args":{"path":""}}',
+    '{"type":"tool_execution_start","toolName":"edit"}',
+    '{"type":"tool_execution_start","toolName":"edit","args":{}}',
+    '{"type":"tool_execution_start","toolName":"edit","args":{"path":123}}',
+    '{"type":"tool_execution_start","toolName":"edit","args":{"path":""}}',
   ].join("\n");
   assert.deepEqual(parseChildStream(stream).delivery.paths, []);
 });
@@ -955,6 +982,154 @@ test("交付核对：一个都对不上才报没有实测支撑", () => {
     deliveryUnverified({ summary: "s", why: "", assessment: "" }, delivery([])),
     false,
     "没自述就不判",
+  );
+});
+
+test("交付核对：五条自述只对上一条 ⇒ 部分覆盖（一条对上不能洗白整张表）", () => {
+  const report = {
+    summary: "s",
+    why: "",
+    assessment: "",
+    files_touched: ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts", "src/e.ts"],
+  };
+  const delivery = (paths: string[]) => ({
+    tools: {},
+    paths,
+    commands: [],
+    errors: 0,
+    textChars: 10,
+  });
+  const partial = delivery(["/repo/src/a.ts"]);
+  assert.equal(deliveryUnverified(report, partial), false, "零命中才亮硬旗——部分命中走覆盖度");
+  assert.deepEqual(deliveryCoverage(report, partial), { claimed: 5, matched: 1 });
+  assert.equal(
+    deliveryCoverage(report, delivery(report.files_touched.map((p) => `/repo/${p}`))),
+    undefined,
+    "全对上不是部分",
+  );
+  assert.equal(deliveryCoverage(report, delivery([])), undefined, "零对上不是部分（那是硬旗的事）");
+});
+
+test("自检对质：五条声称只对上一条 ls ⇒ 部分覆盖（塞一条跑过的命令不能洗白）", () => {
+  const report = {
+    summary: "s",
+    why: "",
+    assessment: "",
+    verified: [
+      { command: "pnpm test" },
+      { command: "tsc" },
+      { command: "pnpm lint" },
+      { command: "pnpm check:breakpoints" },
+      { command: "ls" },
+    ],
+  };
+  const delivery = { tools: {}, paths: [], commands: ["ls"], errors: 0, textChars: 10 };
+  assert.equal(verifyUnverified(report, delivery), false, "零命中才亮硬旗");
+  assert.deepEqual(verifyCoverage(report, delivery), { claimed: 5, matched: 1 });
+  // 全观测到 ⇒ 不是部分。缺这条时 `<` 改成 `<=` 是活的（seen ⊆ claims 使它恒真）
+  assert.equal(
+    verifyCoverage(report, { ...delivery, commands: report.verified.map((c) => c.command) }),
+    undefined,
+    "全对上不是部分",
+  );
+});
+
+test("收据：截断过就不判对不上——丢的是证据，不是罪证", () => {
+  const report = { summary: "s", why: "", assessment: "", files_touched: ["src/a.ts"] };
+  const truncated = {
+    tools: {},
+    paths: [],
+    commands: [],
+    errors: 0,
+    textChars: 10,
+    pathsTruncated: true as const,
+  };
+  assert.equal(deliveryUnverified(report, truncated), false, "路径被挤掉不等于没改过");
+  assert.equal(deliveryCoverage(report, truncated), undefined);
+  // 截断 + 部分命中：缺这条时 `!delivery || pathsTruncated` 改成 `&&` 是活的
+  // （零命中本来就返回 undefined，短路被绕过也看不出来）
+  assert.equal(
+    deliveryCoverage(
+      { ...report, files_touched: ["src/a.ts", "src/b.ts", "src/c.ts"] },
+      { ...truncated, paths: ["/repo/src/a.ts"] },
+    ),
+    undefined,
+    "截断时不报部分覆盖——丢的是证据",
+  );
+
+  const commandsTruncated = {
+    tools: {},
+    paths: [],
+    commands: [],
+    errors: 0,
+    textChars: 10,
+    commandsTruncated: true as const,
+  };
+  const claimed = { ...report, verified: [{ command: "pnpm test" }] };
+  assert.equal(verifyUnverified(claimed, commandsTruncated), false, "旧命令被挤掉不等于没跑过");
+  assert.equal(verifyCoverage(claimed, commandsTruncated), undefined);
+});
+
+test("收件：只读过没改过 ⇒ 自述「改了它」没有实测支撑", () => {
+  const stream = [
+    '{"type":"tool_execution_start","toolName":"read","args":{"path":"/repo/src/a.ts"}}',
+    '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"改好了"}]}}',
+  ].join("\n");
+  const parsed = parseChildStream(stream);
+  const report = { summary: "s", why: "", assessment: "", files_touched: ["src/a.ts"] };
+  assert.deepEqual(parsed.delivery.paths, [], "读不算改过");
+  assert.equal(deliveryUnverified(report, parsed.delivery), true, "读过就声称改过 = 没有实测支撑");
+});
+
+test("交付判词：五档全钉住", () => {
+  const empty = { tools: {}, paths: [], commands: [], errors: 0, textChars: 0 };
+  assert.equal(deliverableOf({ delivery: empty }), "absent", "没报告没正文 = 空跑");
+  assert.equal(
+    deliverableOf({ delivery: { ...empty, textChars: 3 } }),
+    "unverified",
+    "有正文没报告",
+  );
+  const report = { summary: "s", why: "", assessment: "" };
+  assert.equal(deliverableOf({ report, delivery: empty }), "unclaimed", "有报告没自述：只读形态");
+  assert.equal(deliverableOf({ report, delivery: empty, assessmentVacuous: true }), "unverified");
+  assert.equal(deliverableOf({ report, delivery: empty, deliveryUnverified: true }), "unverified");
+  assert.equal(deliverableOf({ report, delivery: empty, verifyUnverified: true }), "unverified");
+  assert.equal(deliverableOf({ report, delivery: empty, reportStale: true }), "unverified");
+  assert.equal(
+    deliverableOf({
+      report: { ...report, files_touched: ["a.ts"] },
+      delivery: empty,
+      deliveryPartial: { claimed: 2, matched: 1 },
+    }),
+    "partial",
+  );
+  assert.equal(
+    deliverableOf({ report: { ...report, files_touched: ["a.ts"] }, delivery: empty }),
+    "verified",
+  );
+  // 截断 + 自述 ⇒ 不盖章。缺这两条时「先攒满 20 条收据，再随便写」能洗成 verified（实测可达：
+  // 21 条 bash 命令是正常工作强度）
+  assert.equal(
+    deliverableOf({
+      report: { ...report, verified: [{ command: "pnpm test" }] },
+      delivery: { ...empty, commandsTruncated: true },
+    }),
+    "unverified",
+    "命令收据被截断、又声称跑过命令 ⇒ 没法对质，不给可信",
+  );
+  assert.equal(
+    deliverableOf({
+      report: { ...report, files_touched: ["a.ts"] },
+      delivery: { ...empty, pathsTruncated: true },
+    }),
+    "unverified",
+    "路径收据被截断、又声称改过文件 ⇒ 同上",
+  );
+  // 截断的那一维没有自述 ⇒ 不受影响（只读任务照样 unclaimed）
+  assert.equal(
+    deliverableOf({ report, delivery: { ...empty, commandsTruncated: true } }),
+    "unclaimed",
+    "没自述就不罚：截断只影响被声称的那一维",
   );
 });
 

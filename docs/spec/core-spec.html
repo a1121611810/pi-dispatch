@@ -2318,22 +2318,44 @@
       </div>
 
       <div class="card warn">
-        <h3>信任记账：词表是粗筛，核对才是判官</h3>
+        <h3>两条轴：status 说进程怎么了，deliverable 说交付有没有实测支撑</h3>
         <p>
-          <code>assessmentVacuous</code
-          >（缺/过短/全正面）只是<b>小窗资格粗筛</b>——它拦「连敷衍都懒得敷衍」的报告，不鉴定伪问题。
+          <code>status</code> 只有退出码一个来源（<code>succeeded</code> = 退出
+          0），它<b>不是</b>质量结论： 孩子什么都不干、打空输出、退出 0，账上照样是
+          <code>succeeded</code>。交付判据是另一列， 定终态时由 registry 用
+          <code>deliverableOf</code> 算一次，<b>永不改 status</b>。
         </p>
-        <p>信任只走记账规则：</p>
         <ul>
-          <li>不可核的自述（assessment 全文）= <b>零分</b>；</li>
-          <li>可核对不上（自述 vs 收据）= 零分且<b>倒扣</b>（没有实测支撑 + 失去小窗资格）；</li>
+          <li><code>verified</code>：有自述，且每条都在收据里对上了；</li>
+          <li><code>unclaimed</code>：有报告但没有可核对的自述——只读分析任务的诚实形态，不罚；</li>
           <li>
-            谎报自检（<code>verified</code> 声称跑过、收据 commands 里一条都没观测到）= 同族倒扣：
-            <code>verifyUnverified</code>——没有实测支撑，不是「一定在撒谎」；
+            <code>partial</code>：有自述只对上一部分（<code>deliveryPartial</code> /
+            <code>verifyPartial</code> 带 <code>{claimed, matched}</code>）；
           </li>
           <li>
-            对上 = <b>唯一正分来源</b>。想把声明变成得分，写进 findings/files_touched/verified
-            接受核对。
+            <code>unverified</code
+            >：有自述零命中、<code>assessmentVacuous</code>、或工具报告早于最后一次转向；
+          </li>
+          <li><code>absent</code>：没交报告、正文也是空的——空跑。</li>
+        </ul>
+        <p>
+          只有 <code>verified</code> 与 <code>unclaimed</code> 享受 8KB 小窗，其余落 50KB 大窗。
+          <code>assessmentVacuous</code
+          >（缺/过短/全正面）仍是<b>粗筛</b>：它拦「连敷衍都懒得敷衍」的报告， 不鉴定伪问题。
+        </p>
+        <p><b>收据的口径决定这套判词可不可信：</b></p>
+        <ul>
+          <li>
+            路径只收<b>写类工具</b>的 <code>args.path</code>。<code>read/grep/find/ls</code> 不算——
+            读过不等于改过，否则把声称改过的文件读一遍就能对上；
+          </li>
+          <li>
+            两处上限（路径留前 20、命令留最近 20）撞到时置 <code>pathsTruncated</code> /
+            <code>commandsTruncated</code>，<b>截断就不判「对不上」</b>——丢的是证据，不是罪证；
+          </li>
+          <li>
+            <code>bash</code>/<code>sed</code> 改的文件进不了收据（没有 <code>args.path</code>），
+            自述这些文件会被判没有实测支撑。旗标的意思是「没有实测支撑」，不是「一定在撒谎」。
           </li>
         </ul>
         <p style="margin-bottom: 0">

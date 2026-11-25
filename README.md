@@ -15,7 +15,8 @@ Programmable subagent dispatch for [pi](https://github.com/earendil-works/pi).
 - **管住** —— 盯卡住（静默 5 分钟 + 无在飞工具）、超时收掉、能停（排队中的抽掉，在跑的 SIGTERM→SIGKILL）
 - **转向** —— 孩子还在跑时 `dispatch_steer` 插一句话，它在下一个回合边界看到后调整方向继续干；不打断在飞工具，收据分 `sent` / `queued` / `delivered` / `seen` / `undelivered`；终态通知汇总「转向 N 条：送达 D / 生效 S（未送达 U）」
 - **留痕** —— 每次派发一条记录，落 `~/.pi/dispatch/<项目桶>/`，原子写、压缩归档、重启恢复
-- **核对** —— 收据从子代理的动作抽（不依赖它自述）；报告三种通道（tool / prompt-json / none）；自述的文件和收据一个都对不上时标 `deliveryUnverified`（后缀匹配，相对/绝对路径都认）；谎报自检（`verified` 声称跑过的命令、收据 commands 里一条都没观测到）标 `verifyUnverified`——意思是「没有实测支撑」，不是「一定在撒谎」
+- **核对** —— 收据从子代理的动作抽（不依赖它自述）；报告三种通道（tool / prompt-json / none）；自述的文件和收据一个都对不上时标 `deliveryUnverified`（后缀匹配，相对/绝对路径都认），只对上一部分时带 `deliveryPartial`（`{claimed, matched}`）；谎报自检（`verified` 声称跑过的命令、收据 commands 里一条都没观测到）标 `verifyUnverified`，同一部分命中走 `verifyPartial`——意思是「没有实测支撑」，不是「一定在撒谎」
+- **两条轴** —— `status` 只有退出码一个来源，它**不是**质量结论；交付另有一列 `deliverable`（`verified` / `unclaimed` / `partial` / `unverified` / `absent`），定终态时由 registry 算一次。空跑退出 0 = `succeeded` + `absent`，v0.1.0 起账上不再把「进程退 0」当成「干成了」
 
 ## 父方工具
 
@@ -53,7 +54,7 @@ Programmable subagent dispatch for [pi](https://github.com/earendil-works/pi).
 - **print/json 同步等待可能很长** —— 子代理跑几分钟，父方工具调用就一直挂着。有 `timeoutMs` 与卡住判定兜底。
 - **座位 0 时一次性宿主直接退回** —— 机器太挤（可用低于预留）时 `seatCap` 是 0，这个进程里没有任何子代理能结束并腾出座位，因此不等、直接回「machine is too tight」，避免挂死父方。
 - **只读档位不是沙箱** —— strict 挡「改」不挡「读」，pi 的读工具没有目录囚禁。
-- **交付核对只认能在收据里对上的路径** —— 收据只记文件类工具的 `args.path`；`bash`/`sed` 改的文件、或 `..` 这类要按工作目录解析的写法进不了收据，自述这些文件会被标 `deliveryUnverified`。提示的意思是「没有实测支撑」，不是「一定在撒谎」。
+- **交付核对只认能在收据里对上的路径** —— 收据只记**写类工具**（edit / write）的 `args.path`；`read`/`grep`/`find`/`ls` 不算（读过不等于改过），`bash`/`sed` 改的文件、或 `..` 这类要按工作目录解析的写法进不了收据，自述这些文件会被标 `deliveryUnverified`。收据撞到 20 条上限被截断时不判对不上（`pathsTruncated` / `commandsTruncated`）。提示的意思是「没有实测支撑」，不是「一定在撒谎」。
 
 ## 开发
 
@@ -81,9 +82,13 @@ pnpm test:mode         # 真机验收（print/json/rpc/tui + 隔离/黑板/非 g
 
 ## 安装
 
+从 git 装（`dist` 不入库，`prepare` 会在装的时候构建）：
+
 ```bash
-pi install npm:pi-dispatch
+pi install git:github.com/a1121611810/pi-dispatch
 ```
+
+本地目录改完想试就用 `pi install ./`。**不要**用 `npm:pi-dispatch`：npm 上那个名字属于别人的项目。
 
 ## 许可证
 
