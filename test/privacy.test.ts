@@ -69,7 +69,7 @@ test("隐私：密钥一律命中（宁可误报不能漏）", () => {
 test("隐私：保留域名的邮箱不算（测试里故意用不可达的）", () => {
   assert.deepEqual(scanText("git config user.email verify@example.invalid"), []);
   assert.deepEqual(scanText("mail me at someone@example.com"), []);
-  const real = scanText("mail me at real-user@personal.dev");
+  const real = scanText(`mail me at ${FAKE_HOME.split("/").pop()}@personal.dev`);
   assert.equal(real.length, 1);
   assert.equal(real[0]!.kind, "email");
 });
