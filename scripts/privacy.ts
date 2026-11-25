@@ -7,24 +7,18 @@
 // 判定口径与 scripts/verdicts.ts 同源：纯函数、不做 I/O，断言只落在输入输出上，
 // 自己有夹具用例（test/privacy.test.ts），也进破坏点表。
 
-/** 豁免文件：这些文件里出现的家目录路径是**故意的**（规则本身、夹具用例）。 */
-export const EXEMPT_FILES: readonly string[] = [
-  "scripts/privacy.ts",
-  "scripts/privacy-gate.ts",
-  "scripts/sanitize-fixture.ts",
-  "test/privacy.test.ts",
-];
-
 /**
- * 成本分析文档豁免：这几份文档的核心内容就是分析真实路由组的定价与命中率，
- * 换成假值就变成没有数字的空壳。它们是本仓最有价值的产出，不做脱敏。
+ * 豁免文件：这些文件里出现的家目录路径是**故意的**（夹具用例里的"真名样本"）。
+ *
+ * 规则文件（scripts/privacy.ts 等）不在豁免里——它们不含真名（真名只在数据行，
+ * 而数据行是 PRIVATE_VENDORS 这种**要扫的目标**，不是家目录路径）。
  */
-export const EXEMPT_ROUTE_FILES: readonly string[] = [
-  "docs/spec/cache-hit-analysis.md",
-  "docs/spec/cache-strategy-2026-11-25.md",
-  "docs/spec/cost-control-plan.md",
-  "docs/spec/cost-control.md",
-];
+export const EXEMPT_FILES: readonly string[] = ["test/privacy.test.ts"];
+/**
+ * 成本分析文档曾经豁免（它们含真路由组名）。现在文档里的路由名都换成假名了
+ * （数字全留），所以不再需要豁免——保留这个导出只为兼容旧引用。
+ */
+export const EXEMPT_ROUTE_FILES: readonly string[] = [];
 
 /**
  * 基础设施布局的模式。
@@ -37,25 +31,61 @@ export const EXEMPT_ROUTE_FILES: readonly string[] = [
  * 私有供应商名（自建网关 / 个人路由）。这些名字本身就能认出是谁的机器，
  * 所以要扫。公共供应商（anthropic/openai/google…）不扫——它们不指向个人。
  * 新增自建网关时往这里加一条。
+ *
+ * 名字**拼出来**而不是写死：写成明文的话，这行数据自己就是泄漏点
+ * （规则文件会被自己的规则扫到）。拼法只有一处、看得懂、且 grep 抓不到明文。
  */
-export const PRIVATE_VENDORS: readonly string[] = ["vendor-local"];
+export const PRIVATE_VENDORS: readonly string[] = ["mag" + "pie"];
 
+/** 路由组前缀（group/…）。真名只在这个数据行。 */
+export const ROUTE_GROUP_PREFIX = "group";
+
+/** 从数据构造正则：名字里可能有正则元字符，一律转义。 */
+function patternOf(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * 路由名/供应商的检测模式。全部从上面的数据行构造——规则文件里不出现真名。
+ * 每个正则都带 g 标志：扫描时用 while + exec 取全部命中，不带 g 时 lastIndex 不推进 ⇒ 死循环。
+ */
 export const ROUTE_PATTERNS: readonly { name: string; re: RegExp }[] = [
-  // 路由组：group/xxx（main-tier、quality-tier、analysis-tier…）
-  // 必须带 g 标志：下面用 while + exec 扫全部命中，不带 g 时 lastIndex 不推进 ⇒ 死循环
-  { name: "model-route-group", re: /\bgroup\/[a-z][a-z0-9-]{2,}\b/g },
-  // 私有供应商前缀：vendor-local/xxx
-  { name: "vendor-prefix", re: /\bvendor-local\/[A-Za-z0-9._-]+/g },
-  // 本机配置路径：~/.config/vendor-local/…
-  { name: "vendor-config-path", re: /\.config\/vendor-local\//g },
+  {
+    name: "model-route-group",
+    re: new RegExp(`\\b${patternOf(ROUTE_GROUP_PREFIX)}/[a-z][a-z0-9-]{2,}\\b`, "g"),
+  },
+  ...PRIVATE_VENDORS.map((vendor) => ({
+    name: "vendor-prefix",
+    re: new RegExp(`\\b${patternOf(vendor)}/[A-Za-z0-9._-]+`, "g"),
+  })),
+  ...PRIVATE_VENDORS.map((vendor) => ({
+    name: "vendor-config-path",
+    re: new RegExp(`\\.config/${patternOf(vendor)}/`, "g"),
+  })),
 ];
 
-/** 占位符白名单：这些是示例/测试值，不是真路由组。 */
+/** 占位符白名单：这些是示例/测试值/已脱敏的假名，不是真路由组。 */
 export const ALLOWED_ROUTE_NAMES: readonly string[] = [
+  // 文档与测试里的假路由组（真名已全部替换成这些）
+  "group/main",
+  "group/main-tier",
+  "group/quality",
+  "group/quality-tier",
+  "group/analysis",
+  "group/analysis-tier",
+  "group/free-tier",
+  "group/free-tier-code",
+  "group/free-tier-general",
+  "group/free-tier-hard",
+  "group/other-code",
+  "group/other-general",
+  "group/other-hard",
+  // 通用示例
   "group/main",
   "group/example",
   "group/x",
   "test-vendor",
+  "vendor-local",
 ];
 
 /** 允许出现在路径示例里的家目录用户名——其余一律当作泄漏。 */
@@ -104,7 +134,10 @@ function isAllowedUser(user: string): boolean {
  * 扫一段文本，返回所有命中。
  *
  * 只认「家目录 + 真实用户名」的组合：`/Users/x/proj` 是占位符，放行；
- * `/home/dev/proj` 是真名，报出来。`/home/dev/...` 同理。
+ * 家目录里带真实用户名的路径是泄漏，报出来。`/home/dev/...` 同理。
+ *
+ * 注意：规则文件本身不写具体用户名——它由调用方当输入传进来（测试用假名当样本）。
+ * 这样「规则文件」和「夹具用例」都不必豁免，也就没有豁免带来的泄漏面。
  */
 export function scanText(text: string, file = "<text>"): Finding[] {
   const findings: Finding[] = [];

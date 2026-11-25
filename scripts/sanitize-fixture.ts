@@ -10,7 +10,8 @@ import { readFileSync, writeFileSync } from "node:fs";
 /** 替换规则：按顺序应用。 */
 export const REPLACEMENTS: readonly { from: RegExp; to: string; why: string }[] = [
   {
-    from: /\/Users\/real-user/g,
+    // 家目录：把 /Users/<任何用户名> 换成 /home/dev（不写死某个用户名——规则本身不该带真名）
+    from: /\/Users\/[A-Za-z0-9._-]+/g,
     to: "/home/dev",
     why: "家目录路径",
   },

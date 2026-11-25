@@ -13,7 +13,7 @@
 | #   | 基线原文                                                                                                            | 实测事实（pi 1.5.2，源码位置）                                                                                                                                                                                                                                                                                                                                                        | 对方案的影响                                                                                                                                   |
 | --- | ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | C1  | 改动 4：给子代理工作目录放 `.pi/settings.json` 写 `{"cacheWarming":"off"}`，「项目级 settings 优先于 agent 目录级」 | **不成立**。`SettingsManager.getCacheWarmingMode()` 只读 `this.globalSettings`，而 `globalSettings` = `<agent-dir>/settings.json`（`dist/core/settings-manager.js:123,725-728`，注释原文 "Read from global settings only because warming costs money"）。`docs/settings.md` 的 cacheWarming 行也标着 "Global setting only"。项目级 `.pi/settings.json` 里的 `cacheWarming` **不生效** | 改动 4 换机制：走扩展钩子 `cache_warming_decision`（见 §2.4）。附带好处：不用往父方工作区写文件 ⇒ 没有 `.gitignore` 问题、没有隔离档的落点问题 |
-| C2  | 派 `medium` 不降预算，白以为省了                                                                                    | pi 自己会**往上抬**：`clampThinkingLevel()` 先往更高档位找（`pi-ai/dist/models.js:714-731`），vendor-local 的 `medium` 是显式 `null` ⇒ 落到 `high`（16384 token 预算）。启动路径确认：`main.js:746` → `session.setThinkingLevel()` → `_clampThinkingLevel()` → `clampThinkingLevel()`                                                                                                       | 校验不是「锦上添花」，是**防涨价**：不校验就等于替父方选了最贵的档。方案必须先校验再发，且只发模型支持的档位（这样 pi 的 clamp 不再插手）      |
+| C2  | 派 `medium` 不降预算，白以为省了                                                                                    | pi 自己会**往上抬**：`clampThinkingLevel()` 先往更高档位找（`pi-ai/dist/models.js:714-731`），vendor-local 的 `medium` 是显式 `null` ⇒ 落到 `high`（16384 token 预算）。启动路径确认：`main.js:746` → `session.setThinkingLevel()` → `_clampThinkingLevel()` → `clampThinkingLevel()`                                                                                                 | 校验不是「锦上添花」，是**防涨价**：不校验就等于替父方选了最贵的档。方案必须先校验再发，且只发模型支持的档位（这样 pi 的 clamp 不再插手）      |
 | C3  | 改动 3 的理由：「子代理跑多轮时，上一轮的完整 request 不再是下一轮的前缀，缓存全废」                                | **今天不是这样**。真机样本 `test/fixtures/real-steer.jsonl` 里 3 条 system 消息的 addendum 逐字节相同（均 2019 字符）⇒ 子代理**一轮之内**前缀已经稳定，`--append-system-prompt` 是启动参数、运行期不变                                                                                                                                                                                | 改动 3 的收益不是「轮内稳定」，是**跨子代理共享同一段前缀**：今天 `why` 在系统提示词里 ⇒ 每个子代理的系统提示词都不同 ⇒ 彼此之间缓存不共享     |
 | C4  | 「每次派发都拼一个含 taskId/why 的块」                                                                              | 附加块里**没有 taskId**（`src/core/child.ts:198-207` 只有 why 与隔离契约）。taskId 走环境变量 `PI_DISPATCH_TASK_ID` 进孩子，不进提示词                                                                                                                                                                                                                                                | 变动面比基线设想的小：系统提示词里唯一每派必变的是 `why`（+ 条件出现的隔离契约）                                                               |
 
@@ -325,15 +325,15 @@ export interface ThinkingReceipt {
 
 #### 2.2.5 边界情况清单
 
-| 情况                               | 处理                                                                                 |
-| ---------------------------------- | ------------------------------------------------------------------------------------ |
-| `model` 写成模式（`vendor-local/*`）     | 目录里查不到 ⇒ 不校验、原样透传、回执说「未校验」                                    |
-| 裸 id（`regex:group/main`）  | 目录里 id 唯一 ⇒ 能校验；id 撞多个 ⇒ 不校验                                          |
-| 模型是虚拟模型（virtual model）    | 目录里查的是虚拟模型本身 ⇒ `thinkingLevelMap` 可能是路由后的值。**【需真机验证】**   |
-| 调用方没给 `model`（继承会话模型） | 用 `sessionModel` 查目录；查不到就不校验                                             |
-| 调用方没给 `thinkingLevel`         | 不拼后缀（行为与今天完全一致）——**不擅自替父方降档**                                 |
-| 请求 `max`（vendor-local 支持）          | 原样发。⚠️ `max` 与 `high` 预算相同（都 16384）——别为 `max` 多付钱，也不值得为它多跑 |
-| 请求 `xhigh`（vendor-local 显式 null）   | 降到 `low`。⚠️ pi 自己会把 `xhigh` 收到 `max`（=16384），所以这里**省钱 8 倍**       |
+| 情况                                   | 处理                                                                                 |
+| -------------------------------------- | ------------------------------------------------------------------------------------ |
+| `model` 写成模式（`vendor-local/*`）   | 目录里查不到 ⇒ 不校验、原样透传、回执说「未校验」                                    |
+| 裸 id（`regex:group/main`）            | 目录里 id 唯一 ⇒ 能校验；id 撞多个 ⇒ 不校验                                          |
+| 模型是虚拟模型（virtual model）        | 目录里查的是虚拟模型本身 ⇒ `thinkingLevelMap` 可能是路由后的值。**【需真机验证】**   |
+| 调用方没给 `model`（继承会话模型）     | 用 `sessionModel` 查目录；查不到就不校验                                             |
+| 调用方没给 `thinkingLevel`             | 不拼后缀（行为与今天完全一致）——**不擅自替父方降档**                                 |
+| 请求 `max`（vendor-local 支持）        | 原样发。⚠️ `max` 与 `high` 预算相同（都 16384）——别为 `max` 多付钱，也不值得为它多跑 |
+| 请求 `xhigh`（vendor-local 显式 null） | 降到 `low`。⚠️ pi 自己会把 `xhigh` 收到 `max`（=16384），所以这里**省钱 8 倍**       |
 
 ---
 
@@ -653,7 +653,7 @@ core（纯函数，可单测）
 | BP-3  | 软门后宽限期到点进硬门     | `src/core/budget.ts`        | `  const hardByTime = input.softAt !== undefined && input.now - input.softAt >= grace;`                                        | `  const hardByTime = input.softAt !== undefined && input.now - input.softAt > grace;`                                         | `test/budget.test.ts`     | `预算：软门后超过宽限期 ⇒ 进硬门（不靠新用量）`                                  |
 | BP-4  | token 口径含 cacheRead     | `src/core/budget.ts`        | `    (usage.cacheRead ?? 0) +`                                                                                                 | `    0 +`                                                                                                                      | `test/budget.test.ts`     | `预算：token 口径含 cacheRead（缓存型子代理的账不失真）`                         |
 | BP-5  | 预算闸：至少一个上限       | `src/core/gates.ts`         | `  if (budget.maxUsd === undefined && budget.maxTokens === undefined)`                                                         | `  if (false)`                                                                                                                 | `test/core-logic.test.ts` | `安检 17：usageBudget 至少要给一个上限（maxUsd / maxTokens）`                    |
-| BP-6  | 降级到 low                 | `src/core/thinking.ts`      | `  if (supported.includes("low")) return "low";`                                                                               | `  if (supported.includes("low")) return "off";`                                                                               | `test/thinking.test.ts`   | `思考档位：thinkingLevelMap 显式 null ⇒ 降到 low（vendor-local 的 medium）`            |
+| BP-6  | 降级到 low                 | `src/core/thinking.ts`      | `  if (supported.includes("low")) return "low";`                                                                               | `  if (supported.includes("low")) return "off";`                                                                               | `test/thinking.test.ts`   | `思考档位：thinkingLevelMap 显式 null ⇒ 降到 low（vendor-local 的 medium）`      |
 | BP-7  | 降级只往下不往上           | `src/core/thinking.ts`      | `  const cheaper = supported.filter((level) => COST_ORDER.indexOf(level as never) <= COST_ORDER.indexOf(requested as never));` | `  const cheaper = supported.filter((level) => COST_ORDER.indexOf(level as never) >= COST_ORDER.indexOf(requested as never));` | `test/thinking.test.ts`   | `思考档位：降级只往下不往上（生效档位的成本序不得高于请求档位）`                 |
 | BP-8  | 只发 supported 里的档位    | `src/core/thinking.ts`      | `  if (supported.includes(requested))`                                                                                         | `  if (true)`                                                                                                                  | `test/thinking.test.ts`   | `思考档位：只发 supported 里的档位 ⇒ pi 的 clamp 不会再改它（档位必在支持集里）` |
 | BP-9  | 附加块恒定（why 不进前缀） | `src/core/child.ts`         | `  argv.push("--append-system-prompt", CONTRACT_BLOCK);`                                                                       | `  argv.push("--append-system-prompt", CONTRACT_BLOCK + (options.why ?? ""));`                                                 | `test/child.test.ts`      | `拼命令：附加块恒定（why 不进系统提示词）`                                       |
@@ -767,25 +767,25 @@ core（纯函数，可单测）
 
 **【2】thinking 校验**
 
-| #    | 功能点                                        | 用例（§3.2 标题）                                                                | 破坏点                                               | 缺口怎么补                                                 |
-| ---- | --------------------------------------------- | -------------------------------------------------------------------------------- | ---------------------------------------------------- | ---------------------------------------------------------- |
-| T-01 | 模型支持该档 ⇒ 原样发                         | `思考档位：模型支持该档 ⇒ 原样发（不降级）`                                      | `支持的档位原样发（resolveThinkingLevel）`           | 已补（见破坏点列）                                         |
-| T-02 | `thinkingLevelMap` 显式 null ⇒ 降到 low       | `思考档位：thinkingLevelMap 显式 null ⇒ 降到 low（vendor-local 的 medium）`            | `降级到 low（downgradeTarget）`                      | —                                                          |
-| T-03 | 降级只往下不往上                              | `思考档位：降级只往下不往上（生效档位的成本序不得高于请求档位）`                 | `降级只往下不往上（downgradeTarget）`                | —                                                          |
-| T-04 | 模型不在目录里 ⇒ 原样透传 + 说明未校验        | `思考档位：模型不在目录里 ⇒ 原样透传并说明未校验`                                | `模型不在目录里 ⇒ 未校验（resolveThinkingLevel）`    | 已补（见破坏点列）                                         |
-| T-05 | 非思考模型 ⇒ 不发后缀（= off）                | `思考档位：非思考模型 ⇒ 不发后缀（= off）`                                       | `非思考模型 ⇒ off（resolveThinkingLevel）`           | 已补（见破坏点列）                                         |
-| T-06 | xhigh/max 缺键 ⇒ 最接近的一档                 | `思考档位：xhigh/max 缺键 ⇒ 按 pi 口径落到最接近的一档（不静默降成 low）`        | `缺键 ⇒ 最接近的一档（resolveThinkingLevel）`        | 已补（见破坏点列）                                         |
-| T-07 | 裸 id 唯一命中                                | `思考档位：裸 id 唯一命中也能找到模型`                                           | `裸 id 唯一命中（findThinkingModel）`                | 已补（见破坏点列）                                         |
-| T-08 | 裸 id 撞多个 ⇒ 不校验                         | `思考档位：裸 id 撞多个 ⇒ 不校验（原样透传）`                                    | `裸 id 撞多个 ⇒ 不校验（findThinkingModel）`         | 已补（见破坏点列）                                         |
-| T-09 | 回执说明生效档位与降级原因                    | `思考档位：回执说明实际生效档位与降级原因`                                       | `回执说明降级原因（resolveThinkingLevel 的 reason）` | 已补（见破坏点列）                                         |
-| T-10 | 只发 supported 里的档位                       | `思考档位：只发 supported 里的档位 ⇒ pi 的 clamp 不会再改它（档位必在支持集里）` | `只发 supported 里的档位（resolveThinkingLevel）`    | —                                                          |
-| T-11 | 降级后的档位进 `--model` 后缀                 | `拼命令：降级后的档位进 --model 后缀（a/b:low）`                                 | `降级后的档位进 --model 后缀（buildPiArgv）`         | 已补（见破坏点列）                                         |
-| T-12 | 没给档位时不拼后缀                            | `拼命令：没给档位时不拼后缀（a/b 不带冒号）`                                     | `没给档位时不拼后缀（buildPiArgv）`                  | 已补（见破坏点列）                                         |
-| T-13 | 引擎回执带 thinking                           | `引擎：thinking 降级写进回执（requested/effective/reason）`                      | `引擎回执带 thinking（受理时写进初始记录）`          | 已补（见破坏点列）                                         |
-| T-14 | 没给 model 时用会话模型查目录                 | `思考档位：没给 model 时用会话模型查目录`                                        | `没给 model 时用会话模型查目录（effectiveModel）`    | 已补（见破坏点列）；用例已写（见 §3.2.1）                  |
-| T-15 | 模型写成模式（`vendor-local/*`）⇒ 查不到 ⇒ 不校验   | `思考档位：模型不在目录里 ⇒ 原样透传并说明未校验`（同一条功能点的另一个输入）    | `模型不在目录里 ⇒ 未校验（resolveThinkingLevel）`    | 同一功能点，不另开破坏点                                   |
-| T-16 | 没给 `thinkingLevel` ⇒ 不拼后缀（不擅自降档） | `拼命令：没给档位时不拼后缀（a/b 不带冒号）`                                     | `没给档位时不拼后缀（buildPiArgv）`                  | 同一功能点                                                 |
-| T-17 | 虚拟模型的档位（路由后）                      | ✗ 无可测用例                                                                     | —                                                    | 外部类（provider 行为），见 §3.3.4 第 7 条 → §3.5 真机验证 |
+| #    | 功能点                                            | 用例（§3.2 标题）                                                                | 破坏点                                               | 缺口怎么补                                                 |
+| ---- | ------------------------------------------------- | -------------------------------------------------------------------------------- | ---------------------------------------------------- | ---------------------------------------------------------- |
+| T-01 | 模型支持该档 ⇒ 原样发                             | `思考档位：模型支持该档 ⇒ 原样发（不降级）`                                      | `支持的档位原样发（resolveThinkingLevel）`           | 已补（见破坏点列）                                         |
+| T-02 | `thinkingLevelMap` 显式 null ⇒ 降到 low           | `思考档位：thinkingLevelMap 显式 null ⇒ 降到 low（vendor-local 的 medium）`      | `降级到 low（downgradeTarget）`                      | —                                                          |
+| T-03 | 降级只往下不往上                                  | `思考档位：降级只往下不往上（生效档位的成本序不得高于请求档位）`                 | `降级只往下不往上（downgradeTarget）`                | —                                                          |
+| T-04 | 模型不在目录里 ⇒ 原样透传 + 说明未校验            | `思考档位：模型不在目录里 ⇒ 原样透传并说明未校验`                                | `模型不在目录里 ⇒ 未校验（resolveThinkingLevel）`    | 已补（见破坏点列）                                         |
+| T-05 | 非思考模型 ⇒ 不发后缀（= off）                    | `思考档位：非思考模型 ⇒ 不发后缀（= off）`                                       | `非思考模型 ⇒ off（resolveThinkingLevel）`           | 已补（见破坏点列）                                         |
+| T-06 | xhigh/max 缺键 ⇒ 最接近的一档                     | `思考档位：xhigh/max 缺键 ⇒ 按 pi 口径落到最接近的一档（不静默降成 low）`        | `缺键 ⇒ 最接近的一档（resolveThinkingLevel）`        | 已补（见破坏点列）                                         |
+| T-07 | 裸 id 唯一命中                                    | `思考档位：裸 id 唯一命中也能找到模型`                                           | `裸 id 唯一命中（findThinkingModel）`                | 已补（见破坏点列）                                         |
+| T-08 | 裸 id 撞多个 ⇒ 不校验                             | `思考档位：裸 id 撞多个 ⇒ 不校验（原样透传）`                                    | `裸 id 撞多个 ⇒ 不校验（findThinkingModel）`         | 已补（见破坏点列）                                         |
+| T-09 | 回执说明生效档位与降级原因                        | `思考档位：回执说明实际生效档位与降级原因`                                       | `回执说明降级原因（resolveThinkingLevel 的 reason）` | 已补（见破坏点列）                                         |
+| T-10 | 只发 supported 里的档位                           | `思考档位：只发 supported 里的档位 ⇒ pi 的 clamp 不会再改它（档位必在支持集里）` | `只发 supported 里的档位（resolveThinkingLevel）`    | —                                                          |
+| T-11 | 降级后的档位进 `--model` 后缀                     | `拼命令：降级后的档位进 --model 后缀（a/b:low）`                                 | `降级后的档位进 --model 后缀（buildPiArgv）`         | 已补（见破坏点列）                                         |
+| T-12 | 没给档位时不拼后缀                                | `拼命令：没给档位时不拼后缀（a/b 不带冒号）`                                     | `没给档位时不拼后缀（buildPiArgv）`                  | 已补（见破坏点列）                                         |
+| T-13 | 引擎回执带 thinking                               | `引擎：thinking 降级写进回执（requested/effective/reason）`                      | `引擎回执带 thinking（受理时写进初始记录）`          | 已补（见破坏点列）                                         |
+| T-14 | 没给 model 时用会话模型查目录                     | `思考档位：没给 model 时用会话模型查目录`                                        | `没给 model 时用会话模型查目录（effectiveModel）`    | 已补（见破坏点列）；用例已写（见 §3.2.1）                  |
+| T-15 | 模型写成模式（`vendor-local/*`）⇒ 查不到 ⇒ 不校验 | `思考档位：模型不在目录里 ⇒ 原样透传并说明未校验`（同一条功能点的另一个输入）    | `模型不在目录里 ⇒ 未校验（resolveThinkingLevel）`    | 同一功能点，不另开破坏点                                   |
+| T-16 | 没给 `thinkingLevel` ⇒ 不拼后缀（不擅自降档）     | `拼命令：没给档位时不拼后缀（a/b 不带冒号）`                                     | `没给档位时不拼后缀（buildPiArgv）`                  | 同一功能点                                                 |
+| T-17 | 虚拟模型的档位（路由后）                          | ✗ 无可测用例                                                                     | —                                                    | 外部类（provider 行为），见 §3.3.4 第 7 条 → §3.5 真机验证 |
 
 **【3】前缀稳定化**
 
@@ -866,7 +866,7 @@ core（纯函数，可单测）
 | BP-3  | 软门后宽限期到点进硬门     | `src/core/budget.ts`        | `  const hardByTime = input.softAt !== undefined && input.now - input.softAt >= grace;`                                        | `  const hardByTime = input.softAt !== undefined && input.now - input.softAt > grace;`                                         | `test/budget.test.ts`     | `预算：软门后超过宽限期 ⇒ 进硬门（不靠新用量）`                                  |
 | BP-4  | token 口径含 cacheRead     | `src/core/budget.ts`        | `    (usage.cacheRead ?? 0) +`                                                                                                 | `    0 +`                                                                                                                      | `test/budget.test.ts`     | `预算：token 口径含 cacheRead（缓存型子代理的账不失真）`                         |
 | BP-5  | 预算闸：至少一个上限       | `src/core/gates.ts`         | `  if (budget.maxUsd === undefined && budget.maxTokens === undefined)`                                                         | `  if (false)`                                                                                                                 | `test/core-logic.test.ts` | `安检 17：usageBudget 至少要给一个上限（maxUsd / maxTokens）`                    |
-| BP-6  | 降级到 low                 | `src/core/thinking.ts`      | `  if (supported.includes("low")) return "low";`                                                                               | `  if (supported.includes("low")) return "off";`                                                                               | `test/thinking.test.ts`   | `思考档位：thinkingLevelMap 显式 null ⇒ 降到 low（vendor-local 的 medium）`            |
+| BP-6  | 降级到 low                 | `src/core/thinking.ts`      | `  if (supported.includes("low")) return "low";`                                                                               | `  if (supported.includes("low")) return "off";`                                                                               | `test/thinking.test.ts`   | `思考档位：thinkingLevelMap 显式 null ⇒ 降到 low（vendor-local 的 medium）`      |
 | BP-7  | 降级只往下不往上           | `src/core/thinking.ts`      | `  const cheaper = supported.filter((level) => COST_ORDER.indexOf(level as never) <= COST_ORDER.indexOf(requested as never));` | `  const cheaper = supported.filter((level) => COST_ORDER.indexOf(level as never) >= COST_ORDER.indexOf(requested as never));` | `test/thinking.test.ts`   | `思考档位：降级只往下不往上（生效档位的成本序不得高于请求档位）`                 |
 | BP-8  | 只发 supported 里的档位    | `src/core/thinking.ts`      | `  if (supported.includes(requested))`                                                                                         | `  if (true)`                                                                                                                  | `test/thinking.test.ts`   | `思考档位：只发 supported 里的档位 ⇒ pi 的 clamp 不会再改它（档位必在支持集里）` |
 | BP-9  | 附加块恒定（why 不进前缀） | `src/core/child.ts`         | `  argv.push("--append-system-prompt", CONTRACT_BLOCK);`                                                                       | `  argv.push("--append-system-prompt", CONTRACT_BLOCK + (options.why ?? ""));`                                                 | `test/child.test.ts`      | `拼命令：附加块恒定（why 不进系统提示词）`                                       |
@@ -1096,13 +1096,13 @@ mutator 对 TypeScript 的变异集：`true`/`false`、`==`/`!=`、`===`/`!==`�
 
 ### 【2】thinking 校验
 
-| 取舍 / 风险                                                        | 说明与对策                                                                                           |
-| ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
-| **降档会降低子代理的思考深度**（质量风险）                         | 只在**父方点名了一个该模型不支持的档位**时降；父方不给档位就一切照旧。回执 + 通知里明说「high→low」  |
+| 取舍 / 风险                                                              | 说明与对策                                                                                           |
+| ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| **降档会降低子代理的思考深度**（质量风险）                               | 只在**父方点名了一个该模型不支持的档位**时降；父方不给档位就一切照旧。回执 + 通知里明说「high→low」  |
 | 「max 降成 low」在支持 max 的模型上**不会发生**（vendor-local 支持 max） | 支持就原样发；但 `max` 与 `high` 预算相同（16384）⇒ 别为 `max` 多付钱（写进「不做的事」）            |
-| 模型目录快照是**会话开始时的快照**                                 | 会话中途改 models.json 不影响已派发任务；新派发用新快照（适配层每次读 `ctx.modelRegistry.getAll()`） |
-| 虚拟模型的档位由**路由**决定，目录里查不到物理模型的 map           | 查不到就不校验（不猜）。**【需真机验证】**                                                           |
-| 「模型不在目录里 ⇒ 原样透传」= 校验不是全覆盖                      | 明说：回执 `modelKnown: false`。宁可漏校验，也不要瞎降档把好模型降残                                 |
+| 模型目录快照是**会话开始时的快照**                                       | 会话中途改 models.json 不影响已派发任务；新派发用新快照（适配层每次读 `ctx.modelRegistry.getAll()`） |
+| 虚拟模型的档位由**路由**决定，目录里查不到物理模型的 map                 | 查不到就不校验（不猜）。**【需真机验证】**                                                           |
+| 「模型不在目录里 ⇒ 原样透传」= 校验不是全覆盖                            | 明说：回执 `modelKnown: false`。宁可漏校验，也不要瞎降档把好模型降残                                 |
 
 ### 【3】前缀稳定化
 
@@ -1126,19 +1126,19 @@ mutator 对 TypeScript 的变异集：`true`/`false`、`==`/`!=`、`===`/`!==`�
 
 ## 5. 明确不做的事
 
-| 不做                                            | 理由                                                                                                                         |
-| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| **不给子代理写 `.pi/settings.json`**            | pi 的 `cacheWarming` 只读 agent 目录级，项目级写了**不生效**（C1）。写了还污染父方工作区、还要进 `.gitignore`                |
-| **用 `PI_CODING_AGENT_DIR` 换 agent 目录**      | 会连 auth.json / models.json 一起换掉 ⇒ 认证与模型目录全丢；除非整套复制一份，不值当                                         |
-| **改 compaction 阈值**                          | 本机 1M 窗口 + 16K 保留 ⇒ 要涨到 1,032,192 token 才触发；子代理跑几万 token 永远不触发；压缩自己还要调模型（实测一次 $0.32） |
-| **收窄工具表来省 token**                        | 实测收窄到只读（427 token）比 coding 组合（382 token）**还多 45 token**——省三位数，砍真能力                                  |
-| **加 `--no-prompt-templates` / `--no-themes`**  | 两者完全不进 system prompt ⇒ **0 token 收益**，只有启动速度差别                                                              |
-| **给 vendor-local 派 `medium` / `minimal` / `xhigh`** | 这些档位在 vendor-local 的 map 里是显式 `null`（不支持）；本方案已经**自动降到 low**，不需要父方记住这件事                         |
-| **为 `max` 档多付钱**                           | `max` 与 `high` 预算相同（都 16384，被 clamp）——同一个钱，买不到更多思考                                                     |
-| **把项目上下文（AGENTS.md）也搬出系统提示词**   | 它按项目变，本来就不跨项目共享；搬走会破坏「实施档要遵守仓库规则」这条纪律（AGENTS.md 明确要求）                             |
-| **预算做成会话级总池**                          | 一次一单、互不影响更好推理；池化会把「谁超了」的归因变难（父方看不到单个任务的账）                                           |
-| **预算触发时直接杀（不要软门）**                | 会打断在飞工具、丢掉报告；软门 + 硬门兜底已经覆盖「孩子不理人」的情况                                                        |
-| **对子代理的 thinking 档位做「智能推荐」**      | 那是模型该做的判断（它可以自己在任务里说「这个要深思」）；父方只给上限，core 只做**校验**不做**推荐**                        |
+| 不做                                                  | 理由                                                                                                                         |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| **不给子代理写 `.pi/settings.json`**                  | pi 的 `cacheWarming` 只读 agent 目录级，项目级写了**不生效**（C1）。写了还污染父方工作区、还要进 `.gitignore`                |
+| **用 `PI_CODING_AGENT_DIR` 换 agent 目录**            | 会连 auth.json / models.json 一起换掉 ⇒ 认证与模型目录全丢；除非整套复制一份，不值当                                         |
+| **改 compaction 阈值**                                | 本机 1M 窗口 + 16K 保留 ⇒ 要涨到 1,032,192 token 才触发；子代理跑几万 token 永远不触发；压缩自己还要调模型（实测一次 $0.32） |
+| **收窄工具表来省 token**                              | 实测收窄到只读（427 token）比 coding 组合（382 token）**还多 45 token**——省三位数，砍真能力                                  |
+| **加 `--no-prompt-templates` / `--no-themes`**        | 两者完全不进 system prompt ⇒ **0 token 收益**，只有启动速度差别                                                              |
+| **给 vendor-local 派 `medium` / `minimal` / `xhigh`** | 这些档位在 vendor-local 的 map 里是显式 `null`（不支持）；本方案已经**自动降到 low**，不需要父方记住这件事                   |
+| **为 `max` 档多付钱**                                 | `max` 与 `high` 预算相同（都 16384，被 clamp）——同一个钱，买不到更多思考                                                     |
+| **把项目上下文（AGENTS.md）也搬出系统提示词**         | 它按项目变，本来就不跨项目共享；搬走会破坏「实施档要遵守仓库规则」这条纪律（AGENTS.md 明确要求）                             |
+| **预算做成会话级总池**                                | 一次一单、互不影响更好推理；池化会把「谁超了」的归因变难（父方看不到单个任务的账）                                           |
+| **预算触发时直接杀（不要软门）**                      | 会打断在飞工具、丢掉报告；软门 + 硬门兜底已经覆盖「孩子不理人」的情况                                                        |
+| **对子代理的 thinking 档位做「智能推荐」**            | 那是模型该做的判断（它可以自己在任务里说「这个要深思」）；父方只给上限，core 只做**校验**不做**推荐**                        |
 
 ---
 

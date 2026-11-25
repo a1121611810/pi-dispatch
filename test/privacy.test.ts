@@ -21,10 +21,10 @@ import {
 import { sanitize, sanitizeJsonl, REPLACEMENTS } from "../scripts/sanitize-fixture.ts";
 
 test("隐私：真名家目录要报出来", () => {
-  const findings = scanText('const p = "/home/dev/develop/x";');
+  const findings = scanText('const p = "/Users/real-user/develop/x";');
   assert.equal(findings.length, 1);
   assert.equal(findings[0]!.kind, "home-path");
-  assert.equal(findings[0]!.text, "/home/dev");
+  assert.equal(findings[0]!.text, "/Users/real-user");
 });
 
 test("隐私：占位符家目录放行（/Users/x/… 是文档里的示例写法）", () => {
@@ -35,7 +35,7 @@ test("隐私：占位符家目录放行（/Users/x/… 是文档里的示例写�
 });
 
 test("隐私：行号要准（报错得能直接定位）", () => {
-  const text = "line1\nline2\nconst p = '/home/dev/x';\nline4";
+  const text = "line1\nline2\nconst p = '/Users/real-user/x';\nline4";
   const findings = scanText(text);
   assert.equal(findings.length, 1);
   assert.equal(findings[0]!.line, 3);
@@ -70,12 +70,12 @@ test("隐私：保留域名的邮箱不算（测试里故意用不可达的）",
 });
 
 test("隐私：模型路由组名与供应商前缀要报出来（能推出定价与供应商）", () => {
-  const group = scanText('const model = "group/main";');
+  const group = scanText('const model = "group/some-route";');
   assert.equal(group.length, 1);
   assert.equal(group[0]!.kind, "route:model-route-group");
-  const vendor = scanText('const model = "vendor-local/group/main";');
+  const vendor = scanText(`const model = "${PRIVATE_VENDORS[0]}/group/some-route";`);
   assert.ok(vendor.some((f) => f.kind === "route:vendor-prefix"));
-  const config = scanText("数据来自 ~/.config/vendor-local/affinity.json");
+  const config = scanText(`数据来自 ~/.config/${PRIVATE_VENDORS[0]}/affinity.json`);
   assert.ok(config.some((f) => f.kind === "route:vendor-config-path"));
 });
 
@@ -93,13 +93,13 @@ test("隐私：路由名占位符放行（示例与测试值不是真路由组�
   }
 });
 
-test("隐私：成本分析文档豁免路由名扫描（分析对象就是真路由组）", () => {
+test("隐私：成本分析文档不再豁免（里面的路由名已换成假名）", () => {
   const doc = "docs/spec/cost-control.md";
-  assert.deepEqual(scanText('model = "group/main"', doc), [], "成本文档不报");
-  assert.ok(scanText('model = "group/main"').length > 0, "同样的内容换个文件就报");
-  for (const file of EXEMPT_ROUTE_FILES) {
-    assert.deepEqual(scanText("group/main vendor-local/x", file), [], `${file} 应当豁免`);
-  }
+  assert.deepEqual(EXEMPT_ROUTE_FILES, [], "文档不该再豁免——真名已换成假名");
+  assert.ok(
+    scanText('model = "group/some-route"', doc).length > 0,
+    "成本文档与其他文件一样要扫（真名已不在文档里）",
+  );
 });
 
 test("隐私：二进制文件不扫（扫出来是乱码）", () => {
@@ -117,12 +117,12 @@ test("隐私：规则文件与夹具用例自己豁免（它们里的家目录�
 });
 
 test("脱敏：家目录路径换成占位符", () => {
-  assert.equal(sanitize("/home/dev/x"), "/home/dev/x");
+  assert.equal(sanitize("/Users/real-user/x"), "/home/dev/x");
 });
 
 test("脱敏：模型路由名与供应商名换掉", () => {
-  assert.equal(sanitize('"model":"group/main"'), '"model":"test/model"');
-  assert.equal(sanitize('"provider":"vendor-local"'), '"provider":"test/provider"');
+  assert.equal(sanitize('"model":"group/some-route"'), '"model":"test/model"');
+  assert.equal(sanitize(`"provider":"${PRIVATE_VENDORS[0]}"`), '"provider":"test/provider"');
 });
 
 test("脱敏：project_context 整块留结构不留内容", () => {
@@ -148,16 +148,16 @@ test("脱敏：产物每行都必须是合法 JSON（解析器会静默跳过坏
 
 test("脱敏：整份 JSONL 走一遍，每行都得能解析", () => {
   const source = [
-    '{"type":"session","cwd":"/home/dev/x","id":"01a200ed-7e02-7508-ac60-412b1c0ff1fe"}',
-    '{"type":"message_end","message":{"provider":"vendor-local","model":"group/main"}}',
+    '{"type":"session","cwd":"/Users/real-user/x","id":"01a200ed-7e02-7508-ac60-412b1c0ff1fe"}',
+    `{"type":"message_end","message":{"provider":"${PRIVATE_VENDORS[0]}","model":"group/some-route"}}`,
     '{"type":"message_end","message":{"role":"assistant","project_context":"<project_context>\\n# Secret Rules\\n</project_context>"}}',
   ].join("\n");
   const out = sanitizeJsonl(source);
   const lines = out.split("\n").filter(Boolean);
   assert.equal(lines.length, 3);
   for (const line of lines) assert.doesNotThrow(() => JSON.parse(line));
-  assert.ok(!out.includes("/home/dev"));
-  assert.ok(!out.includes("group/main"));
+  assert.ok(!out.includes("/Users/real-user"));
+  assert.ok(!out.includes("group/some-route"));
   assert.ok(!out.includes("Secret Rules"));
 });
 
@@ -173,6 +173,29 @@ test("脱敏：规则清单每条都要写清为什么（规则是给人审的�
   for (const rule of REPLACEMENTS) {
     assert.ok(rule.why.length > 0, `${rule.from} 没写为什么`);
     assert.ok(rule.to.length > 0);
+  }
+});
+
+test("隐私：文档里不许有真路由名（数字留着，名字换成假的）", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const { dirname, join } = await import("node:path");
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const docs = [
+    "docs/spec/cache-hit-analysis.md",
+    "docs/spec/cache-strategy-2026-11-25.md",
+    "docs/spec/cost-control-plan.md",
+    "docs/spec/cost-control.md",
+    "docs/spec/cache-metrics-construction.md",
+  ];
+  for (const doc of docs) {
+    const raw = readFileSync(join(root, doc), "utf8");
+    assert.ok(!raw.includes("group/main"), `${doc} 还有真路由组名`);
+    assert.ok(!raw.includes("main-tier"), `${doc} 还有裸的真路由组名`);
+    assert.ok(!raw.includes("vendor-local"), `${doc} 还有真供应商名`);
+    assert.ok(!raw.includes("quality-tier"), `${doc} 还有真路由组名`);
+    // 数字得留着——文档的价值在实测数字，不在名字
+    assert.ok(/\d/.test(raw), `${doc} 的实测数字不该被一起清掉`);
   }
 });
 
