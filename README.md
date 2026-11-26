@@ -53,7 +53,8 @@ extension actually loaded:
 pi -p "dispatch a task and give me its taskId"
 ```
 
-A `taskId` in the reply means it is installed. No reply means it is not.
+A `taskId` in the reply means it is installed. If there is none, check whether `dispatch_task`
+appears in the tool list — a missing entry point is the failure this check is looking for.
 
 ## Compatibility
 
@@ -66,54 +67,67 @@ A `taskId` in the reply means it is installed. No reply means it is not.
 ## What it does
 
 **Queue.** Seats come from a memory pool: available memory, minus a reserve of 10% of total memory.
-Each seat is 512 MiB or 2% of total, whichever is larger. When seats run out, tasks wait in FIFO
-order.
-`dispatch_task` never rejects for capacity — the official subagent example returns an error past
-8 parallel tasks instead.
+Each seat is 512 MiB or 2% of total, whichever is larger. In a long-lived host, tasks wait in FIFO
+order when the seats run out. A one-shot host cannot free a seat, so it returns
+`machine is too tight` instead of waiting.
 
-**Watch.** A child with no activity for 5 minutes, and no tool call in flight, counts as stalled
-and is shut down.
+**Watch.** A child with no activity and no tool call in flight counts as stalled and is shut down.
+The threshold is 5 minutes by default; it is configurable, and 0 turns it off.
 
 **Stop.** `dispatch_stop` removes a queued task, or sends SIGTERM then SIGKILL to a running one.
-Stopping one child leaves the others running; Ctrl+C in the official example kills all of them.
+Stopping one child leaves the others running.
 
 **Steer.** `dispatch_steer` writes into a mailbox the child reads at its next turn boundary. In-flight
 tool calls are not interrupted. Up to 4096 characters per message, 16 messages per task.
 
-**Keep a ledger.** Every dispatch writes a record under `~/.pi/dispatch/<project bucket>/`, with
-atomic writes, compressed archives, and restore on restart. Records survive the session.
+**Keep a ledger.** Every accepted dispatch writes a record under `~/.pi/dispatch/<project bucket>/`,
+with atomic writes, compressed archives, and restore on restart. A dispatch rejected before it is
+assigned an id — by a gate, or by the one-shot capacity check — leaves no record.
 
 **Check the delivery.** The report can arrive by tool call, by a JSON block in the prompt, or not
 at all. Paths the child says it wrote are matched against the receipts taken from its `edit` and
 `write` tool calls; commands it says it ran are matched against observed command receipts. See
 [Receipts, not self-reports](#receipts-not-self-reports).
 
-## Why not the built-in subagent example
+## Where it fits
 
-pi ships `examples/extensions/subagent`, an extension you can copy. It spawns children, streams
-their output, shows per-child token usage, and aborts all of them on Ctrl+C. If one fire-and-forget
-child at a time is all you need, it is smaller than this package.
+pi ships `examples/extensions/subagent` as a copyable reference: a single agent, up to eight parallel
+tasks with four running at once, or a chain. It is an example, not a maintained package. If that
+shape fits, copy it.
 
-The two differ where supervision starts to matter:
+The ecosystem already has mature packages. Each line is what that package is best at, from its own
+documentation:
 
-|                                    | `examples/extensions/subagent`               | pi-dispatch                                  |
-| ---------------------------------- | -------------------------------------------- | -------------------------------------------- |
-| A 9th parallel task                | returns `Too many parallel tasks. Max is 8.` | waits in the queue                           |
-| Stop one child                     | Ctrl+C kills every child                     | `dispatch_stop <taskId>`                     |
-| Change a running child's direction | not supported                                | `dispatch_steer`                             |
-| After a restart                    | records gone                                 | records restored                             |
-| Did it deliver?                    | exit code and output                         | exit code **and** a checked delivery verdict |
+- [`pi-subagents`](https://github.com/nicobailon/pi-subagents) — scripted multi-agent workflows, missions, configurable acceptance gates.
+- [`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents) — Claude Code-style named agents, with a queue and a live fleet view.
+- [`@quintinshaw/pi-dynamic-workflows`](https://github.com/QuintinShaw/pi-dynamic-workflows) — JavaScript fan-out with journaled resume.
+- [`pi-better-subagents`](https://github.com/1aboveio/pi-better-harness/tree/main/packages/pi-better-subagents) — detached runs in an OS sandbox.
 
-`pi-subagents` is the popular package in this space (about 986K downloads a month at the time of
-writing) and it already covers steering and worktree isolation. What it does not do is queue
-against a memory budget or audit a child's claims against its receipts.
+Two design choices separate this package, and both are about defaults rather than features:
+
+|                         | pi-dispatch                                            | A configured concurrency cap       |
+| ----------------------- | ------------------------------------------------------ | ---------------------------------- |
+| When a child waits      | seats sized from available memory, minus a 10% reserve | the number you wrote down          |
+| What a dispatch returns | exit code **plus** a verdict checked against receipts  | exit code plus the child's summary |
+
+The packages above check work too: by running a command you configure, or by asking other models to
+vote. This one reads the `edit`, `write`, and command receipts the parent already observed, so there
+is nothing to configure. That is a different mechanism, not a stronger one.
+
+Where they are ahead: OS sandboxing, journaled resume, workflow and persona systems, and a live UI.
+If you need those, use them.
+
+_Package descriptions were checked against upstream documentation on 2026-11-26. Upstreams move
+quickly; verify before relying on any claim here._
 
 ## Receipts, not self-reports
 
 The final report a child writes is a claim. The receipts are what pi observed it do. A dispatch
 ends with two values that are computed separately:
 
-- `status` — the process outcome. Exit code is its only source. It says nothing about quality.
+- `status` — the process outcome. An exit code decides `succeeded` or `failed`; `canceled` (removed
+  from the queue before running) and `lost` (reconciled away) are lifecycle outcomes with no exit
+  code behind them. None of these is a quality verdict.
 - `deliverable` — whether claims are supported by receipts.
 
 | `deliverable` | Meaning                                                                                               |
@@ -121,13 +135,15 @@ ends with two values that are computed separately:
 | `verified`    | Every claimed path and command was found in the receipts.                                             |
 | `unclaimed`   | A report arrived, but it claimed no paths or commands to check. A read-only analysis looks like this. |
 | `partial`     | Some claims matched; the child reports how many of each.                                              |
-| `unverified`  | Claims exist and the receipts do not support them, or the receipt was truncated.                      |
+| `unverified`  | Claims exist and the receipts do not support them.                                                    |
 | `absent`      | No report, empty text, no paths touched. A child that exits 0 having done nothing lands here.         |
 
-`unverified` means **no observed evidence**, not proof of lying. A command run through `bash`, a
-file edited with `sed -i`, or a path written as `..` cannot appear in a receipt, so an honest child
-can be marked `unverified`. The record states what was observed; it does not conclude that the
-child lied.
+`unverified` also covers a body with no report, a report older than the last steer, a vacuous
+self-assessment, and a truncated receipt that still leaves a claim unmatched. It means **no observed
+evidence**, not proof of lying. A file changed through `bash` or
+`sed -i` cannot appear as a path receipt (the command itself can), and a path written as `..` has to
+be resolved against the working directory before it can be matched, so an honest child can be marked
+`unverified`. The record states what was observed; it does not conclude that the child lied.
 
 The exact matching rules — suffix matching for paths, per-segment trust for compound commands, the
 20-entry receipt cap — are in [`docs/spec/core-spec.html`](./docs/spec/core-spec.html).
