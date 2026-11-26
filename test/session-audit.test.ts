@@ -2,7 +2,7 @@
 // 每条用例都写明「实现写错时它凭什么红」——判词链是这一层的全部价值。
 //
 // ── 变异测试（`mutator --no-coverage --mutate-all src/audit`）───────────
-// 当前：350 个位点，杀掉 269~270，**幸存 80~81**，0 超时。**不是零幸存**——这是明账。
+// 当前：350 个位点，杀掉 282，**幸存 68**（逐条判定见 docs/audit-mutation.md），0 超时。**不是零幸存**——这是明账。
 // 按类：`?? -> ||` 22、`&& -> ||` 17、`0 -> 1` 15、`=== -> !==` 7、`>= -> >` 6、`true -> false` 6。
 //
 // 能证死的等价类（两条，都不是猜的）：
@@ -588,4 +588,77 @@ test("判词：没正文 + 路径收据被截断 ⇒ unverified（不能当 abse
   );
   assert.equal(result.truncated, true);
   assert.equal(result.deliverable, "unverified");
+});
+
+// ── 索引边界：第 0 条也要看到 ────────────────────────────────────────────
+
+test("报告就在流的第一条时也要认", () => {
+  const result = audit(
+    [{ kind: "message", role: "assistant", text: "`pnpm test` 跑通了。" }],
+    null,
+  );
+  assert.equal(result.claims.commands.length, 1);
+  assert.equal(result.deliverable, "unverified"); // 有自述、没收据
+});
+
+test("steer 在报告之前不算过期", () => {
+  // `stale = lastSteer > reportIndex`；steer 在报告之前（哪怕是第 0 条）不满足，
+  // 所以「跳过第 0 条」那两条变异在这一判定上等价。
+  const result = audit(
+    [
+      { kind: "message", role: "user", text: "再改", steer: true },
+      { kind: "tool", name: "bash", input: { command: "pnpm test" }, exitCode: 0 },
+      { kind: "message", role: "assistant", text: "`pnpm test` 跑通了。" },
+    ],
+    null,
+  );
+  assert.equal(result.deliverable, "verified");
+  assert.deepEqual(result.notes, []);
+});
+
+test("报告之后的普通 user 消息不算 steer", () => {
+  const result = audit(
+    [
+      { kind: "tool", name: "bash", input: { command: "pnpm test" }, exitCode: 0 },
+      { kind: "message", role: "assistant", text: "`pnpm test` 跑通了。" },
+      { kind: "message", role: "user", text: "好" },
+    ],
+    null,
+  );
+  assert.equal(result.deliverable, "verified");
+  assert.deepEqual(result.notes, []);
+});
+
+// ── 命中判定的边界 ──────────────────────────────────────────────────────
+
+test("单 token 命令（node）也能命中", () => {
+  assert.equal(audit([bash("node", 0)], "`node` 跑通了。").deliverable, "verified");
+});
+
+test("未知段（|| 左侧）不算命中", () => {
+  const result = audit([bash("a || pnpm test", 0)], "`pnpm test` 跑通了。");
+  assert.equal(result.deliverable, "unverified");
+});
+
+test("非字符串命令不进收据、也不崩", () => {
+  const result = audit(
+    [{ kind: "tool", name: "bash", input: { command: 123 as unknown as string }, exitCode: 0 }],
+    "`pnpm test` 跑通了。",
+  );
+  assert.equal(result.receipts.commands.length, 0);
+});
+
+test("1 命中 2 条 ⇒ partial", () => {
+  const result = audit([bash("pnpm test", 0)], "`pnpm test` 跑通了，`pnpm lint` 也跑通了。");
+  assert.equal(result.deliverable, "partial");
+});
+
+// ── 小句 / 句子切分的边界 ────────────────────────────────────────────────
+
+test("句点+空格也是句子边界（动词不跨过去）", () => {
+  assert.deepEqual(extractClaims("改了 `src/a.ts`. `src/b.ts` 是新的。").paths, ["src/a.ts"]);
+});
+
+test("反引号里的逗号不切小句", () => {
+  assert.deepEqual(extractClaims("改了 `a,b/c.ts`").paths, ["a,b/c.ts"]);
 });

@@ -1256,3 +1256,123 @@ test("claude：正文只拼 text 块，空块与 tool_use 不进报告", () => {
   assert.equal(result.report, "第一段");
   assert.equal(bashOf(result.events)[0]!.exitCode, 0);
 });
+
+// ── 畸形输入：不能崩、不能凭空造收据 ────────────────────────────────────
+
+test("claude：content 里混进 null / 字符串不崩也不产收据", () => {
+  const lines = [
+    JSON.stringify({ type: "assistant", message: { content: [null, "字符串", 42] } }),
+    JSON.stringify({ type: "user", message: { content: [null] } }),
+  ];
+  const result = normalizeClaude(lines);
+  assert.equal(result.malformed, 0);
+  assert.deepEqual(result.events, []);
+});
+
+test("claude：assistant 里的 tool_result 不当 tool_use 处理", () => {
+  const result = normalizeClaude([
+    JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "tool_result", tool_use_id: "a", content: "Exit code 0" }] },
+    }),
+  ]);
+  assert.deepEqual(result.events, []);
+});
+
+test("claude：user 里的 tool_use 不当工具调用", () => {
+  const result = normalizeClaude([
+    JSON.stringify({
+      type: "user",
+      message: {
+        content: [{ type: "tool_use", id: "a", name: "Write", input: { file_path: "/x.ts" } }],
+      },
+    }),
+  ]);
+  assert.deepEqual(result.events, []);
+});
+
+test("claude：后台跑的命令不算跑完（没有收据）", () => {
+  const result = normalizeClaude([
+    JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          {
+            type: "tool_use",
+            id: "a",
+            name: "Bash",
+            input: { command: "pnpm test", run_in_background: true },
+          },
+        ],
+      },
+    }),
+    JSON.stringify({
+      type: "user",
+      message: {
+        content: [
+          { type: "tool_result", tool_use_id: "a", content: "Command running in background" },
+        ],
+      },
+    }),
+  ]);
+  assert.deepEqual(bashOf(result.events), []);
+});
+
+test("claude：侧链里的工具调用不算数", () => {
+  const result = normalizeClaude([
+    JSON.stringify({
+      type: "assistant",
+      isSidechain: true,
+      message: {
+        content: [{ type: "tool_use", id: "a", name: "Write", input: { file_path: "/x.ts" } }],
+      },
+    }),
+    JSON.stringify({
+      type: "user",
+      isSidechain: true,
+      message: { content: [{ type: "tool_result", tool_use_id: "a", content: "ok" }] },
+    }),
+  ]);
+  assert.deepEqual(result.events, []);
+});
+
+test("claude：cwd 取第一条，后面的不覆盖", () => {
+  const result = normalizeClaude([
+    JSON.stringify({ type: "system", cwd: "/repo/a" }),
+    JSON.stringify({ type: "system", cwd: "/repo/b" }),
+  ]);
+  assert.deepEqual(
+    result.events.find((e) => e.kind === "meta"),
+    { kind: "meta", cwd: "/repo/a" },
+  );
+});
+
+test("codex：content 里混进 null / 非字符串不崩", () => {
+  const result = normalizeCodex([
+    JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [null, 42, { type: "output_text", text: 7 }],
+      },
+    }),
+  ]);
+  assert.equal(result.malformed, 0);
+  assert.deepEqual(result.events, []);
+});
+
+test("codex：只有 tool_use 没有文字时不产 message 事件", () => {
+  const result = normalizeClaude([
+    JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [{ type: "tool_use", id: "a", name: "Read", input: { file_path: "/x.ts" } }],
+      },
+    }),
+  ]);
+  assert.deepEqual(
+    result.events.filter((e) => e.kind === "message"),
+    [],
+  );
+});
