@@ -2,7 +2,7 @@
 // 每条用例都写明「实现写错时它凭什么红」——判词链是这一层的全部价值。
 //
 // ── 变异测试（`mutator --no-coverage --mutate-all src/audit`）───────────
-// 当前：350 个位点，杀掉 254，**幸存 96**，0 超时。**不是零幸存**——这是明账。
+// 当前：350 个位点，杀掉 261，**幸存 89**，0 超时。**不是零幸存**——这是明账。
 // 按类：`?? -> ||` 22、`&& -> ||` 17、`0 -> 1` 15、`=== -> !==` 7、`>= -> >` 6、`true -> false` 6。
 //
 // 能证死的等价类（两条，都不是猜的）：
@@ -255,8 +255,10 @@ test("命中：含分隔符的自述不走整串快路", () => {
 test("否定辖域是 12 字：第 12 字还算被否定，第 13 字不算", () => {
   // 差一个字就差一档判词，窗口端点必须钉死。
   const inside = "没有" + "x".repeat(9) + "改动 `src/a.ts`"; // 「改」在偏移 11，辖域内
+  const edge = "没有" + "x".repeat(10) + "改动 `src/a.ts`"; // 偏移 12，正好在边界上
   const outside = "没有" + "x".repeat(11) + "改动 `src/a.ts`"; // 偏移 13，超出 12 字辖域
   assert.deepEqual(extractClaims(inside).paths, [], "辖域内不算改动");
+  assert.deepEqual(extractClaims(edge).paths, [], "边界（第 12 字）仍算被否定");
   assert.deepEqual(extractClaims(outside).paths, ["src/a.ts"], "超出 12 字就算数");
 });
 

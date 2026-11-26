@@ -61,7 +61,7 @@
     "test:mode": "node scripts/verify-modes.ts",
     "check:breakpoints": "node scripts/breakpoints.ts",
     "test:audit-cross": "node scripts/verify-audit-cross.ts",
-    "mutate:audit": "mutator --no-coverage --mutate-all src/audit --test-command \"node scripts/test.ts test/session-audit.test.ts test/session-audit-normalize.test.ts\""
+    "mutate:audit": "mutator --no-coverage --mutate-all src/audit --test-command \"node scripts/test.ts test/session-audit.test.ts test/session-audit-normalize.test.ts test/session-audit-fuzz.test.ts test/session-audit-normalize-fuzz.test.ts\""
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.5.2",
