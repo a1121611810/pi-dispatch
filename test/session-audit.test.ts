@@ -1,5 +1,13 @@
 // 会话审计的判词层：五档、八条对抗样本、纯函数性。
 // 每条用例都写明「实现写错时它凭什么红」——判词链是这一层的全部价值。
+//
+// ── 变异测试欠账（`mutator --no-coverage src/audit`）─────────────────────
+// 当前：345 个位点，杀掉 217，**幸存 128**。没有逐个证明等价，这是一笔明账，不是
+// 「全绿」。按类看：`?? -> ||` 22、`&& -> ||` 19、`0 -> 1` 17、`=== -> !==` 10、
+// `true -> false` 9、`! -> 空` 7、`>= -> >` 6。多数落在归一化层的可选字段默认值上
+// （那份日志里字段恒有值），但要一个个对着真夹具证实才算数——下一轮补，别当已经绿了。
+// 已经钉死的边界：否定辖域的 12 字端点、路径去重、命令/路径两维各自的窗口方向、
+// 声称成功/声称跑过两条命中分支、空命令自述。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -233,6 +241,53 @@ test("命中：含分隔符的自述不走整串快路", () => {
     ]),
     false,
   );
+});
+
+// ── 边界：把变异测试里能杀的那批钉住 ────────────────────────────────────
+
+test("否定辖域是 12 字：第 12 字还算被否定，第 13 字不算", () => {
+  // 差一个字就差一档判词，窗口端点必须钉死。
+  const inside = "没有" + "x".repeat(9) + "改动 `src/a.ts`"; // 「改」在偏移 11，辖域内
+  const outside = "没有" + "x".repeat(11) + "改动 `src/a.ts`"; // 偏移 13，超出 12 字辖域
+  assert.deepEqual(extractClaims(inside).paths, [], "辖域内不算改动");
+  assert.deepEqual(extractClaims(outside).paths, ["src/a.ts"], "超出 12 字就算数");
+});
+
+test("抽取：同一路径只算一条自述", () => {
+  assert.deepEqual(extractClaims("改了 `src/a.ts`，又改了 `src/a.ts`。").paths, ["src/a.ts"]);
+});
+
+test("命中：声称成功但收据是失败 ⇒ 不命中", () => {
+  assert.equal(
+    claimHit(claim("pnpm test"), [{ command: "pnpm test", exitCode: 1, trusted: true }]),
+    false,
+  );
+});
+
+test("命中：声称跑过但没有退出码 ⇒ 不命中", () => {
+  assert.equal(
+    claimHit(claim("pnpm test", false), [{ command: "pnpm test", trusted: false }]),
+    false,
+  );
+});
+
+test("命中：空命令自述不命中", () => {
+  assert.equal(
+    claimHit(claim("   "), [{ command: "pnpm test", exitCode: 0, trusted: true }]),
+    false,
+  );
+});
+
+test("收据：命令保最近 20 条，路径保最先 20 条", () => {
+  const commands = Array.from({ length: 21 }, (_, i) => bash(`cmd-${i}`, 0));
+  const result = audit(commands, null);
+  assert.equal(result.receipts.commands.length, 20, "命令留最近 20 条");
+  assert.equal(result.receipts.commands[0]!.command, "cmd-1", "最早的一条被挤掉");
+
+  const paths = Array.from({ length: 21 }, (_, i) => write(`src/f${i}.ts`));
+  const kept = audit(paths, null).receipts.paths;
+  assert.equal(kept.length, 20, "路径留最先 20 条");
+  assert.equal(kept[0], "src/f0.ts", "最后一条被挤掉");
 });
 
 // ── 纯函数性与规模 ──────────────────────────────────────────────────────
