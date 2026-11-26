@@ -689,7 +689,7 @@ function normalizeCodex(lines) {
 		const topItem = topType === "item.completed" ? record.item ?? void 0 : void 0;
 		const item = envelopeItem ?? topItem;
 		if (item !== void 0) {
-			const type = (item.type ?? "").toLowerCase();
+			const type = (item.type ?? "").toLowerCase().replace(/[_-]/g, "");
 			if (type === "commandexecution") {
 				const command = unwrapShell(item.command);
 				if (command !== void 0) commands.push({
@@ -702,7 +702,8 @@ function normalizeCodex(lines) {
 			}
 			if (type === "filechange") {
 				const changes = item.changes;
-				if (changes && typeof changes === "object") for (const path of Object.keys(changes)) writes.push({
+				const paths = Array.isArray(changes) ? changes.map((entry) => entry.path).filter((p) => typeof p === "string") : changes && typeof changes === "object" ? Object.keys(changes) : [];
+				for (const path of paths) writes.push({
 					path,
 					...cwd !== void 0 ? { cwd } : {}
 				});
