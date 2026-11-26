@@ -654,6 +654,11 @@ const READ_ONLY_TOOLS = [
 	"find",
 	"ls"
 ];
+/**
+* 会改文件的工具（pi 内置只有这两个）。收据只认白名单——
+* 黑名单会把「任何带 path 参数的调用」都当改文件，`child_report` 多传个 path 就能伪造收据。
+*/
+const WRITE_TOOLS = ["edit", "write"];
 /** 空串是坏值（会变成 `--model ""`），当没给处理。 */
 function nonEmpty(value) {
 	return value && value.trim() !== "" ? value : void 0;
@@ -746,6 +751,9 @@ function emptyStreamAcc() {
 		tools: Object.create(null),
 		paths: [],
 		commands: [],
+		failedCommands: [],
+		lostPath: false,
+		lostCommand: false,
 		pathsTruncated: false,
 		commandsTruncated: false,
 		errors: 0,
@@ -788,7 +796,7 @@ function declaredToolNames(sections) {
 * 只要把那 N 个文件读一遍就能对上（实测可洗白）。
 */
 function writablePath(toolName, args) {
-	if (READ_ONLY_TOOLS.includes(toolName)) return void 0;
+	if (!WRITE_TOOLS.includes(toolName)) return void 0;
 	const path = args?.path;
 	if (typeof path !== "string" || !path) return void 0;
 	return path;
@@ -817,7 +825,8 @@ function commandOf(toolName, args) {
 }
 /**
 * 记一条跑过的命令。原样记串不解析；保最近 N 条（交付前的验证命令在尾部）。
-* 只在工具调用**成功**后才调（见 takeToolEvent）：跑挂了的不算兑现。
+* 成功失败都记——跑过就是出勤。是不是「兑现」看 failedCommands（见 claimSatisfied）：
+* 声称 exitCode:0 的自述不能拿一条失败观测顶过去。
 */
 function recordCommandText(command, acc) {
 	if (acc.commands.includes(command)) return;
@@ -826,6 +835,12 @@ function recordCommandText(command, acc) {
 		acc.commands.shift();
 		acc.commandsTruncated = true;
 	}
+}
+/** 记一条跑挂的命令（与 commands 同受上限：被挤掉就当没观测到成功过）。 */
+function recordFailedCommand(command, acc) {
+	if (acc.failedCommands.includes(command)) return;
+	acc.failedCommands.push(command);
+	if (acc.failedCommands.length > MAX_COMMANDS) acc.failedCommands.shift();
 }
 /**
 * 工具轨迹：start 计次并把收据**暂存**，end 计错并决定去留。
@@ -843,6 +858,10 @@ function takeToolEvent(event, acc) {
 		const callId = typeof event.toolCallId === "string" ? event.toolCallId : void 0;
 		const path = writablePath(name, event.args);
 		const command = commandOf(name, event.args);
+		if (callId === void 0) {
+			if (path !== void 0) acc.lostPath = true;
+			if (command !== void 0) acc.lostCommand = true;
+		}
 		if (callId !== void 0 && (path !== void 0 || command !== void 0)) acc.pendingWrites.set(callId, {
 			...path !== void 0 ? { path } : {},
 			...command !== void 0 ? { command } : {}
@@ -855,9 +874,11 @@ function takeToolEvent(event, acc) {
 		const pending = acc.pendingWrites.get(callId);
 		if (pending === void 0) return;
 		acc.pendingWrites.delete(callId);
-		if (failed) return;
-		if (pending.path !== void 0) recordPath(pending.path, acc);
-		if (pending.command !== void 0) recordCommandText(pending.command, acc);
+		if (pending.path !== void 0 && !failed) recordPath(pending.path, acc);
+		if (pending.command !== void 0) {
+			recordCommandText(pending.command, acc);
+			if (failed) recordFailedCommand(pending.command, acc);
+		}
 	}
 }
 /** 用量：自报的 cacheRead/cacheWrite/cost 缺省就不出键。逐字段 finite——NaN 会污染账。 */
@@ -1103,7 +1124,12 @@ function parseChildStream(stdout) {
 		}
 		takeToolReport(event.message, acc, lineNo);
 	}
-	const dangling = acc.pendingWrites.size > 0;
+	let danglingPath = false;
+	let danglingCommand = false;
+	for (const pending of acc.pendingWrites.values()) {
+		if (pending.path !== void 0) danglingPath = true;
+		if (pending.command !== void 0) danglingCommand = true;
+	}
 	return {
 		text: acc.text,
 		toolReport: acc.toolReport,
@@ -1116,11 +1142,12 @@ function parseChildStream(stdout) {
 			tools: acc.tools,
 			paths: acc.paths,
 			commands: acc.commands,
+			...acc.failedCommands.length > 0 ? { failedCommands: [...acc.failedCommands] } : {},
 			errors: acc.errors,
 			textChars: acc.text.length,
 			...acc.malformed > 0 ? { malformed: acc.malformed } : {},
-			...acc.pathsTruncated || dangling ? { pathsTruncated: true } : {},
-			...acc.commandsTruncated || dangling ? { commandsTruncated: true } : {}
+			...acc.pathsTruncated || danglingPath || acc.lostPath ? { pathsTruncated: true } : {},
+			...acc.commandsTruncated || danglingCommand || acc.lostCommand ? { commandsTruncated: true } : {}
 		},
 		declaredTools: acc.declaredTools,
 		steerEvidence: evidenceOf(acc)
@@ -1265,10 +1292,11 @@ function pathClaims(report) {
 * 段内仍用 `segmentsMatch`（token 级 + 参数交错容忍）；段间要求每一段各自有出处，
 * 但不要求来自同一条 bash（真机常常拆成多次调用）。
 */
-function claimSatisfied(claim, observed) {
-	const segments = commandSegments(claim);
+function claimSatisfied(claim, observed, failed) {
+	const segments = commandSegments(claim.command, true);
 	if (segments.length === 0) return false;
-	return segments.every((claimSeg) => observed.some((command) => commandSegments(command).some((observedSeg) => segmentsMatch(claimSeg, observedSeg))));
+	const wantOk = claim.exitCode === 0;
+	return segments.every((claimSeg) => observed.some((command) => !(wantOk && (failed.includes(command) || hasMaskingSeparator(command))) && commandSegments(command).some((observedSeg) => segmentsMatch(claimSeg, observedSeg))));
 }
 /**
 * 自检对质：报告声称跑过的命令，收据里一条都没观测到 ⇒ 声称没有实测支撑。
@@ -1282,7 +1310,8 @@ function claimSatisfied(claim, observed) {
 function verifyUnverified(report, delivery) {
 	const claims = commandClaims(report);
 	if (claims.length === 0 || !delivery || delivery.commandsTruncated) return false;
-	return !claims.some((claim) => claimSatisfied(claim.command, delivery.commands));
+	const failed = delivery.failedCommands ?? [];
+	return !claims.some((claim) => claimSatisfied(claim, delivery.commands, failed));
 }
 /**
 * 改动自述的覆盖度：声称几条、对上几条。只在「部分对上」时返回（全对上/零对上都不返回）。
@@ -1302,7 +1331,8 @@ function deliveryCoverage(report, delivery) {
 function verifyCoverage(report, delivery) {
 	const claims = commandClaims(report);
 	if (!delivery || delivery.commandsTruncated) return void 0;
-	const seen = claims.filter((claim) => claimSatisfied(claim.command, delivery.commands));
+	const failed = delivery.failedCommands ?? [];
+	const seen = claims.filter((claim) => claimSatisfied(claim, delivery.commands, failed));
 	return seen.length > 0 && seen.length < claims.length ? {
 		claimed: claims.length,
 		matched: seen.length
@@ -1317,7 +1347,12 @@ function verifyCoverage(report, delivery) {
 */
 function receiptGap(report, delivery) {
 	if (!delivery) return false;
-	return delivery.pathsTruncated === true && pathClaims(report).length > 0 || delivery.commandsTruncated === true && commandClaims(report).length > 0;
+	const paths = delivery.paths ?? [];
+	const commands = delivery.commands ?? [];
+	const failed = delivery.failedCommands ?? [];
+	const pathGap = delivery.pathsTruncated === true && pathClaims(report).some((claim) => !paths.some((path) => pathMatches(claim, path)));
+	const commandGap = delivery.commandsTruncated === true && commandClaims(report).some((claim) => !claimSatisfied(claim, commands, failed));
+	return pathGap || commandGap;
 }
 /**
 * 交付判词。退出码只说进程怎么了，这一列说交付有没有实测支撑——两条轴分开记。
@@ -1329,7 +1364,7 @@ function receiptGap(report, delivery) {
 *   verified   有自述且全对上
 */
 function deliverableOf(record) {
-	if (!record.report && (record.delivery?.textChars ?? 0) === 0 && (record.delivery?.paths.length ?? 0) === 0) return "absent";
+	if (!record.report && (record.delivery?.textChars ?? 0) === 0 && (record.delivery?.paths?.length ?? 0) === 0 && record.delivery?.pathsTruncated !== true && record.delivery?.commandsTruncated !== true) return "absent";
 	if (!record.report) return "unverified";
 	if (!record.delivery) return "unverified";
 	if (record.deliveryUnverified || record.verifyUnverified || record.assessmentVacuous || record.reportStale) return record.deliveryPartial || record.verifyPartial ? "partial" : "unverified";
@@ -1337,36 +1372,114 @@ function deliverableOf(record) {
 	if (receiptGap(record.report, record.delivery)) return "unverified";
 	return pathClaims(record.report).length + commandClaims(record.report).length === 0 ? "unclaimed" : "verified";
 }
-/** 空白归一 + 去截尾省略号：截断产生的 … 在 token 化前当通配抹掉。 */
-function normalizeCommand(command) {
-	return command.trim().replace(/\s+/g, " ").replace(/…$/, "");
-}
 /**
 * 按 shell 分隔符切成「命令段」，每段成 token 表；段首 VAR=value 剥掉。
 * 不按换行切——heredoc 正文留在 cat 段内，段首不是声称命令就不算跑过。
 */
-function commandSegments(command) {
-	return normalizeCommand(command).split(/&&|\|\||;|\|/).map((segment) => {
-		const tokens = segment.trim().split(/\s+/).filter(Boolean);
+function commandSegments(command, splitNewlines = false) {
+	const text = command.trim();
+	const raw = [];
+	let current = "";
+	let quote = null;
+	for (let i = 0; i < text.length; i++) {
+		const ch = text[i];
+		if (quote !== null) {
+			current += ch;
+			if (ch === quote) quote = null;
+			continue;
+		}
+		if (ch === "\"" || ch === "'") {
+			quote = ch;
+			current += ch;
+			continue;
+		}
+		if (ch === "\n") {
+			if (splitNewlines) {
+				raw.push(current);
+				current = "";
+			} else current += " ";
+			continue;
+		}
+		const pair = text.slice(i, i + 2);
+		if (pair === "&&" || pair === "||") {
+			raw.push(current);
+			current = "";
+			i++;
+			continue;
+		}
+		if (ch === ";" || ch === "|") {
+			raw.push(current);
+			current = "";
+			continue;
+		}
+		current += ch;
+	}
+	raw.push(current);
+	return raw.map((segment) => {
+		const tokens = segment.trim().replace(/\s+/g, " ").split(" ").filter(Boolean);
 		while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) tokens.shift();
 		return tokens;
 	}).filter((tokens) => tokens.length > 0);
 }
-/** a 是 b 的 token 前缀；最后一个 token 允许前缀（截断/半词宽容）。 */
-function tokensPrefix(a, b) {
-	if (a.length === 0 || a.length > b.length) return false;
-	for (let i = 0; i < a.length - 1; i++) if (a[i] !== b[i]) return false;
-	return b[a.length - 1].startsWith(a[a.length - 1]);
-}
 /** 同一条基础命令、参数交错：a 的 token 按序出现在 b 里（首 token 必须相同）。 */
-function tokensRunInOrder(a, b) {
-	if (a.length === 0 || a[0] !== b[0]) return false;
-	let j = 1;
-	for (let i = 1; i < b.length && j < a.length; i++) if (b[i] === a[j]) j++;
-	return j === a.length;
+/**
+* 两个 token 是否算同一个：完全相等，或某一侧被截断（带 …）时按前缀认。
+* 截断信息留在 token 上（不整串剥掉），所以「pnpm test」不会被「pnpm test:unit」满足。
+*/
+function tokensEquivalent(a, b) {
+	if (a === b) return true;
+	if (a.endsWith("…")) return b.startsWith(a.slice(0, -1));
+	if (b.endsWith("…")) return a.startsWith(b.slice(0, -1));
+	return false;
 }
-function segmentsMatch(a, b) {
-	return tokensPrefix(a, b) || tokensPrefix(b, a) || tokensRunInOrder(a, b) || tokensRunInOrder(b, a);
+/**
+* 命令里有没有**会掩码失败**的分隔符（`||`、`;`、`|`、单个 `&`）。
+* pi 只给整条命令一个成败：`pnpm test || true` 整体成功，但 `pnpm test` 到底过没过不知道。
+* 所以这类观测不能拿来当「exitCode:0 已被证实」。`&&` 是安全的（全跑完才算成功）。
+*/
+function hasMaskingSeparator(command) {
+	let quote = null;
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		if (quote !== null) {
+			if (ch === quote) quote = null;
+			continue;
+		}
+		if (ch === "\"" || ch === "'") {
+			quote = ch;
+			continue;
+		}
+		if (ch === ";") return true;
+		if (ch === "|") return true;
+		if (ch === "&") {
+			if (command[i + 1] === "&") i++;
+			else return true;
+		}
+	}
+	return false;
+}
+function segmentsMatch(claim, observed) {
+	if (claim.length === 0) return false;
+	let j = 0;
+	let afterFlag = false;
+	for (let i = 0; i < observed.length && j < claim.length; i++) {
+		const token = observed[i];
+		if (tokensEquivalent(claim[j], token)) {
+			j++;
+			afterFlag = false;
+			continue;
+		}
+		if (token.startsWith("-")) {
+			afterFlag = true;
+			continue;
+		}
+		if (afterFlag) {
+			afterFlag = false;
+			continue;
+		}
+		return false;
+	}
+	return j === claim.length;
 }
 // src/core/cache-warming.ts
 /** 预热决策：depth > 0 ⇒ 停；depth === 0 ⇒ 不表态（undefined）。 */
@@ -3765,9 +3878,9 @@ function applyAttachBudget(current, command) {
 * failed / canceled 同样要判——「没有交付」本身就是一条判词（通常是 absent），
 * 父方看到「failed + absent」就知道这单既没成功也没交东西，而不是对着 undefined 猜。
 *
-* 正文窗口大小仍由判词决定（src/index.ts 的 hasReliableReport），这里不动：
-* failed 任务的正文通常为空，空正文压根不会触发截断；
-* 「失败但正文很长」说明它跑了很久、产了内容、最后才失败——那种情况给全文是合理的。
+* 正文窗口在 src/index.ts 的 hasReliableReport 里另有一道门：**只有 succeeded** 才可能换小窗。
+* 失败的任务即便报告里的自述全对上，也拿全文——失败最需要看死因看现场，
+* 「报告可信」不等于「进程没崩」。
 */
 function deliverablePatch(current) {
 	return { deliverable: deliverableOf(current) };
@@ -4567,7 +4680,7 @@ function deliver(pi, notifications) {
 				n.deliverable === "partial" && partial ? `｜交付只对上 ${partial.matched}/${partial.claimed} 条（查 dispatch_list 复核）` : "",
 				n.deliveryUnverified ? "｜报告里的改动没有实测支撑（查 dispatch_list 复核）" : "",
 				n.verifyUnverified ? "｜报告声称的自检没有实测支撑（查 dispatch_list 复核）" : "",
-				n.deliverable === "unverified" && !n.deliveryUnverified && !n.verifyUnverified ? n.receiptTruncated ? "｜收据超出上限，那一维没法核对（判词不给盖章）" : "｜交付判词为「未核实」（查 dispatch_list 看原因）" : "",
+				n.deliverable === "unverified" && !n.deliveryUnverified && !n.verifyUnverified ? n.receiptTruncated ? "｜收据被截断或缺失（上限／流被切），那一维没法核对" : "｜交付判词为「未核实」（查 dispatch_list 看原因）" : "",
 				n.reportStale ? "｜工具报告早于最后一次转向（以最终正文为准）" : "",
 				n.steers ? steerHint(n.steers) : "",
 				n.budgetExhausted ? "｜预算到点（降级交付）" : "",

@@ -2333,9 +2333,9 @@
             <code>verifyPartial</code> 带 <code>{claimed, matched}</code>）；
           </li>
           <li>
-            <code>unverified</code
-            >：有自述零命中、<code>assessmentVacuous</code>、工具报告早于最后一次转向，
-            或收据被上限截断导致那一维没法对质；
+            <code>unverified</code>：有正文但没报告、有报告但没有收据、自述零命中、
+            <code>assessmentVacuous</code>、工具报告早于最后一次转向，
+            或收据被截断且确实有条自述在保留的收据里找不到（<code>receiptGap</code>）；
           </li>
           <li>
             <code>absent</code>：没交报告、正文空的、<b>也没改过任何文件</b>——空跑。
@@ -2416,7 +2416,10 @@
           </thead>
           <tbody>
             <tr>
-              <td>四要件全满足（回执在 ∧ 非空转 ∧ 核对没挂 ∧ 自检没谎报）</td>
+              <td>
+                任务<b>成功</b>（<code>status === "succeeded"</code>）∧ 判词是
+                <code>verified</code> 或 <code>unclaimed</code>
+              </td>
               <td><b>8KB</b></td>
               <td>头 4KB + 省略标记 + 尾 4KB</td>
             </tr>
@@ -2448,10 +2451,16 @@
           >（子代理说 <code>src/a.ts</code>，它实际碰的是 <code>a.ts</code>）。
         </p>
         <p>
-          命令对质是<b>段级 × token 级</b>：按 && || ; | 切段、段首 VAR=value
-          剥掉，命令必须「是」某段的前缀、或同首 token 的参数交错序列——<code>echo pnpm test</code>
-          只是提到，不算跑过；空白归一 + 截尾省略号宽容仍保留。不认 time/sudo 等 wrapper
-          前缀，换行不拆（heredoc 由段首挡住）——已知边界，误报出现再补。
+          命令对质是<b>段级 × token 级</b>：按 <code>&amp;&amp;</code> / <code>||</code> /
+          <code>;</code> / <code>|</code> 切段（<b>引号里的分隔符不切</b>，
+          <code>echo "x &amp;&amp; pnpm test"</code> 只是一段），段首 VAR=value 剥掉。 自述的 token
+          要按序出现在观测里，中间只许夹旗标及其值——<code>echo pnpm test</code> 不算跑过，<code
+            >pnpm exec echo test</code
+          >
+          也不算，<code>pnpm test:unit</code> 顶不了
+          <code>pnpm test</code>。声称侧的换行当分隔符（两条命令各要出处）；观测侧不按换行切，
+          heredoc 正文因此被段首
+          <code>cat</code> 挡住。截断宽容只留在真被截断（<code>…</code>）的那一侧。
         </p>
         <p style="margin-bottom: 0">
           ⇒ <b>用后缀匹配</b>：子代理的文件名是收据路径的后缀就算命中。这样<b>零误伤</b>。
@@ -3045,7 +3054,16 @@
           </li>
           <li>
             <b>列表</b>：<code>dispatch_list</code> 的行多带 <code>budget</code> /
-            <code>thinking</code> / <code>budgetExhausted</code> 三列。
+            <code>thinking</code> / <code>budgetExhausted</code> 三列，另有
+            <code>deliverable</code> / <code>deliveryUnverified</code> /
+            <code>verifyUnverified</code> / <code>receiptTruncated</code> 供复核。
+          </li>
+          <li>
+            <b>终态通知带判词提示</b>：<code>absent</code> 且成功时写「空跑：退出码 0
+            但什么都没交」（失败时只说「没有交付」——退出码不是 0，别编）；
+            <code>partial</code> 写「只对上 m/n 条」；判词降到
+            <code>unverified</code> 时写原因——硬旗写「没有实测支撑」，
+            <code>receiptTruncated</code> 写「收据被截断或缺失（上限／流被切），那一维没法核对」。
           </li>
           <li>
             <b>终态通知</b>：预算到点带一句「预算到点（降级交付）」；档位被降级时带一句「思考档位

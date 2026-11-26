@@ -125,9 +125,9 @@ export function applyAttachBudget(
  * failed / canceled 同样要判——「没有交付」本身就是一条判词（通常是 absent），
  * 父方看到「failed + absent」就知道这单既没成功也没交东西，而不是对着 undefined 猜。
  *
- * 正文窗口大小仍由判词决定（src/index.ts 的 hasReliableReport），这里不动：
- * failed 任务的正文通常为空，空正文压根不会触发截断；
- * 「失败但正文很长」说明它跑了很久、产了内容、最后才失败——那种情况给全文是合理的。
+ * 正文窗口在 src/index.ts 的 hasReliableReport 里另有一道门：**只有 succeeded** 才可能换小窗。
+ * 失败的任务即便报告里的自述全对上，也拿全文——失败最需要看死因看现场，
+ * 「报告可信」不等于「进程没崩」。
  */
 function deliverablePatch(current: TaskRecord): Partial<TaskRecord> {
   return { deliverable: deliverableOf(current) };
@@ -165,7 +165,7 @@ export function applyResolveExit(
     return {
       to: command.exitCode === 0 ? "succeeded" : "failed",
       patch: {
-        // 判词跟同一条退出码判据走：只有 succeeded 才带（别的终态没有「交付」可言）
+        // 判词对所有终态都落账（见 deliverablePatch）：failed 也有「交付了什么」要说
         ...deliverablePatch(current),
         // 孩子压根没起（建 worktree 失败 / 等名额被叫停）：startedAt 要清——
         // 记录里 startedAt 有值必须恒等于「孩子真起过」。

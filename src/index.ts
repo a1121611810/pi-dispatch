@@ -428,7 +428,7 @@ export function deliver(pi: ExtensionAPI, notifications: NotificationCenter): vo
           // 截断是另一种——收据太多收不下，那一维没法核，不等于孩子在撒谎。
           n.deliverable === "unverified" && !n.deliveryUnverified && !n.verifyUnverified
             ? n.receiptTruncated
-              ? "｜收据超出上限，那一维没法核对（判词不给盖章）"
+              ? "｜收据被截断或缺失（上限／流被切），那一维没法核对"
               : "｜交付判词为「未核实」（查 dispatch_list 看原因）"
             : "",
           n.reportStale ? "｜工具报告早于最后一次转向（以最终正文为准）" : "",
