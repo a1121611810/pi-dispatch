@@ -3,10 +3,22 @@
   "version": "0.1.1",
   "description": "Programmable subagent dispatch for pi: queue, spawn, watch, stop, and account for child agents",
   "keywords": [
+    "agent",
+    "agents",
+    "autonomous",
+    "delegation",
     "dispatch",
+    "multi-agent",
+    "orchestration",
+    "parallel",
     "pi",
+    "pi-coding-agent",
+    "pi-extension",
     "pi-package",
-    "subagents"
+    "subagent",
+    "subagents",
+    "task-queue",
+    "verification"
   ],
   "homepage": "https://github.com/a1121611810/pi-dispatch",
   "bugs": "https://github.com/a1121611810/pi-dispatch/issues",
