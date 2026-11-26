@@ -724,3 +724,10 @@ test("自述比收据长时不算命中（不按前缀放行）", () => {
   const result = audit([bash("pnpm test", 0)], "`pnpm test --watch` 跑通了。");
   assert.equal(result.deliverable, "unverified");
 });
+
+test("失败类自述不看收据段的信任标记", () => {
+  // wantOk=false 时 `os.known` 不参与判定：`a || pnpm test` 里右边的段虽然「未知」，
+  // 但它确实是跑过且失败的那条，失败自述照样算兑现。
+  const result = audit([bash("a || pnpm test", 1)], "`pnpm test` 失败了。");
+  assert.equal(result.deliverable, "verified");
+});
