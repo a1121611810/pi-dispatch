@@ -5,14 +5,10 @@
 格式按 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号按
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.1.1] - 2026-11-26
 
-### 新增
-
-- **交付判词与任务状态分成两条轴。** `status` 只由子代理的退出码决定，它不是质量结论；
-  交付另有一列 `deliverable`，取 `verified` / `unclaimed` / `partial` / `unverified` /
-  `absent` 五档，在终态时由 registry 算一次。空跑退出 0 记作 `succeeded` + `absent`，
-  账上不再把「进程退 0」当成「干成了」。
+无功能变化。这次发布用来验证 CI 发版链路：打 tag 触发 workflow，用 npm trusted publishing
+（OIDC）认证。0.1.0 是本地手动发布的，`publish` 这一步此前没有在 CI 里跑过。
 
 ## [0.1.0] - 2026-11-26
 
@@ -20,6 +16,10 @@
 
 ### 新增
 
+- **交付判词与任务状态分成两条轴。** `status` 只由子代理的退出码决定，它不是质量结论；
+  交付另有一列 `deliverable`，取 `verified` / `unclaimed` / `partial` / `unverified` /
+  `absent` 五档，在终态时由 registry 算一次。空跑退出 0 记作 `succeeded` + `absent`，
+  账上不再把「进程退 0」当成「干成了」。
 - **派子代理** —— `dispatch_task` 递一段任务，立刻拿编号（长驻宿主 rpc/tui）或等它跑完拿交付物
   （一次性宿主 print/json）。
 - **排队** —— 座位从内存池切份额，满了 FIFO 排队，永远不拒绝。
