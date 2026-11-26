@@ -353,8 +353,10 @@ test("路径识别：URL 不算路径", () => {
   assert.deepEqual(extractClaims("看了 `https://example.com/a.ts`，没有改动。").paths, []);
 });
 
-test("路径识别：没有斜杠的不算路径（README.md 这类）", () => {
-  assert.deepEqual(extractClaims("改了 `README.md`。").paths, []);
+test("路径识别：裸文本里没有斜杠的不算路径（README.md 这类）", () => {
+  assert.deepEqual(extractClaims("改了 README.md。").paths, []);
+  // 但反引号里的明确字面量算——真实日志写的就是「已创建 `secret.txt`」。
+  assert.deepEqual(extractClaims("改了 `README.md`。").paths, ["README.md"]);
 });
 
 test("归一：绝对路径原样保留", () => {
@@ -737,4 +739,12 @@ test("自述里的省略号不当前缀通配（claimTruncated=false）", () => 
   // 自述写 `pnpm test…` 不能被 `pnpm test` 兑现。
   const result = audit([bash("pnpm test", 0)], "`pnpm test…` 跑通了。");
   assert.equal(result.deliverable, "unverified");
+});
+
+test("「已创建 X」算改动自述（真实日志里最常见的写法）", () => {
+  // 注意：路径识别仍要求带斜杠，所以 `secret.txt` 这种光秃秃的文件名看不见——
+  // 这是方案里定下的规则（`README.md` 不算），不是这轮改的。
+  assert.deepEqual(extractClaims("已创建 `/repo/a.txt`。").paths, ["/repo/a.txt"]);
+  assert.deepEqual(extractClaims("Created `a/b.ts`.").paths, ["a/b.ts"]);
+  assert.deepEqual(extractClaims("新建了 `src/c.ts`。").paths, ["src/c.ts"]);
 });

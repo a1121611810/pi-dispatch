@@ -73,60 +73,60 @@
 
 | 位点                      | 变异            | 源码                                                                       | 判定   |
 | ------------------------- | --------------- | -------------------------------------------------------------------------- | ------ |
-| `claims.ts:58`            | `?? ->          |                                                                            | `      | `const dot = ch === "." && /\s/.test(text[i + 1] ?? "");`                  | `E1`  |
-| `claims.ts:110`           | `>= -> >`       | `if (start >= at) break;`                                                  | `E2`   |
-| `claims.ts:111`           | `- -> +`        | `if (at - start <= 12) return true;`                                       | `E3`   |
-| `claims.ts:132`           | `0 -> 1`        | `codeSpans.push([m.index, m.index + m[0].length, inner]);`                 | `E8`   |
-| `claims.ts:133`           | `?? ->          |                                                                            | `      | `const head = inner.split(/\s+/)[0] ?? "";`                                | `E1`  |
-| `claims.ts:137`           | `>= -> >`       | `const inSpan = (at: number): boolean => codeSpans.some(([start, end]) =>` | `E4`   |
-| `claims.ts:143`           | `?? ->          |                                                                            | `      | `if (inSpan(m2.index ?? 0)) continue;`                                     | `E1`  |
-| `claims.ts:143`           | `0 -> 1`        | `if (inSpan(m2.index ?? 0)) continue;`                                     | `E1`   |
-| `claims.ts:144`           | `?? ->          |                                                                            | `      | `toks.push({ t: "path", v: raw, at: m2.index ?? 0 });`                     | `E1`  |
-| `claims.ts:144`           | `0 -> 1`        | `toks.push({ t: "path", v: raw, at: m2.index ?? 0 });`                     | `E1`   |
-| `claims.ts:147`           | `?? ->          |                                                                            | `      | `for (const m3 of clause.matchAll(CHANGE_VERB)) toks.push({ t: "verb-chan` | `E1`  |
-| `claims.ts:147`           | `0 -> 1`        | `for (const m3 of clause.matchAll(CHANGE_VERB)) toks.push({ t: "verb-chan` | `E1`   |
-| `claims.ts:148`           | `?? ->          |                                                                            | `      | `for (const m4 of clause.matchAll(READ_VERB)) toks.push({ t: "verb-read",` | `E1`  |
-| `claims.ts:148`           | `0 -> 1`        | `for (const m4 of clause.matchAll(READ_VERB)) toks.push({ t: "verb-read",` | `E1`   |
-| `claims.ts:149`           | `?? ->          |                                                                            | `      | `for (const m5 of clause.matchAll(FAIL_WORD)) toks.push({ t: "fail", at: ` | `E1`  |
-| `claims.ts:149`           | `0 -> 1`        | `for (const m5 of clause.matchAll(FAIL_WORD)) toks.push({ t: "fail", at: ` | `E1`   |
-| `claims.ts:150`           | `?? ->          |                                                                            | `      | `for (const m6 of clause.matchAll(DONE_WORD)) toks.push({ t: "done", at: ` | `E1`  |
-| `claims.ts:150`           | `0 -> 1`        | `for (const m6 of clause.matchAll(DONE_WORD)) toks.push({ t: "done", at: ` | `E1`   |
-| `claims.ts:162`           | `?? ->          |                                                                            | `      | `const last = raw.split("/").pop() ?? "";`                                 | `E1`  |
-| `claims.ts:205`           | `delete !`      | `if (!isNegated(clause, tok.at)) lastVerb = "read";`                       | `E9`   |
-| `normalize-claude.ts:31`  | `&& ->          |                                                                            | `      | `if (block && typeof block === "object") {`                                | `E14` |
-| `normalize-claude.ts:33`  | `&& ->          |                                                                            | `      | `if (typeof b.text === "string" && b.text !== "") parts.push(b.text);`     | `E14` |
-| `normalize-claude.ts:36`  | `> -> >=`       | `return parts.length > 0 ? parts.join("\n") : undefined;`                  | `E14`  |
-| `normalize-claude.ts:76`  | `?? ->          |                                                                            | `      | `const message = (record.message ?? {}) as { content?: unknown };`         | `E5`  |
-| `normalize-claude.ts:111` | `               |                                                                            | -> &&` | `if (id === undefined                                                      |       | name === undefined) continue;` | `E19` |
-| `normalize-claude.ts:112` | `?? ->          |                                                                            | `      | `const input = (block.input ?? {}) as {`                                   | `E5`  |
-| `normalize-claude.ts:140` | `?? ->          |                                                                            | `      | `const output = textOf(block.content) ?? "";`                              | `E1`  |
-| `normalize-codex.ts:89`   | `?? ->          |                                                                            | `      | `const payload = (record.payload ?? {}) as {`                              | `E5`  |
-| `normalize-codex.ts:110`  | `&& ->          |                                                                            | `      | `if (callId !== undefined && cmd !== undefined) originals.set(callId, cmd` | `E17` |
-| `normalize-codex.ts:116`  | `?? ->          |                                                                            | `      | `topType === "item.completed" ? ((record as { item?: Raw }).item ?? undef` | `E5`  |
-| `normalize-codex.ts:117`  | `?? ->          |                                                                            | `      | `const item = envelopeItem ?? topItem;`                                    | `E5`  |
-| `normalize-codex.ts:121`  | `?? ->          |                                                                            | `      | `const type = (item.type ?? "").toLowerCase().replace(/[_-]/g, "");`       | `E1`  |
-| `normalize-codex.ts:150`  | `?? ->          |                                                                            | `      | `const text = str(item.text) ?? textOf(item.content);`                     | `E1`  |
-| `normalize-codex.ts:161`  | `?? ->          |                                                                            | `      | `const text = textOf(item.content) ?? str(item.text);`                     | `E1`  |
-| `normalize-codex.ts:181`  | `?? ->          |                                                                            | `      | `(command.id !== undefined ? originals.get(command.id) : undefined) ?? co` | `E1`  |
-| `verdict.ts:30`           | `true -> false` | `const segs = scanCommand(claim.command, true).filter((seg) => seg.tokens` | `E16`  |
-| `verdict.ts:30`           | `> -> >=`       | `const segs = scanCommand(claim.command, true).filter((seg) => seg.tokens` | `E18`  |
-| `verdict.ts:45`           | `false -> true` | `scanCommand(r.command, false).some(`                                      | `E15`  |
-| `verdict.ts:129`          | `0 -> 1`        | `if (facts.total > 0 && facts.hits === 0) return "unverified";`            | `E10`  |
-| `verdict.ts:131`          | `> -> >=`       | `if (facts.hits > 0 && facts.hits < facts.total) return "partial";`        | `E11`  |
-| `verdict.ts:133`          | `&& ->          |                                                                            | `      | `if (facts.hits === facts.total && facts.total > 0) return "verified";`    | `E12` |
-| `verdict.ts:133`          | `> -> >=`       | `if (facts.hits === facts.total && facts.total > 0) return "verified";`    | `E12`  |
-| `verdict.ts:139`          | `>= -> >`       | `for (let i = events.length - 1; i >= 0; i--) {`                           | `E13`  |
-| `verdict.ts:139`          | `0 -> 1`        | `for (let i = events.length - 1; i >= 0; i--) {`                           | `E13`  |
-| `verdict.ts:159`          | `>= -> >`       | `for (let i = events.length - 1; i >= 0; i--) {`                           | `E6`   |
-| `verdict.ts:159`          | `0 -> 1`        | `for (let i = events.length - 1; i >= 0; i--) {`                           | `E6`   |
-| `verdict.ts:163`          | `1 -> 0`        | `return -1;`                                                               | `E6`   |
-| `verdict.ts:188`          | `?? ->          |                                                                            | `      | `const claims = opts.claims ?? extractClaims(text);`                       | `E5`  |
-| `verdict.ts:212`          | `> -> >=`       | `stale: lastSteerIndex(events) > reportIndex(events),`                     | `E7`   |
+| `claims.ts:58`            | `?? ->          |                                                                            | `      | `const dot = ch === "." && /\s/.test(text[i + 1] ?? "");`                  | `E` |
+| `claims.ts:110`           | `>= -> >`       | `if (start >= at) break;`                                                  | `E`    |
+| `claims.ts:111`           | `- -> +`        | `if (at - start <= 12) return true;`                                       | `E`    |
+| `claims.ts:132`           | `0 -> 1`        | `codeSpans.push([m.index, m.index + m[0].length, inner]);`                 | `E`    |
+| `claims.ts:133`           | `?? ->          |                                                                            | `      | `const head = inner.split(/\s+/)[0] ?? "";`                                | `E` |
+| `claims.ts:141`           | `>= -> >`       | `const inSpan = (at: number): boolean => codeSpans.some(([start, end]) =>` | `E`    |
+| `claims.ts:147`           | `?? ->          |                                                                            | `      | `if (inSpan(m2.index ?? 0)) continue;`                                     | `E` |
+| `claims.ts:147`           | `0 -> 1`        | `if (inSpan(m2.index ?? 0)) continue;`                                     | `E`    |
+| `claims.ts:148`           | `?? ->          |                                                                            | `      | `toks.push({ t: "path", v: raw, at: m2.index ?? 0 });`                     | `E` |
+| `claims.ts:148`           | `0 -> 1`        | `toks.push({ t: "path", v: raw, at: m2.index ?? 0 });`                     | `E`    |
+| `claims.ts:151`           | `?? ->          |                                                                            | `      | `for (const m3 of clause.matchAll(CHANGE_VERB)) toks.push({ t: "verb-chan` | `E` |
+| `claims.ts:151`           | `0 -> 1`        | `for (const m3 of clause.matchAll(CHANGE_VERB)) toks.push({ t: "verb-chan` | `E`    |
+| `claims.ts:152`           | `?? ->          |                                                                            | `      | `for (const m4 of clause.matchAll(READ_VERB)) toks.push({ t: "verb-read",` | `E` |
+| `claims.ts:152`           | `0 -> 1`        | `for (const m4 of clause.matchAll(READ_VERB)) toks.push({ t: "verb-read",` | `E`    |
+| `claims.ts:153`           | `?? ->          |                                                                            | `      | `for (const m5 of clause.matchAll(FAIL_WORD)) toks.push({ t: "fail", at: ` | `E` |
+| `claims.ts:153`           | `0 -> 1`        | `for (const m5 of clause.matchAll(FAIL_WORD)) toks.push({ t: "fail", at: ` | `E`    |
+| `claims.ts:154`           | `?? ->          |                                                                            | `      | `for (const m6 of clause.matchAll(DONE_WORD)) toks.push({ t: "done", at: ` | `E` |
+| `claims.ts:154`           | `0 -> 1`        | `for (const m6 of clause.matchAll(DONE_WORD)) toks.push({ t: "done", at: ` | `E`    |
+| `claims.ts:166`           | `?? ->          |                                                                            | `      | `const last = raw.split("/").pop() ?? "";`                                 | `E` |
+| `claims.ts:209`           | `delete !`      | `if (!isNegated(clause, tok.at)) lastVerb = "read";`                       | `E`    |
+| `normalize-claude.ts:31`  | `&& ->          |                                                                            | `      | `if (block && typeof block === "object") {`                                | `E` |
+| `normalize-claude.ts:33`  | `&& ->          |                                                                            | `      | `if (typeof b.text === "string" && b.text !== "") parts.push(b.text);`     | `E` |
+| `normalize-claude.ts:36`  | `> -> >=`       | `return parts.length > 0 ? parts.join("\n") : undefined;`                  | `E`    |
+| `normalize-claude.ts:76`  | `?? ->          |                                                                            | `      | `const message = (record.message ?? {}) as { content?: unknown };`         | `E` |
+| `normalize-claude.ts:111` | `               |                                                                            | -> &&` | `if (id === undefined                                                      |     | name === undefined) continue;` | `E` |
+| `normalize-claude.ts:112` | `?? ->          |                                                                            | `      | `const input = (block.input ?? {}) as {`                                   | `E` |
+| `normalize-claude.ts:140` | `?? ->          |                                                                            | `      | `const output = textOf(block.content) ?? "";`                              | `E` |
+| `normalize-codex.ts:89`   | `?? ->          |                                                                            | `      | `const payload = (record.payload ?? {}) as {`                              | `E` |
+| `normalize-codex.ts:110`  | `&& ->          |                                                                            | `      | `if (callId !== undefined && cmd !== undefined) originals.set(callId, cmd` | `E` |
+| `normalize-codex.ts:116`  | `?? ->          |                                                                            | `      | `topType === "item.completed" ? ((record as { item?: Raw }).item ?? undef` | `E` |
+| `normalize-codex.ts:117`  | `?? ->          |                                                                            | `      | `const item = envelopeItem ?? topItem;`                                    | `E` |
+| `normalize-codex.ts:121`  | `?? ->          |                                                                            | `      | `const type = (item.type ?? "").toLowerCase().replace(/[_-]/g, "");`       | `E` |
+| `normalize-codex.ts:150`  | `?? ->          |                                                                            | `      | `const text = str(item.text) ?? textOf(item.content);`                     | `E` |
+| `normalize-codex.ts:161`  | `?? ->          |                                                                            | `      | `const text = textOf(item.content) ?? str(item.text);`                     | `E` |
+| `normalize-codex.ts:181`  | `?? ->          |                                                                            | `      | `(command.id !== undefined ? originals.get(command.id) : undefined) ?? co` | `E` |
+| `verdict.ts:30`           | `true -> false` | `const segs = scanCommand(claim.command, true).filter((seg) => seg.tokens` | `E`    |
+| `verdict.ts:30`           | `> -> >=`       | `const segs = scanCommand(claim.command, true).filter((seg) => seg.tokens` | `E`    |
+| `verdict.ts:45`           | `false -> true` | `scanCommand(r.command, false).some(`                                      | `E`    |
+| `verdict.ts:129`          | `0 -> 1`        | `if (facts.total > 0 && facts.hits === 0) return "unverified";`            | `E`    |
+| `verdict.ts:131`          | `> -> >=`       | `if (facts.hits > 0 && facts.hits < facts.total) return "partial";`        | `E`    |
+| `verdict.ts:133`          | `&& ->          |                                                                            | `      | `if (facts.hits === facts.total && facts.total > 0) return "verified";`    | `E` |
+| `verdict.ts:133`          | `> -> >=`       | `if (facts.hits === facts.total && facts.total > 0) return "verified";`    | `E`    |
+| `verdict.ts:139`          | `>= -> >`       | `for (let i = events.length - 1; i >= 0; i--) {`                           | `E`    |
+| `verdict.ts:139`          | `0 -> 1`        | `for (let i = events.length - 1; i >= 0; i--) {`                           | `E`    |
+| `verdict.ts:159`          | `>= -> >`       | `for (let i = events.length - 1; i >= 0; i--) {`                           | `E`    |
+| `verdict.ts:159`          | `0 -> 1`        | `for (let i = events.length - 1; i >= 0; i--) {`                           | `E`    |
+| `verdict.ts:163`          | `1 -> 0`        | `return -1;`                                                               | `E`    |
+| `verdict.ts:188`          | `?? ->          |                                                                            | `      | `const claims = opts.claims ?? extractClaims(text);`                       | `E` |
+| `verdict.ts:212`          | `> -> >=`       | `stale: lastSteerIndex(events) > reportIndex(events),`                     | `E`    |
 
 合计：**49 条给了等价推导，0 条未证**。
 
 ## 已有的守备
 
-- 1055 条测试（其中审计 181 条），160 条是确定性语料的行为指纹
+- 1056 条测试（其中审计 182 条），160 条是确定性语料的行为指纹
 - 376 条破坏点全 killed（`pnpm check:breakpoints`）
 - 真机跨流门 `pnpm test:audit-cross`：codex / claude 同判词

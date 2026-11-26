@@ -677,7 +677,7 @@ const RUNNERS = /* @__PURE__ */ new Set([
 	"make",
 	"git"
 ]);
-const CHANGE_VERB = /改|修改|新增|新建|删除|写入|implemented|changed|added|created|wrote|updated|fixed/gi;
+const CHANGE_VERB = /改|修改|新增|新建|创建|删除|写入|implemented|changed|added|created|wrote|updated|fixed/gi;
 const READ_VERB = /读|看了|查看|检查|搜索|grep|read|inspected|checked|reviewed|scanned/gi;
 /** 失败词。裸「红」不算（「红利 / 红灯」会误伤）。 */
 const FAIL_WORD = /失败|报错|挂了|failed|error|failing|not ok|未通过|没通过|没有通过/gi;
@@ -779,6 +779,11 @@ function tokensOf(clause) {
 			at: m.index
 		});
 		else if (looksLikePath(inner)) toks.push({
+			t: "path",
+			v: inner,
+			at: m.index
+		});
+		else if (/^[^\s/]+\.[A-Za-z][\w-]{0,9}$/.test(inner)) toks.push({
 			t: "path",
 			v: inner,
 			at: m.index
