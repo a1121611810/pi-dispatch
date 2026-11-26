@@ -1311,12 +1311,13 @@ function normalizeClaude(lines) {
 				const isError = block.is_error === true;
 				if (tool.sidechain) continue;
 				if (tool.name === "bash" || tool.name === "Bash") {
+					if (tool.input.command === void 0) continue;
 					const exitCode = exitCodeOf$1(output, isError, tool.input.runInBackground === true);
 					if (exitCode === void 0) continue;
 					events.push({
 						kind: "tool",
 						name: "bash",
-						input: { command: tool.input.command ?? "" },
+						input: { command: tool.input.command },
 						exitCode
 					});
 					continue;

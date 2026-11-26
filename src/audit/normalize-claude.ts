@@ -142,12 +142,14 @@ export function normalizeClaude(lines: Iterable<string>): NormalizedClaude {
         if (tool.sidechain) continue;
 
         if (tool.name === "bash" || tool.name === "Bash") {
+          // 没有命令文本的调用不是收据：空串会被下游丢掉，但它说明这次调用没记完整。
+          if (tool.input.command === undefined) continue;
           const exitCode = exitCodeOf(output, isError, tool.input.runInBackground === true);
           if (exitCode === undefined) continue; // 没跑完 / 被拦下：不是收据
           events.push({
             kind: "tool",
             name: "bash",
-            input: { command: tool.input.command ?? "" },
+            input: { command: tool.input.command },
             exitCode,
           });
           continue;

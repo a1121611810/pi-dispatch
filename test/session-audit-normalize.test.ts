@@ -956,3 +956,52 @@ test("跨流（三家）：同一个任务三种形状判词相同", () => {
   const verdicts = [codex, claude, pi].map((r) => audit(r.events, r.report).deliverable);
   assert.deepEqual(verdicts, ["verified", "verified", "verified"]);
 });
+
+test("类型闸（表）：每个字段塞错类型都不产收据、也不崩", () => {
+  const codexCases: string[] = [
+    JSON.stringify({
+      type: "item.completed",
+      item: { type: "command_execution", command: 123, exit_code: 0 },
+    }),
+    JSON.stringify({
+      type: "item.completed",
+      item: { type: "file_change", changes: "不是数组也不是对象" },
+    }),
+    JSON.stringify({
+      type: "item.completed",
+      item: { type: "file_change", changes: [{ path: 123 }] },
+    }),
+    JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", content: [{ type: "Text", text: null }] },
+    }),
+    JSON.stringify({
+      type: "response_item",
+      payload: { type: "message", role: "assistant", content: "不是数组" },
+    }),
+    JSON.stringify({ type: "response_item", payload: { type: "message", role: 123, content: [] } }),
+  ];
+  for (const line of codexCases) {
+    const result = normalizeCodex([line]);
+    assert.equal(bashOf(result.events).length, 0, `codex 不该产命令：${line}`);
+    assert.equal(writeOf(result.events).length, 0, `codex 不该产路径：${line}`);
+    assert.equal(result.malformed, 0);
+  }
+
+  const claudeCases: Array<[string, unknown, unknown]> = [
+    ["Bash", { command: 123 }, "Exit code 0"],
+    ["Write", { file_path: 123 }, "ok"],
+    ["Edit", { file_path: "" }, "ok"],
+    ["NotebookEdit", { notebook_path: null }, "ok"],
+  ];
+  for (const [name, input, output] of claudeCases) {
+    const lines = [
+      claudeLine("assistant", [{ type: "tool_use", id: "t1", name, input }]),
+      claudeLine("user", [{ type: "tool_result", tool_use_id: "t1", content: output }]),
+    ];
+    const result = normalizeClaude(lines);
+    assert.equal(result.malformed, 0, `${name} 不该崩`);
+    assert.equal(bashOf(result.events).length, 0, `${name} 不该产命令`);
+    assert.equal(writeOf(result.events).length, 0, `${name} 不该产路径`);
+  }
+});
