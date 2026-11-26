@@ -86,7 +86,10 @@ out
 
 # Nuxt.js build / generate output
 .nuxt
-dist
+# dist 不再忽略：pi 的 git 装是 clone + 在 clone 里跑一次包管理器安装
+# （--omit=dev / --prod），devDeps 不装、pnpm 分支根本不跑 prepare ⇒ 现场构建
+# 这条路不存在。dist 必须入库，两种装法才都拿到同一份产物。
+# 漂移由 `pnpm build:check`（build 后 git diff --exit-code -- dist）在 CI 里拦住。
 .output
 
 # NitroJS

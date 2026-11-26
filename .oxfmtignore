@@ -1,0 +1,9 @@
+# oxfmt / oxlint 的忽略清单。
+#
+# 为什么要单独一份：dist 现在入库了（pi 的 git 装必须 clone 下来就有产物，
+# 现场构建那条路在 pnpm 分支不存在）。但 dist 是 rolldown 生成的产物，
+# 它的代码风格由 rolldown 决定，不由我们决定——让格式化器去改它，
+# 只会和 `pnpm build:check`（重建后 git diff --exit-code -- dist）打架。
+#
+# 这里只挡格式化与静态检查；隐私门禁仍会扫 dist（它是入库文件，得干净）。
+dist/
