@@ -534,3 +534,197 @@ test("claude：content 既不是数组也不是字符串时安全跳过", () => 
   assert.equal(result.events.length, 0);
   assert.equal(result.malformed, 0);
 });
+
+// ── 表驱动：把所有信封/工具/结果形状一次铺开 ────────────────────────────
+// 单条用例覆盖一张表，比逐条写更省，也能一次钉住多个分支。
+
+test("表驱动：codex 的每种信封与 item 类型各归各位", () => {
+  const cases: Array<{ name: string; line: string; bash: number; write: number; msg: number }> = [
+    {
+      name: "历史 envelope + CommandExecution",
+      line: JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "item_completed",
+          item: { type: "CommandExecution", command: ["/bin/sh", "-c", "ls"], exit_code: 0 },
+        },
+      }),
+      bash: 1,
+      write: 0,
+      msg: 0,
+    },
+    {
+      name: "实时 envelope + command_execution（snake）",
+      line: JSON.stringify({
+        type: "item.completed",
+        item: { type: "command_execution", command: "ls", exit_code: 0 },
+      }),
+      bash: 1,
+      write: 0,
+      msg: 0,
+    },
+    {
+      name: "历史 envelope + FileChange（对象）",
+      line: JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "item_completed",
+          item: { type: "FileChange", changes: { "/a.ts": { type: "add" } } },
+        },
+      }),
+      bash: 0,
+      write: 1,
+      msg: 0,
+    },
+    {
+      name: "实时 envelope + file_change（数组）",
+      line: JSON.stringify({
+        type: "item.completed",
+        item: { type: "file_change", changes: [{ path: "/a.ts" }] },
+      }),
+      bash: 0,
+      write: 1,
+      msg: 0,
+    },
+    {
+      name: "AgentMessage（Pascal）",
+      line: JSON.stringify({
+        type: "item.completed",
+        item: { type: "AgentMessage", content: [{ type: "Text", text: "hi" }] },
+      }),
+      bash: 0,
+      write: 0,
+      msg: 1,
+    },
+    {
+      name: "agent_message（snake，带 text）",
+      line: JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "hi" } }),
+      bash: 0,
+      write: 0,
+      msg: 1,
+    },
+    {
+      name: "UserMessage（content 数组）",
+      line: JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "item_completed",
+          item: { type: "UserMessage", content: [{ type: "text", text: "喂" }] },
+        },
+      }),
+      bash: 0,
+      write: 0,
+      msg: 1,
+    },
+    {
+      name: "response_item/message（role=user）",
+      line: JSON.stringify({
+        type: "response_item",
+        payload: { type: "message", role: "user", content: [{ type: "input_text", text: "喂" }] },
+      }),
+      bash: 0,
+      write: 0,
+      msg: 1,
+    },
+    {
+      name: "未知类型",
+      line: JSON.stringify({ type: "turn.started" }),
+      bash: 0,
+      write: 0,
+      msg: 0,
+    },
+  ];
+  for (const item of cases) {
+    const result = normalizeCodex([item.line]);
+    assert.equal(bashOf(result.events).length, item.bash, `${item.name}：命令`);
+    assert.equal(writeOf(result.events).length, item.write, `${item.name}：路径`);
+    assert.equal(messageOf(result.events).length, item.msg, `${item.name}：消息`);
+  }
+});
+
+test("表驱动：claude 的每种工具与结果组合", () => {
+  const bashUse = (name: string, input: unknown, id = "t1"): string =>
+    claudeLine("assistant", [{ type: "tool_use", id, name, input }]);
+  const result = (content: unknown, extra: Record<string, unknown> = {}, id = "t1"): string =>
+    claudeLine("user", [{ type: "tool_result", tool_use_id: id, content, ...extra }]);
+
+  const cases: Array<{ name: string; lines: string[]; bash: number; write: number }> = [
+    {
+      name: "Bash + Exit code 0",
+      lines: [bashUse("Bash", { command: "ls" }), result("Exit code 0\nok")],
+      bash: 1,
+      write: 0,
+    },
+    {
+      name: "Bash + Exit code 7",
+      lines: [bashUse("Bash", { command: "ls" }), result("Exit code 7\nboom")],
+      bash: 1,
+      write: 0,
+    },
+    {
+      name: "Bash + 无标记成功",
+      lines: [bashUse("Bash", { command: "ls" }), result("普通输出")],
+      bash: 1,
+      write: 0,
+    },
+    {
+      name: "Bash + is_error 无标记",
+      lines: [bashUse("Bash", { command: "ls" }), result("hook error", { is_error: true })],
+      bash: 0,
+      write: 0,
+    },
+    {
+      name: "Bash + 后台",
+      lines: [
+        bashUse("Bash", { command: "ls", run_in_background: true }),
+        result("Command running in background"),
+      ],
+      bash: 0,
+      write: 0,
+    },
+    {
+      name: "Bash + 超时转后台",
+      lines: [
+        bashUse("Bash", { command: "ls" }),
+        result("did not complete within its 120s timeout"),
+      ],
+      bash: 0,
+      write: 0,
+    },
+    {
+      name: "Write",
+      lines: [bashUse("Write", { file_path: "/a.ts" }), result("ok")],
+      bash: 0,
+      write: 1,
+    },
+    {
+      name: "Edit",
+      lines: [bashUse("Edit", { file_path: "/a.ts" }), result("ok")],
+      bash: 0,
+      write: 1,
+    },
+    {
+      name: "NotebookEdit",
+      lines: [bashUse("NotebookEdit", { notebook_path: "/a.ipynb" }), result("ok")],
+      bash: 0,
+      write: 1,
+    },
+    {
+      name: "Read 不算写",
+      lines: [bashUse("Read", { file_path: "/a.ts" }), result("Exit code 0")],
+      bash: 0,
+      write: 0,
+    },
+    {
+      name: "Grep 不算写",
+      lines: [bashUse("Grep", { pattern: "x" }), result("ok")],
+      bash: 0,
+      write: 0,
+    },
+  ];
+  for (const item of cases) {
+    const normalized = normalizeClaude(item.lines);
+    assert.equal(bashOf(normalized.events).length, item.bash, `${item.name}：命令`);
+    assert.equal(writeOf(normalized.events).length, item.write, `${item.name}：路径`);
+  }
+});
