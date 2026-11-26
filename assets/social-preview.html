@@ -1,0 +1,333 @@
+<!doctype html>
+<!-- Source for assets/social-preview.png. Render at 1280x640. -->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>pi-dispatch social preview</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        width: 1280px;
+        height: 640px;
+        overflow: hidden;
+      }
+      body {
+        background: #0d1116;
+        color: #ebe7e4;
+        font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+      }
+      .grid {
+        position: absolute;
+        inset: 0;
+        background-image:
+          linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+        background-size: 32px 32px;
+      }
+      .glow {
+        position: absolute;
+        inset: 0;
+        background: radial-gradient(
+          circle at 73% 46%,
+          rgba(77, 154, 191, 0.16),
+          rgba(77, 154, 191, 0) 52%
+        );
+      }
+      .left {
+        position: absolute;
+        left: 80px;
+        top: 72px;
+        width: 580px;
+      }
+      .motif {
+        width: 36px;
+        height: 52px;
+        position: relative;
+        margin-bottom: 18px;
+      }
+      .motif i {
+        position: absolute;
+        display: block;
+      }
+      .motif .a {
+        width: 18px;
+        height: 18px;
+        left: 0;
+        top: 0;
+        background: #f09082;
+      }
+      .motif .b {
+        width: 18px;
+        height: 34px;
+        left: 0;
+        top: 18px;
+        background: #4d9abf;
+      }
+      .motif .c {
+        width: 18px;
+        height: 18px;
+        left: 18px;
+        top: 34px;
+        background: #f1be58;
+      }
+      .kicker {
+        font-family: Menlo, "SF Mono", Monaco, monospace;
+        font-size: 12px;
+        letter-spacing: 2.6px;
+        color: #9fa4ab;
+        margin: 0 0 8px 0;
+      }
+      h1 {
+        margin: 0;
+        font-size: 82px;
+        line-height: 1.02;
+        font-weight: 600;
+        letter-spacing: -2.2px;
+      }
+      .tag {
+        margin: 14px 0 0 0;
+        font-size: 34px;
+        line-height: 1.2;
+        font-style: italic;
+        color: #ebe7e4;
+      }
+      .tag em {
+        color: #6a9fcc;
+        font-style: italic;
+      }
+      .sub {
+        margin: 30px 0 0 0;
+        font-family: Menlo, "SF Mono", Monaco, monospace;
+        font-size: 17px;
+        line-height: 1.75;
+        color: #9fa4ab;
+      }
+      .sub span {
+        color: #5c5752;
+        padding: 0 8px;
+      }
+      .install {
+        position: absolute;
+        left: 80px;
+        bottom: 42px;
+      }
+      .install .label {
+        font-family: Menlo, "SF Mono", Monaco, monospace;
+        font-size: 11px;
+        letter-spacing: 2.2px;
+        color: #5c5752;
+        margin-bottom: 7px;
+      }
+      .install .cmd {
+        font-family: Menlo, "SF Mono", Monaco, monospace;
+        font-size: 19px;
+        color: #d5d8db;
+      }
+      .repo {
+        position: absolute;
+        right: 80px;
+        bottom: 46px;
+        font-family: Menlo, "SF Mono", Monaco, monospace;
+        font-size: 12px;
+        color: #757d89;
+      }
+      .ledger {
+        position: absolute;
+        right: 80px;
+        top: 112px;
+        width: 500px;
+        height: 416px;
+        background: #161d27;
+        border: 1px solid rgba(73, 80, 89, 0.9);
+        border-radius: 14px;
+        box-shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
+        overflow: hidden;
+      }
+      .edge {
+        position: absolute;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        width: 6px;
+        background: linear-gradient(#f09082 0%, #4d9abf 50%, #f1be58 100%);
+      }
+      .panel-head {
+        position: absolute;
+        left: 30px;
+        right: 28px;
+        top: 24px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .panel-title {
+        font-family: Menlo, "SF Mono", Monaco, monospace;
+        font-size: 12px;
+        letter-spacing: 1.8px;
+        color: #9fa4ab;
+      }
+      .dots {
+        display: flex;
+        gap: 8px;
+      }
+      .dots i {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #495059;
+        display: block;
+      }
+      .rule {
+        position: absolute;
+        left: 30px;
+        right: 28px;
+        top: 50px;
+        height: 1px;
+        background: rgba(73, 80, 89, 0.7);
+      }
+      .rows {
+        position: absolute;
+        left: 30px;
+        right: 28px;
+        top: 68px;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 124px 1fr auto;
+        align-items: baseline;
+        margin-bottom: 22px;
+        font-family: Menlo, "SF Mono", Monaco, monospace;
+      }
+      .row .k {
+        font-size: 16px;
+        color: #9fa4ab;
+      }
+      .row .v {
+        font-size: 17px;
+        color: #ebe7e4;
+      }
+      .row .m {
+        font-size: 12px;
+        color: #5c5752;
+        text-align: right;
+      }
+      .row .process {
+        color: #d5d8db;
+      }
+      .row .salmon {
+        color: #f09082;
+      }
+      .row .amber {
+        color: #e8993a;
+      }
+      .row.big .v {
+        font-size: 22px;
+        font-weight: 700;
+      }
+      .rule2 {
+        margin: 4px 0 22px;
+        height: 1px;
+        background: rgba(73, 80, 89, 0.7);
+      }
+      .verdict {
+        position: absolute;
+        left: 30px;
+        right: 28px;
+        bottom: 22px;
+        height: 52px;
+        border-radius: 8px;
+        background: #0d1116;
+        border: 1px solid rgba(73, 80, 89, 0.7);
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 0 18px;
+        font-family: Menlo, "SF Mono", Monaco, monospace;
+        font-size: 17px;
+      }
+      .verdict .eq {
+        color: #f09082;
+      }
+      .verdict .status {
+        color: #9fa4ab;
+      }
+      .verdict .done {
+        color: #e8993a;
+      }
+      .verdict .note {
+        margin-left: auto;
+        font-size: 11px;
+        color: #5c5752;
+        letter-spacing: 0.3px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="grid"></div>
+    <div class="glow"></div>
+
+    <div class="left">
+      <div class="motif"><i class="a"></i><i class="b"></i><i class="c"></i></div>
+      <p class="kicker">PI EXTENSION</p>
+      <h1>pi-dispatch</h1>
+      <p class="tag">Subagent dispatch with <em>receipts</em>.</p>
+      <p class="sub">
+        Memory-aware queue<span>·</span>stall watch<span>·</span>mid-run steering<br />
+        Claims checked against observed receipts
+      </p>
+    </div>
+
+    <div class="install">
+      <div class="label">INSTALL</div>
+      <div class="cmd">pi install npm:@goodali/pi-dispatch</div>
+    </div>
+    <div class="repo">github.com/a1121611810/pi-dispatch</div>
+
+    <div class="ledger">
+      <div class="edge"></div>
+      <div class="panel-head">
+        <div class="panel-title">DISPATCH LEDGER</div>
+        <div class="dots"><i></i><i></i><i></i></div>
+      </div>
+      <div class="rule"></div>
+      <div class="rows">
+        <div class="row">
+          <div class="k">task</div>
+          <div class="v">7f3a</div>
+          <div class="m">12.4s</div>
+        </div>
+        <div class="row">
+          <div class="k">status</div>
+          <div class="v process">succeeded</div>
+          <div class="m">exit 0</div>
+        </div>
+        <div class="row">
+          <div class="k">claim</div>
+          <div class="v">"ran pnpm test"</div>
+          <div class="m"></div>
+        </div>
+        <div class="row">
+          <div class="k">receipt</div>
+          <div class="v salmon">not observed</div>
+          <div class="m"></div>
+        </div>
+        <div class="rule2"></div>
+        <div class="row big">
+          <div class="k">deliverable</div>
+          <div class="v amber">unverified</div>
+          <div class="m"></div>
+        </div>
+      </div>
+      <div class="verdict">
+        <span class="status">status</span>
+        <span class="eq">≠</span>
+        <span class="done">verdict</span>
+        <span class="note">exit 0 is not delivery evidence</span>
+      </div>
+    </div>
+  </body>
+</html>

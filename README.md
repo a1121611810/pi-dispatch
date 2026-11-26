@@ -4,6 +4,8 @@
 [![npm](https://img.shields.io/npm/v/@goodali/pi-dispatch)](https://www.npmjs.com/package/@goodali/pi-dispatch)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
+[![pi-dispatch: subagent dispatch with receipts](https://raw.githubusercontent.com/a1121611810/pi-dispatch/main/assets/social-preview.png)](https://pi.dev/packages/@goodali/pi-dispatch)
+
 Subagent dispatch for [pi](https://pi.dev): queue children against a memory budget, watch them
 for stalls, stop them, steer them mid-run, and check what they claim against what they actually did.
 

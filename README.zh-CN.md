@@ -6,6 +6,8 @@
 
 [English](./README.md) · 简体中文
 
+[![pi-dispatch：带收据的子代理派发](https://raw.githubusercontent.com/a1121611810/pi-dispatch/main/assets/social-preview.png)](https://pi.dev/packages/@goodali/pi-dispatch)
+
 pi 的子代理派发扩展：按内存预算给子代理分席位、排队、盯卡死、能停、能在跑的时候改方向，
 并且把子代理自述的和它实际做的对一遍。
 
