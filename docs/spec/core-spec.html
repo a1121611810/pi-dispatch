@@ -2394,6 +2394,17 @@
             调用；
           </li>
           <li>
+            <b>可信度按 shell 优先级传播。</b><code>|</code> 最高，<code>&amp;&amp;</code> /
+            <code>||</code> 同级左结合， <code>;</code> / <code>&amp;</code> / 换行最低。<code
+              >&amp;&amp;</code
+            >
+            两边都可推；
+            <code>||</code> 两边都<b>不可推</b>——整条成功只说明「至少一边」，另一条可能根本没跑；
+            <code>;</code> / <code>|</code> 只有右边可推。父级不可推时整棵子树一律不可推。
+            不按这个传播的话，<code>a || b</code> 里的 <code>b</code> 就能靠整条退出码兑现一条
+            「跑过 b」的声称；
+          </li>
+          <li>
             两处上限（路径留前 20、命令留最近 20）撞到时置 <code>pathsTruncated</code> /
             <code>commandsTruncated</code>，<b>截断就不判「对不上」</b>——丢的是证据，不是罪证。
             缺口（<code>receiptGap</code>）的定义更窄：截断<b>且确实有条自述在保留的收据里找不到</b>。

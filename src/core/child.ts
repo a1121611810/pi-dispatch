@@ -1331,7 +1331,7 @@ export function deliverableOf(record: DeliverableInput): Deliverable {
  * 只有和末尾用 `&&` 串起来的那些段才算（`a && b` 成功 ⇒ a、b 都成功）；
  * 一旦中间隔了 `;` `|` `||` `&` 或换行，前面那些段的成败就被掩掉了。
  */
-interface CommandSegment {
+export interface CommandSegment {
   tokens: string[];
   known: boolean;
 }
@@ -1341,34 +1341,40 @@ interface CommandSegment {
  * 引号内的分隔符不切、`\"` 不是闭合引号（否则 `echo "x\" && pnpm test"` 会被切出
  * 一段干净的 pnpm test）。`&` 紧邻 `>` 是重定向（2>&1 / &>log），不算控制符。
  *
- * 「能否推出」的规则：整条命令的退出码只反映**最后一组**的成败；组与组之间只有 `&&` 会把
- * 成功往前传（`a && b` 成功 ⇒ a 也成功），而 `;` `||` 后台 `&` 和未加引号的换行都会切断。
- * 管道 `|` 是一组：只有末段的成败代表整组（`pnpm test && ls | cat` 里 pnpm test 仍然可信，
- * ls 则不可信）。观测侧不按换行切——heredoc 正文留在 cat 段里，段首对不上声称命令。
+ * 信任按 shell 的优先级建树后**自顶向下**传播——`|` 最高，`&&`/`||` 同级左结合，
+ * `;`/`&`/未加引号换行最低：
+ *   And(l,r)           ⇒ 两边都可推（`a && b` 成功 ⇒ a、b 都成功）
+ *   Or(l,r)            ⇒ 两边都不可推（`a || b` 成功只说明「至少一边」，另一条可能根本没跑）
+ *   Seq(l,r)/Pipe(l,r) ⇒ 只有右边可推；左边的成败被整条退出码掩掉
+ * 父节点不可推时，整棵子树一律不可推。观测侧不按换行切——heredoc 正文留在 cat 段里，
+ * 段首对不上声称命令。
  */
-function scanCommand(command: string, splitNewlines: boolean): CommandSegment[] {
-  type Stage = { tokens: string[]; group: number; lastInGroup: boolean };
+export function scanCommand(command: string, splitNewlines: boolean): CommandSegment[] {
+  type Sep = "and" | "or" | "seq" | "pipe";
+  type Node = { leaf: number } | { op: Sep; l: Node; r: Node };
+  const stages: string[][] = [];
+  const seps: Sep[] = [];
   let quote: string | null = null;
   const hasHeredoc = command.includes("<<");
-  const stages: Stage[] = [];
-  const groupSafe: boolean[] = []; // 第 i 组与下一组之间的分隔符是不是 &&
-  let group = 0;
   let current = "";
+
   const takeTokens = (): string[] => {
     const tokens = current.trim().replace(/\s+/g, " ").split(" ").filter(Boolean);
+    // 环境变量前缀（FOO=1 cmd）不是命令本体：声称 `pnpm test` 不该被 `FOO=1` 挡住。
     while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0]!)) tokens.shift();
     current = "";
     return tokens;
   };
-  const closeStage = () => {
+  const closeStage = (): void => {
     const tokens = takeTokens();
-    if (tokens.length > 0) stages.push({ tokens, group, lastInGroup: false });
+    if (tokens.length > 0) stages.push(tokens);
   };
-  const closeGroup = (nextSafe: boolean) => {
+  // 分隔符只在「上一段已经闭合」时记账：`a && ` 的尾巴不产生空段。
+  const pushSep = (sep: Sep): void => {
     closeStage();
-    groupSafe[group] = nextSafe;
-    group += 1;
+    if (stages.length > 0 && seps.length === stages.length - 1) seps.push(sep);
   };
+
   for (let i = 0; i < command.length; i++) {
     const ch = command[i]!;
     if (quote !== null) {
@@ -1395,12 +1401,12 @@ function scanCommand(command: string, splitNewlines: boolean): CommandSegment[] 
       // 所以它前面的命令成败一律不可信（和 `;` 同罪）。
       // 例外：heredoc 的正文里有换行，那不是命令——把正文留在 cat 那一段里
       // （段首是 cat，声称的命令自然对不上），整条按「掩码」处理。
-      if (splitNewlines || !hasHeredoc) closeGroup(false);
+      if (splitNewlines || !hasHeredoc) pushSep("seq");
       else current += " ";
       continue;
     }
     if (ch === "&" && next === "&") {
-      closeGroup(true);
+      pushSep("and");
       i++;
       continue;
     }
@@ -1410,42 +1416,80 @@ function scanCommand(command: string, splitNewlines: boolean): CommandSegment[] 
         current += ch;
         continue;
       }
-      closeGroup(false);
+      pushSep("seq");
       continue;
     }
     if (ch === "|" && next === "|") {
-      closeGroup(false);
+      pushSep("or");
       i++;
       continue;
     }
     if (ch === "|") {
-      // 管道：同组换段，不关组
-      closeStage();
+      pushSep("pipe");
       continue;
     }
     if (ch === ";") {
-      closeGroup(false);
+      pushSep("seq");
       continue;
     }
     current += ch;
   }
-  closeGroup(true);
+  closeStage();
+  // 尾部悬挂的分隔符（`a;` / `a &&`）不参与建树：段已经闭合，后面没有段了。
+  // 不丢的话会造出一个幽灵叶子，把 `a;` 里的 a 判成「成败被掩」。
+  while (seps.length > 0 && seps.length >= stages.length) seps.pop();
 
-  // 每组只有末段代表整组；组的可信度从后往前靠 && 传递。
-  const lastStage = new Map<number, number>();
-  stages.forEach((stage, index) => lastStage.set(stage.group, index));
-  for (const index of lastStage.values()) stages[index]!.lastInGroup = true;
+  if (stages.length === 0) return [];
 
-  const groupKnown: boolean[] = Array.from({ length: group }, () => false);
-  let acc = true;
-  for (let g = group - 1; g >= 0; g--) {
-    acc = acc && groupSafe[g]!;
-    groupKnown[g] = acc;
-  }
-  return stages.map((stage) => ({
-    tokens: stage.tokens,
-    known: groupKnown[stage.group] === true && stage.lastInGroup,
-  }));
+  // 优先级爬升建树（`|` 最高；`&&`/`||` 同级；`;`/`&`/换行最低），全部左结合。
+  const PREC: Record<Sep, number> = { pipe: 3, and: 2, or: 2, seq: 1 };
+  let cursor = 0;
+  const parseExpr = (minPrec: number): Node => {
+    let left: Node = { leaf: cursor };
+    while (cursor < seps.length) {
+      const op = seps[cursor]!;
+      if (PREC[op] < minPrec) break;
+      cursor++;
+      left = { op, l: left, r: parseExpr(PREC[op] + 1) };
+    }
+    return left;
+  };
+  const tree = parseExpr(1);
+
+  const known = stages.map(() => false);
+  const markAll = (node: Node, value: boolean): void => {
+    if ("leaf" in node) known[node.leaf] = value;
+    else {
+      markAll(node.l, value);
+      markAll(node.r, value);
+    }
+  };
+  const mark = (node: Node, trusted: boolean): void => {
+    if (!trusted) {
+      markAll(node, false);
+      return;
+    }
+    if ("leaf" in node) {
+      known[node.leaf] = true;
+      return;
+    }
+    if (node.op === "and") {
+      mark(node.l, true);
+      mark(node.r, true);
+      return;
+    }
+    if (node.op === "or") {
+      markAll(node.l, false);
+      markAll(node.r, false);
+      return;
+    }
+    // seq / pipe：左边成败被整条退出码掩掉，右边继承。
+    mark(node.l, false);
+    mark(node.r, true);
+  };
+  mark(tree, true);
+
+  return stages.map((tokens, index) => ({ tokens, known: known[index] === true }));
 }
 /**
  * 这条命令的成败有没有被掩码（`;` `|` `||` 后台 `&` 未加引号的换行）。

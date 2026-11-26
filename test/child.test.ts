@@ -54,6 +54,7 @@ import {
   parseChildStream,
   pathMatches,
   receiptGap,
+  scanCommand,
   spawnChild,
   normalizeReport,
   supportsNoMcp,
@@ -1782,6 +1783,107 @@ test("自检对质：掩码分隔符不能证明「跑通了」", () => {
     verifyUnverified(ok, cmdDelivery(["pnpm test && echo ok"])),
     false,
     "&& 是安全的：后一条跑成才算整条成功",
+  );
+});
+
+test("扫段：八条信任 oracle（`&&` / `;` / `&` / `||` / `|` 的优先级与左结合）", () => {
+  // 判定「整条成功时这一段能不能推出来」的规则表。按 shell 的优先级建树后自顶向下传播：
+  // `|` 最高，`&&`/`||` 同级左结合，`;`/`&`/换行最低；父节点不可推则整棵子树不可推。
+  const known = (command: string): Array<[string, boolean]> =>
+    scanCommand(command, true).map((seg) => [seg.tokens.join(" "), seg.known]);
+  assert.deepEqual(
+    known("a || b"),
+    [
+      ["a", false],
+      ["b", false],
+    ],
+    "`||` 两侧都可能没跑",
+  );
+  assert.deepEqual(
+    known("a & b"),
+    [
+      ["a", false],
+      ["b", true],
+    ],
+    "`&` 之后必跑，前面的成败被掩",
+  );
+  assert.deepEqual(
+    known("true || b && c"),
+    [
+      ["true", false],
+      ["b", false],
+      ["c", true],
+    ],
+    "`&&` 与 `||` 同级、左结合：b 在 `true || b` 里可能没跑",
+  );
+  assert.deepEqual(
+    known("a || b; c"),
+    [
+      ["a", false],
+      ["b", false],
+      ["c", true],
+    ],
+    "`;` 之后的命令一定跑",
+  );
+  assert.deepEqual(
+    known("a; b || c"),
+    [
+      ["a", false],
+      ["b", false],
+      ["c", false],
+    ],
+    "`||` 右侧可能没跑",
+  );
+  assert.deepEqual(
+    known("a && b; c"),
+    [
+      ["a", false],
+      ["b", false],
+      ["c", true],
+    ],
+    "`;` 把左边整棵子树掩掉",
+  );
+  assert.deepEqual(known("pnpm test; echo done"), [
+    ["pnpm test", false],
+    ["echo done", true],
+  ]);
+  assert.deepEqual(
+    known("a && b | c"),
+    [
+      ["a", true],
+      ["b", false],
+      ["c", true],
+    ],
+    "`|` 优先级高于 `&&`：a 与整条一起成功",
+  );
+  assert.deepEqual(
+    known("a && b"),
+    [
+      ["a", true],
+      ["b", true],
+    ],
+    "`&&` 链上每段都可推",
+  );
+  assert.deepEqual(
+    known("a;"),
+    [["a", true]],
+    "尾部悬挂的分隔符不该造出幽灵段（`a;` 的退出码就是 a 的）",
+  );
+});
+
+test("自检对质：`||` 右操作数没跑也能兑现在今天不成立", () => {
+  // 整条 `pnpm test || pnpm test:unit` 退出 0，可能只说明 pnpm test 成功了，
+  // test:unit 根本没跑。声称「跑通了 test:unit」不能被这条观测兑现。
+  const report = {
+    summary: "s",
+    why: "",
+    assessment: "",
+    verified: [{ command: "pnpm test:unit", exitCode: 0 }],
+  };
+  assert.equal(
+    verifyUnverified(report, cmdDelivery(["pnpm test || pnpm test:unit"])),
+    true,
+    "`||` 右侧的成败不可推",
   );
 });
 
