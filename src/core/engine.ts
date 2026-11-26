@@ -12,6 +12,7 @@ import {
   effectiveModel,
   parseChildStream,
   extractReportFromText,
+  receiptGap,
   spawnChild,
   STDOUT_KEEP_CHARS,
   verifyUnverified,
@@ -1116,6 +1117,11 @@ export class TaskEngine {
     }
     const unverified = deliveryUnverified(report, parsed.delivery);
     const verifyFailed = verifyUnverified(report, parsed.delivery);
+    // 收据被截断**且那一维有自述** ⇒ 判词因此不给盖章。与硬旗分开：
+    // 硬旗是「说了但没证据」，截断是「证据太多收不下，没法核」。
+    // 口径必须与 deliverableOf 同一份（receiptGap），否则通知会说错降级原因
+    // （实测：没交报告 + 收据截断 ⇒ 通知说「收据超出上限」，真因是没交报告）。
+    const receiptTruncated = receiptGap(report, parsed.delivery);
     // 部分命中：一条对上不能洗白整张表，但也不到「零命中」那种硬指控
     const deliveryPartial = deliveryCoverage(report, parsed.delivery);
     const verifyPartial = verifyCoverage(report, parsed.delivery);
@@ -1136,6 +1142,7 @@ export class TaskEngine {
       cache: cacheObservation,
       unverified,
       verifyUnverified: verifyFailed,
+      receiptTruncated,
       vacuous: assessmentVacuous(report),
       deliveryPartial,
       verifyPartial,
@@ -1197,6 +1204,9 @@ export class TaskEngine {
       delivery: record.delivery,
       deliveryUnverified: record.deliveryUnverified,
       verifyUnverified: record.verifyUnverified,
+      // 判词因「收据没法对质」而降级时带出这一位——通知里只给布尔提示，
+      // 父方要看原因得靠 dispatch_list，这条得跟着走到公共结果上。
+      receiptTruncated: record.receiptTruncated,
       assessmentVacuous: record.assessmentVacuous,
       deliverable: record.deliverable,
       deliveryPartial: record.deliveryPartial,

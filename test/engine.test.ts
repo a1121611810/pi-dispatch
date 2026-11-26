@@ -520,7 +520,8 @@ test("引擎：卡住——静默超过阈值收尸", async () => {
 test("引擎：收四样——正文 / 报告 / 用量 / 收据", async () => {
   const stream = [
     '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"结论"}],"usage":{"input":10,"output":5}}}',
-    '{"type":"tool_execution_start","toolName":"edit","args":{"path":"/a"}}',
+    '{"type":"tool_execution_start","toolCallId":"s1","toolName":"edit","args":{"path":"/a"}}',
+    '{"type":"tool_execution_end","toolCallId":"s1","toolName":"edit","isError":false}',
   ].join("\n");
   const { engine } = freshEngine({
     spawn: fakeSpawn({ stdout: stream, exitCode: 0 }),
@@ -721,8 +722,16 @@ test("引擎：声称与观测一致 ⇒ 结果不带 verifyUnverified", async (
   const stream = [
     JSON.stringify({
       type: "tool_execution_start",
+      toolCallId: "ok1",
       toolName: "bash",
       args: { command: "pnpm test" },
+    }),
+    // 命令要成功跑完才算兑现（跑挂的不算），所以夹具必须有配对的 end
+    JSON.stringify({
+      type: "tool_execution_end",
+      toolCallId: "ok1",
+      toolName: "bash",
+      isError: false,
     }),
     JSON.stringify({
       type: "message_end",
@@ -784,8 +793,15 @@ test("引擎：自述与收据是同一文件（写法不同）⇒ 不报没有�
   const stream = [
     JSON.stringify({
       type: "tool_execution_start",
+      toolCallId: "e1",
       toolName: "edit",
       args: { path: "/repo/src/a.ts" },
+    }),
+    JSON.stringify({
+      type: "tool_execution_end",
+      toolCallId: "e1",
+      toolName: "edit",
+      isError: false,
     }),
     JSON.stringify({
       type: "message_end",
@@ -3663,7 +3679,8 @@ test("引擎：报告没给可核对项 ⇒ deliverable=unclaimed（不冒充 ve
 
 test("引擎：五条自述只对上一条 ⇒ deliverable=partial（硬旗不亮，但不是清白）", async () => {
   const stream = [
-    '{"type":"tool_execution_start","toolName":"edit","args":{"path":"/repo/src/a.ts"}}',
+    '{"type":"tool_execution_start","toolCallId":"e1","toolName":"edit","args":{"path":"/repo/src/a.ts"}}',
+    '{"type":"tool_execution_end","toolCallId":"e1","toolName":"edit","isError":false}',
     JSON.stringify({
       type: "message_end",
       message: {

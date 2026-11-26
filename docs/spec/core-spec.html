@@ -2334,12 +2334,26 @@
           </li>
           <li>
             <code>unverified</code
-            >：有自述零命中、<code>assessmentVacuous</code>、或工具报告早于最后一次转向；
+            >：有自述零命中、<code>assessmentVacuous</code>、工具报告早于最后一次转向，
+            或收据被上限截断导致那一维没法对质；
           </li>
-          <li><code>absent</code>：没交报告、正文也是空的——空跑。</li>
+          <li>
+            <code>absent</code>：没交报告、正文空的、<b>也没改过任何文件</b>——空跑。
+            只看正文会把「改了文件但没写报告」误判成空跑，所以 <code>paths</code> 非空就不算；但<b
+              >只看 paths 不看 commands</b
+            >：跑一句 <code>ls</code> 不代表有交付， 拿 <code>commands</code> 当豁免会让「跑了个 ls
+            就啥也没交」也失去空跑信号。
+          </li>
         </ul>
         <p>
-          只有 <code>verified</code> 与 <code>unclaimed</code> 享受 8KB 小窗，其余落 50KB 大窗。
+          判词对<b>所有终态</b>都落账（成功、失败、取消、丢失），不是只有
+          <code>succeeded</code> 才有—— 「没有交付」本身就是一条判词。 这样下游不必把
+          <code>undefined</code> 当「不可信」猜，判词轴也不会只覆盖一半终态。
+        </p>
+        <p>
+          只有 <b><code>succeeded</code></b> 且判词是 <code>verified</code> 或
+          <code>unclaimed</code> 才享受 8KB 小窗，其余落 50KB 大窗。
+          失败的任务即便报告里的自述全对上，仍然拿全文：失败最需要看死因，「报告可信」不等于「进程没崩」。
           <code>assessmentVacuous</code
           >（缺/过短/全正面）仍是<b>粗筛</b>：它拦「连敷衍都懒得敷衍」的报告， 不鉴定伪问题。
         </p>
@@ -2350,8 +2364,30 @@
             读过不等于改过，否则把声称改过的文件读一遍就能对上；
           </li>
           <li>
+            <b>成功才算兑现。</b>收据在 <code>tool_execution_start</code> 暂存、等
+            <code>tool_execution_end</code> 且
+            <code>isError !== true</code> 才落账——路径和命令同一套。 失败的不算：5 次全失败的
+            <code>edit</code>、跑挂的 <code>pnpm test</code>，都不能拿来换「已核对」。 只有
+            <code>start</code> 没有 <code>end</code>（子代理被杀、日志被切）＝ 不知道成没成，
+            同样不落账，并置截断位；
+          </li>
+          <li>
+            <b>空白自述不算自述。</b><code>files_touched: [" "]</code> 和
+            <code>verified: [{command: " "}]</code>
+            都不是可核对项——否则交一条空白就能换到「已核对」。
+            路径两侧空白会被裁掉再比（与命令侧同构）；
+          </li>
+          <li>
+            <b>复合命令逐段核对。</b
+            ><code>ls &amp;&amp; pnpm test</code> 的每一段都要在收据里找到出处，
+            任一段缺失就标——不然跑个 <code>ls</code> 就能声称三个命令都跑过。段可以来自不同的 bash
+            调用；
+          </li>
+          <li>
             两处上限（路径留前 20、命令留最近 20）撞到时置 <code>pathsTruncated</code> /
-            <code>commandsTruncated</code>，<b>截断就不判「对不上」</b>——丢的是证据，不是罪证；
+            <code>commandsTruncated</code>，<b>截断就不判「对不上」</b>——丢的是证据，不是罪证。
+            但那一维<b>有自述</b>时判词也不盖章（<code>receiptGap</code>），否则「先攒满 20
+            条收据，再随便写」是一条洗白通道；
           </li>
           <li>
             <code>bash</code>/<code>sed</code> 改的文件进不了收据（没有 <code>args.path</code>），

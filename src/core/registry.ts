@@ -56,6 +56,8 @@ export type TaskCommand =
       unverified?: boolean;
       /** 谎报自检（声称的命令一条都没观测到） */
       verifyUnverified?: boolean;
+      /** 收据被上限截断（那一维没法对质，判词不给盖章） */
+      receiptTruncated?: boolean;
       /** assessment 空转（小窗资格粗筛） */
       vacuous?: boolean;
       /** 改动自述只对上一部分（0 < matched < claimed） */
@@ -118,9 +120,17 @@ export function applyAttachBudget(
   return { record: next, fromStatus: current.status, changed: true };
 }
 
-/** 成功终态才带判词：退出码 0 也要说清交付有没有实测支撑，两件事分开记。 */
-function deliverablePatch(current: TaskRecord, to: TaskStatus): Partial<TaskRecord> {
-  return to === "succeeded" ? { deliverable: deliverableOf(current) } : {};
+/**
+ * 终态都带判词：退出码 0 也要说清交付有没有实测支撑，两件事分开记。
+ * failed / canceled 同样要判——「没有交付」本身就是一条判词（通常是 absent），
+ * 父方看到「failed + absent」就知道这单既没成功也没交东西，而不是对着 undefined 猜。
+ *
+ * 正文窗口大小仍由判词决定（src/index.ts 的 hasReliableReport），这里不动：
+ * failed 任务的正文通常为空，空正文压根不会触发截断；
+ * 「失败但正文很长」说明它跑了很久、产了内容、最后才失败——那种情况给全文是合理的。
+ */
+function deliverablePatch(current: TaskRecord): Partial<TaskRecord> {
+  return { deliverable: deliverableOf(current) };
 }
 
 /**
@@ -140,7 +150,7 @@ export function applyResolveExit(
       // 孩子已经成功退出（退出码 0）时 stop 来晚了：记 succeeded，不是 canceled
       to,
       patch: {
-        ...deliverablePatch(current, to),
+        ...deliverablePatch(current),
         ...(command.notStarted ? { startedAt: undefined } : {}),
         // 叫停过也要记真实退出码：孩子确实以 143 退出的，账上不该回落 -1
         exitCode: command.exitCode,
@@ -156,7 +166,7 @@ export function applyResolveExit(
       to: command.exitCode === 0 ? "succeeded" : "failed",
       patch: {
         // 判词跟同一条退出码判据走：只有 succeeded 才带（别的终态没有「交付」可言）
-        ...deliverablePatch(current, command.exitCode === 0 ? "succeeded" : "failed"),
+        ...deliverablePatch(current),
         // 孩子压根没起（建 worktree 失败 / 等名额被叫停）：startedAt 要清——
         // 记录里 startedAt 有值必须恒等于「孩子真起过」。
         ...(command.notStarted ? { startedAt: undefined } : {}),
@@ -304,6 +314,7 @@ export class TaskRegistry {
           cache: command.cache ?? current.cache,
           ...(command.unverified ? { deliveryUnverified: true } : {}),
           ...(command.verifyUnverified ? { verifyUnverified: true } : {}),
+          ...(command.receiptTruncated ? { receiptTruncated: true } : {}),
           ...(command.vacuous ? { assessmentVacuous: true } : {}),
           ...(command.deliveryPartial ? { deliveryPartial: command.deliveryPartial } : {}),
           ...(command.verifyPartial ? { verifyPartial: command.verifyPartial } : {}),
@@ -375,6 +386,10 @@ export class TaskRegistry {
       startedAt:
         "startedAt" in patch ? patch.startedAt : to === "running" ? Date.now() : current.startedAt,
       finishedAt: isTerminal(to) ? Date.now() : current.finishedAt,
+      // 判词对所有终态都落账，统一在这里兜：不然「同是终态」有的有判词有的没有
+      // （走 resolve-exit 的有、走 cancel-queued / reconcile-lost / 直接 transition 的没有），
+      // 判词轴就成了半截的。已由 patch 算好的（resolve-exit）不覆盖。
+      ...(isTerminal(to) && !("deliverable" in patch) ? deliverablePatch(current) : {}),
     };
     this.#records.set(id, next);
     this.#emit(next, current);

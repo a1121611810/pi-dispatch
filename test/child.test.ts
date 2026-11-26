@@ -53,6 +53,7 @@ import {
   extractReportFromText,
   parseChildStream,
   pathMatches,
+  receiptGap,
   spawnChild,
   normalizeReport,
   supportsNoMcp,
@@ -344,11 +345,84 @@ test("收件：读不算改过——read/grep 的 path 不进收据，bash 的�
   assert.deepEqual(parsed.delivery.paths, [], "read 的 path 不算改动");
   assert.equal((parsed.delivery.paths as string[]).filter((p) => p.includes("grep")).length, 0);
   const mixed = [
-    '{"type":"tool_execution_start","toolName":"read","args":{"path":"/a"}}',
-    '{"type":"tool_execution_start","toolName":"edit","args":{"path":"/b"}}',
-    '{"type":"tool_execution_start","toolName":"write","args":{"path":"/c"}}',
+    '{"type":"tool_execution_start","toolCallId":"c1","toolName":"read","args":{"path":"/a"}}',
+    '{"type":"tool_execution_end","toolCallId":"c1","toolName":"read","isError":false}',
+    '{"type":"tool_execution_start","toolCallId":"c2","toolName":"edit","args":{"path":"/b"}}',
+    '{"type":"tool_execution_end","toolCallId":"c2","toolName":"edit","isError":false}',
+    '{"type":"tool_execution_start","toolCallId":"c3","toolName":"write","args":{"path":"/c"}}',
+    '{"type":"tool_execution_end","toolCallId":"c3","toolName":"write","isError":false}',
   ].join("\n");
   assert.deepEqual(parseChildStream(mixed).delivery.paths, ["/b", "/c"], "只有写类工具算改过");
+});
+
+test("收件：失败的工具调用不算碰过（5 次全失败的 edit 也换不到自述对上）", () => {
+  // 路径在 start 时暂存、end 且没报错才落进收据：失败的那次没改到任何东西。
+  // 之前是在 start 就落——5 次全失败的 edit 也算「碰过 5 个文件」，
+  // 孩子照着自述写一遍就能换到「已核对」（实测可达）。
+  const lines: string[] = [];
+  for (let i = 0; i < 5; i++) {
+    lines.push(
+      `{"type":"tool_execution_start","toolCallId":"f${i}","toolName":"edit","args":{"path":"/nope${i}"}}`,
+    );
+    lines.push(
+      `{"type":"tool_execution_end","toolCallId":"f${i}","toolName":"edit","isError":true}`,
+    );
+  }
+  const parsed = parseChildStream(lines.join("\n"));
+  assert.deepEqual(parsed.delivery.paths, [], "失败的不算改过");
+  assert.equal(parsed.delivery.errors, 5);
+  // 判词看的是引擎算好的旗标，不是收据本身——这里把旗标也一起算出来
+  const unverified = deliveryUnverified(
+    { summary: "s", why: "", assessment: "", files_touched: ["/nope0"] },
+    parsed.delivery,
+  );
+  assert.equal(unverified, true, "自述说改了，但那次编辑失败了 ⇒ 没有实测支撑");
+  assert.equal(
+    deliverableOf({
+      report: { summary: "s", why: "", assessment: "", files_touched: ["/nope0"] },
+      delivery: parsed.delivery,
+      deliveryUnverified: unverified,
+    }),
+    "unverified",
+  );
+});
+
+test("收件：失败的命令不算兑现（跑挂的 pnpm test 换不到 verified）", () => {
+  // 命令侧原先是 start 就记：跑挂的 `pnpm test` 也算「跑过」，
+  // 于是声称 `exitCode: 0` 照样拿到「已核对」（实测可达）。
+  // 现在与路径侧同构：end 且不报错才算兑现。
+  const stream = [
+    '{"type":"tool_execution_start","toolCallId":"bf1","toolName":"bash","args":{"command":"pnpm test"}}',
+    '{"type":"tool_execution_end","toolCallId":"bf1","toolName":"bash","isError":true}',
+  ].join("\n");
+  const parsed = parseChildStream(stream);
+  assert.deepEqual(parsed.delivery.commands, [], "跑挂的不算跑过");
+  assert.equal(parsed.delivery.errors, 1);
+  const report = { summary: "s", why: "", assessment: "", verified: [{ command: "pnpm test" }] };
+  assert.equal(
+    verifyUnverified(report, parsed.delivery),
+    true,
+    "声称跑了，但那次跑挂了 ⇒ 没有实测支撑",
+  );
+});
+
+test("收件：成功的命令照记（失败才不算，别把好的一起砍了）", () => {
+  const stream = [
+    '{"type":"tool_execution_start","toolCallId":"bs1","toolName":"bash","args":{"command":"pnpm test"}}',
+    '{"type":"tool_execution_end","toolCallId":"bs1","toolName":"bash","isError":false}',
+  ].join("\n");
+  assert.deepEqual(parseChildStream(stream).delivery.commands, ["pnpm test"]);
+});
+
+test("收件：没有 end 的调用不算碰过（流被截断，不知道成没成）", () => {
+  // pi 每次 tool_execution_start 都有配对的 end（成功或失败都发）；
+  // 只有流被截断（子代理被杀、输出文件被切）才会缺 end。
+  // 那种情况下不知道成没成 ⇒ 不记路径（宁漏勿冤），也不能算碰过。
+  const stream =
+    '{"type":"tool_execution_start","toolCallId":"x1","toolName":"edit","args":{"path":"/a"}}';
+  const parsed = parseChildStream(stream);
+  assert.deepEqual(parsed.delivery.paths, [], "配不上 end 就不记");
+  assert.equal(parsed.delivery.errors, 0, "没有 end 就没有失败可数");
 });
 
 test("收件：工具出错要计数", () => {
@@ -713,17 +787,44 @@ test("收件：同一工具调多次要累加次数", () => {
 
 test("收件：路径去重（同一路径只记一次）", () => {
   const stream = [
-    '{"type":"tool_execution_start","toolName":"edit","args":{"path":"/a"}}',
-    '{"type":"tool_execution_start","toolName":"edit","args":{"path":"/a"}}',
-    '{"type":"tool_execution_start","toolName":"edit","args":{"path":"/b"}}',
+    '{"type":"tool_execution_start","toolCallId":"d1","toolName":"edit","args":{"path":"/a"}}',
+    '{"type":"tool_execution_end","toolCallId":"d1","toolName":"edit","isError":false}',
+    '{"type":"tool_execution_start","toolCallId":"d2","toolName":"edit","args":{"path":"/a"}}',
+    '{"type":"tool_execution_end","toolCallId":"d2","toolName":"edit","isError":false}',
+    '{"type":"tool_execution_start","toolCallId":"d3","toolName":"edit","args":{"path":"/b"}}',
+    '{"type":"tool_execution_end","toolCallId":"d3","toolName":"edit","isError":false}',
   ].join("\n");
   assert.deepEqual(parseChildStream(stream).delivery.paths, ["/a", "/b"]);
+});
+
+test("收件：自述路径两侧空白不影响对质（命令侧 trim，路径侧也要）", () => {
+  // 命令走 normalizeCommand 会 trim，路径侧原先不 trim ⇒
+  // `files_touched: [" /a.ts "]` 配收据 `/a.ts` 永远对不上，冤枉诚实孩子。
+  const delivery = { tools: {}, paths: ["/a.ts"], commands: [], errors: 0, textChars: 10 };
+  const report = { summary: "s", why: "", assessment: "", files_touched: [" /a.ts "] };
+  assert.equal(deliveryUnverified(report, delivery), false, "两侧空白不该影响");
+});
+
+test("收件：只有 start 没有 end ⇒ 置截断位（证据丢了，不是没做过）", () => {
+  // 子代理被杀 / 日志被切时，在飞的那次调用只剩 start。
+  // 那是「不知道成没成」，不是「没做过」——置截断位让判词按「没法对质」处理，
+  // 别把诚实孩子判成「没有实测支撑」。
+  const stream =
+    '{"type":"tool_execution_start","toolCallId":"k1","toolName":"edit","args":{"path":"/a"}}';
+  const delivery = parseChildStream(stream).delivery;
+  assert.equal(delivery.pathsTruncated, true);
+  assert.equal(delivery.commandsTruncated, true);
 });
 
 test("收件：路径清单有上限（超出的不记，但记下截断过）", () => {
   const lines: string[] = [];
   for (let i = 0; i < 30; i++) {
-    lines.push(`{"type":"tool_execution_start","toolName":"edit","args":{"path":"/p${i}"}}`);
+    lines.push(
+      `{"type":"tool_execution_start","toolCallId":"p${i}","toolName":"edit","args":{"path":"/p${i}"}}`,
+    );
+    lines.push(
+      `{"type":"tool_execution_end","toolCallId":"p${i}","toolName":"edit","isError":false}`,
+    );
   }
   const delivery = parseChildStream(lines.join("\n")).delivery;
   assert.equal(delivery.paths.length, 20, "路径清单上限 20");
@@ -733,7 +834,12 @@ test("收件：路径清单有上限（超出的不记，但记下截断过）",
 test("收件：命令清单留最近 20 条，丢过就记下截断", () => {
   const lines: string[] = [];
   for (let i = 0; i < 21; i++) {
-    lines.push(`{"type":"tool_execution_start","toolName":"bash","args":{"command":"cmd${i}"}}`);
+    lines.push(
+      `{"type":"tool_execution_start","toolCallId":"c${i}","toolName":"bash","args":{"command":"cmd${i}"}}`,
+    );
+    lines.push(
+      `{"type":"tool_execution_end","toolCallId":"c${i}","toolName":"bash","isError":false}`,
+    );
   }
   const delivery = parseChildStream(lines.join("\n")).delivery;
   assert.equal(delivery.commands.length, 20, "只留最近 20 条");
@@ -743,10 +849,14 @@ test("收件：命令清单留最近 20 条，丢过就记下截断", () => {
 
 test("收件：args 不是对象或 path 不是字符串时不记路径", () => {
   const stream = [
-    '{"type":"tool_execution_start","toolName":"edit"}',
-    '{"type":"tool_execution_start","toolName":"edit","args":{}}',
-    '{"type":"tool_execution_start","toolName":"edit","args":{"path":123}}',
-    '{"type":"tool_execution_start","toolName":"edit","args":{"path":""}}',
+    '{"type":"tool_execution_start","toolCallId":"n1","toolName":"edit"}',
+    '{"type":"tool_execution_end","toolCallId":"n1","toolName":"edit","isError":false}',
+    '{"type":"tool_execution_start","toolCallId":"n2","toolName":"edit","args":{}}',
+    '{"type":"tool_execution_end","toolCallId":"n2","toolName":"edit","isError":false}',
+    '{"type":"tool_execution_start","toolCallId":"n3","toolName":"edit","args":{"path":123}}',
+    '{"type":"tool_execution_end","toolCallId":"n3","toolName":"edit","isError":false}',
+    '{"type":"tool_execution_start","toolCallId":"n4","toolName":"edit","args":{"path":""}}',
+    '{"type":"tool_execution_end","toolCallId":"n4","toolName":"edit","isError":false}',
   ].join("\n");
   assert.deepEqual(parseChildStream(stream).delivery.paths, []);
 });
@@ -775,9 +885,12 @@ test("收件：bash 命令进收据（真机样本）", () => {
 
 test("收件：命令去重（同一命令只记一次）", () => {
   const stream = [
-    '{"type":"tool_execution_start","toolName":"bash","args":{"command":"pnpm test"}}',
-    '{"type":"tool_execution_start","toolName":"bash","args":{"command":"pnpm test"}}',
-    '{"type":"tool_execution_start","toolName":"bash","args":{"command":"tsc"}}',
+    '{"type":"tool_execution_start","toolCallId":"g1","toolName":"bash","args":{"command":"pnpm test"}}',
+    '{"type":"tool_execution_end","toolCallId":"g1","toolName":"bash","isError":false}',
+    '{"type":"tool_execution_start","toolCallId":"g2","toolName":"bash","args":{"command":"pnpm test"}}',
+    '{"type":"tool_execution_end","toolCallId":"g2","toolName":"bash","isError":false}',
+    '{"type":"tool_execution_start","toolCallId":"g3","toolName":"bash","args":{"command":"tsc"}}',
+    '{"type":"tool_execution_end","toolCallId":"g3","toolName":"bash","isError":false}',
   ].join("\n");
   assert.deepEqual(parseChildStream(stream).delivery.commands, ["pnpm test", "tsc"]);
 });
@@ -785,7 +898,12 @@ test("收件：命令去重（同一命令只记一次）", () => {
 test("收件：命令清单上限——保最近 20 条（验证命令在尾部）", () => {
   const lines: string[] = [];
   for (let i = 0; i < 25; i++) {
-    lines.push(`{"type":"tool_execution_start","toolName":"bash","args":{"command":"cmd${i}"}}`);
+    lines.push(
+      `{"type":"tool_execution_start","toolCallId":"h${i}","toolName":"bash","args":{"command":"cmd${i}"}}`,
+    );
+    lines.push(
+      `{"type":"tool_execution_end","toolCallId":"h${i}","toolName":"bash","isError":false}`,
+    );
   }
   const commands = parseChildStream(lines.join("\n")).delivery.commands;
   assert.equal(commands.length, 20, "命令清单上限 20");
@@ -810,7 +928,10 @@ test("收件：command 缺失或不是字符串时不记", () => {
 
 test("收件：超长命令截尾（600 → 500+…）", () => {
   const long = "x".repeat(600);
-  const stream = `{"type":"tool_execution_start","toolName":"bash","args":{"command":"${long}"}}`;
+  const stream = [
+    `{"type":"tool_execution_start","toolCallId":"l1","toolName":"bash","args":{"command":"${long}"}}`,
+    '{"type":"tool_execution_end","toolCallId":"l1","toolName":"bash","isError":false}',
+  ].join("\n");
   const commands = parseChildStream(stream).delivery.commands;
   assert.equal(commands[0]!.length, 501, "500 字符 + 省略号");
   assert.ok(commands[0]!.endsWith("…"));
@@ -818,7 +939,10 @@ test("收件：超长命令截尾（600 → 500+…）", () => {
 
 test("收件：命令正好 500 字符不截尾——阈值是「超过」不是「达到」", () => {
   const exact = "x".repeat(500);
-  const stream = `{"type":"tool_execution_start","toolName":"bash","args":{"command":"${exact}"}}`;
+  const stream = [
+    `{"type":"tool_execution_start","toolCallId":"x1","toolName":"bash","args":{"command":"${exact}"}}`,
+    '{"type":"tool_execution_end","toolCallId":"x1","toolName":"bash","isError":false}',
+  ].join("\n");
   const commands = parseChildStream(stream).delivery.commands;
   assert.equal(commands.length, 1);
   assert.equal(commands[0], exact, "500 字符原样记串");
@@ -1132,6 +1256,88 @@ test("交付判词：五档全钉住", () => {
   );
 });
 
+test("交付判词：收据缺口按「那一维有自述」算", () => {
+  // receiptGap 是判词、引擎、通知三处共用的唯一口径。
+  // 拿裸 OR 当缺口 ⇒ 没交报告的任务被说成「收据超出上限」（实测误归因）。
+  const delivery = {
+    tools: {},
+    paths: [],
+    commands: [],
+    errors: 0,
+    textChars: 10,
+    commandsTruncated: true as const,
+  };
+  const bare = { summary: "s", why: "", assessment: "" };
+  assert.equal(receiptGap(bare, delivery), false, "那一维没有自述 ⇒ 谈不上没法核");
+  assert.equal(
+    receiptGap({ ...bare, verified: [{ command: "pnpm test" }] }, delivery),
+    true,
+    "有自述又截断 ⇒ 真的没法核",
+  );
+  assert.equal(receiptGap(bare, undefined), false, "没有收据就没有缺口");
+});
+
+test("交付判词：没有收据就不给盖章（导出函数自己兜住）", () => {
+  // 引擎路径上 delivery 永远有值（parseChildStream 总返回对象），所以这是防御性的。
+  // 但 deliverableOf 是导出函数，别指望调用方一定传。
+  assert.equal(
+    deliverableOf({ report: { summary: "s", why: "", assessment: "", files_touched: ["/a"] } }),
+    "unverified",
+    "没有收据就没法对质，不能凭自述给「已核对」",
+  );
+});
+
+test("交付判词：改了文件但没写正文 ⇒ 不是空跑", () => {
+  // absent 的意思是「什么都没交」。之前只看正文（textChars===0），
+  // 于是「改了文件、没写正文」的孩子被判成空跑——它明明动过手。
+  const delivery = { tools: { edit: 1 }, paths: ["/a.ts"], commands: [], errors: 0, textChars: 0 };
+  assert.equal(
+    deliverableOf({ delivery }),
+    "unverified",
+    "动过手但没交报告 ⇒ unverified，不是 absent",
+  );
+  assert.equal(
+    deliverableOf({ delivery: { ...delivery, paths: [] } }),
+    "absent",
+    "什么都没动也没交 ⇒ 才是空跑",
+  );
+});
+
+test("交付判词：空白自述不算自述（换不到「已核对」）", () => {
+  // 之前声称数按原始 length 数，而对质/覆盖度那边按过滤后的口径数——
+  // 两边口径不一致，于是孩子交一条空白命令就能换到「已核对」（实测可达）。
+  // 路径侧当时完全没过滤：`files_touched: ["  "]` 是同一个洞的另一个入口。
+  const empty = { tools: {}, paths: [], commands: [], errors: 0, textChars: 10 };
+  const report = { summary: "s", why: "", assessment: "" };
+  assert.equal(
+    deliverableOf({ report: { ...report, verified: [{ command: "   " }] }, delivery: empty }),
+    "unclaimed",
+    "空白命令不算自述",
+  );
+  assert.equal(
+    deliverableOf({ report: { ...report, files_touched: ["  "] }, delivery: empty }),
+    "unclaimed",
+    "空白路径不算自述",
+  );
+  assert.equal(
+    deliverableOf({
+      report: { ...report, verified: [{ command: "" }] },
+      delivery: empty,
+    }),
+    "unclaimed",
+    "空字符串同样不算",
+  );
+  // 截断判定也按过滤后的口径：一条空白自述不该白扣一档降级
+  assert.equal(
+    deliverableOf({
+      report: { ...report, verified: [{ command: "   " }] },
+      delivery: { ...empty, commandsTruncated: true },
+    }),
+    "unclaimed",
+    "空白自述 + 命令收据截断 ⇒ 该维没有自述，不降级",
+  );
+});
+
 // ── 自检对质：声称的命令 vs 收据的命令 ──────────────────────────────────
 
 /** 对质组的公共收据形状：只有 commands 变化。 */
@@ -1213,14 +1419,42 @@ test("自检对质：空白差异归一后命中", () => {
 });
 
 test("自检对质：双向 contains——长声称对短观测也命中", () => {
+  // 单段命令：观测是声称的子串就算命中（token 级前缀容忍）。
   const report = {
     summary: "s",
     why: "",
     assessment: "",
-    verified: [{ command: "cd src && pnpm test --filter core" }],
+    verified: [{ command: "pnpm test --filter core" }],
   };
   const delivery = cmdDelivery(["pnpm test"]);
   assert.equal(verifyUnverified(report, delivery), false, "观测是声称的子串也认");
+});
+
+test("自检对质：复合声称的每一段都要有出处（只跑一段不能洗白整条）", () => {
+  // 「ls && pnpm test && pnpm lint」声称跑了三个命令，收据里只有 ls：
+  // 之前是「任一段命中即算整条对上」⇒ 孩子靠跑 ls 就能换到「已核对」（实测可达）。
+  // 现在每段都要各自有出处；段可以来自不同的 bash 调用。
+  const report = {
+    summary: "s",
+    why: "",
+    assessment: "",
+    verified: [{ command: "ls && pnpm test && pnpm lint" }],
+  };
+  assert.equal(
+    verifyUnverified(report, cmdDelivery(["ls"])),
+    true,
+    "只观测到一段 ⇒ 亮旗（没有实测支撑）",
+  );
+  assert.equal(
+    verifyUnverified(report, cmdDelivery(["ls", "pnpm test", "pnpm lint"])),
+    false,
+    "三段都观测到 ⇒ 不亮旗",
+  );
+  assert.equal(
+    verifyUnverified(report, cmdDelivery(["ls && pnpm test && pnpm lint"])),
+    false,
+    "一条 bash 里跑完整串也算",
+  );
 });
 
 test("自检对质：截尾省略号当通配——声称与观测在不同边界截断仍咬合", () => {
@@ -1780,8 +2014,15 @@ test("收据：黑板写带上 args.command 也不进 commands", () => {
   const stream = [
     JSON.stringify({
       type: "tool_execution_start",
+      toolCallId: "bb1",
       toolName: "blackboard_write",
       args: { text: "留言", command: "rm -rf /" },
+    }),
+    JSON.stringify({
+      type: "tool_execution_end",
+      toolCallId: "bb1",
+      toolName: "blackboard_write",
+      isError: false,
     }),
   ].join("\n");
   const parsed = parseChildStream(stream);

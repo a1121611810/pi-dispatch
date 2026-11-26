@@ -279,6 +279,8 @@ export interface TaskRecord {
   deliveryUnverified?: boolean;
   /** 谎报自检被抓：声称跑过的命令，收据里一条都没观测到 */
   verifyUnverified?: boolean;
+  /** 收据被上限截断：那一维没法对质，判词因此不给盖章 */
+  receiptTruncated?: boolean;
   /** assessment 空转（缺/过短/全正面）——小窗资格粗筛结果，信任只走记账规则 */
   assessmentVacuous?: boolean;
   /** 交付判词：退出码之外的第二条轴，定终态时算一次 */
@@ -340,6 +342,8 @@ export interface DispatchResult {
   deliveryUnverified?: boolean;
   /** 谎报自检被抓：声称跑过的命令，收据里一条都没观测到 */
   verifyUnverified?: boolean;
+  /** 收据被上限截断：那一维没法对质，判词因此不给盖章 */
+  receiptTruncated?: boolean;
   /** assessment 空转（缺/过短/全正面）——小窗资格粗筛结果，信任只走记账规则 */
   assessmentVacuous?: boolean;
   /** 交付判词：退出码之外的第二条轴 */
