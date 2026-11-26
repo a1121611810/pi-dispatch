@@ -2,12 +2,15 @@
 // 每条用例都写明「实现写错时它凭什么红」——判词链是这一层的全部价值。
 //
 // ── 变异测试（`mutator --no-coverage --mutate-all src/audit`）───────────
-// 当前：350 个位点，杀掉 252，**幸存 98**，0 超时。**不是零幸存**——这是明账。
+// 当前：350 个位点，杀掉 254，**幸存 96**，0 超时。**不是零幸存**——这是明账。
 // 按类：`?? -> ||` 22、`&& -> ||` 17、`0 -> 1` 15、`=== -> !==` 7、`>= -> >` 6、`true -> false` 6。
 //
-// 能证死的等价类：`?? -> ||` 的前提是左值只可能是 `string | undefined`（`str()`
-// 把空串也映射成 undefined）或 `RegExpExecArray.index`（只可能 0 或正数，没有
-// NaN），这两种情况下 `??` 与 `||` 外延相等。
+// 能证死的等价类（两条，都不是猜的）：
+//   1. `str(x) ?? y`：`str()` 只返回非空字符串或 undefined（空串已被它映射成
+//      undefined），所以 `??` 与 `||` 外延相等；
+//   2. `m.index ?? 0`：`matchAll` 的 `index` 一定是 number，`?? 1` 那条变异只在
+//      「index 为 undefined」时才有差别，而这个前提不可达。
+// 这两类占幸存者的大头，但我**没有**逐条对着夹具验证剩下的，全按欠账记。
 // 其余没有逐个证明，记成欠账——别当已经绿了。
 // 已经钉死的边界：否定辖域 12 字端点、路径去重、两维窗口方向、命中两分支、
 // 空命令自述、分词器的「命令 vs 路径」优先、字段缺省分支。
@@ -495,4 +498,21 @@ test("形状：一次完整审计的结果逐字段相等", () => {
     truncated: false,
     notes: [],
   });
+});
+
+test("抽取：动词跨小句继续生效（同一句子内）", () => {
+  // 「改了代码，`src/a.ts`」——动词在前一小句，路径在后一小句，仍算改动自述。
+  assert.deepEqual(extractClaims("改了代码，`src/a.ts`。").paths, ["src/a.ts"]);
+});
+
+test("抽取：动词不跨句子生效", () => {
+  // 「改了代码。`src/a.ts` 在那。」——句号之后重新起算，不能借上一句的动词。
+  assert.deepEqual(extractClaims("改了代码。`src/a.ts` 在那。").paths, []);
+});
+
+test("抽取：两个完成词各自绑定", () => {
+  const claims = extractClaims("`pnpm lint` 通过，`pnpm test` 通过，已修复。");
+  assert.equal(claims.commands.length, 2);
+  assert.equal(claims.vagueBindings.length, 1, "「已修复」只绑最近的一条");
+  assert.equal(claims.vagueBindings[0], 1);
 });
