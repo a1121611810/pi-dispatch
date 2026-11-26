@@ -1477,3 +1477,66 @@ test("codex：cwd 取第一条 session_meta，后面的不覆盖", () => {
     { kind: "meta", cwd: "/a" },
   );
 });
+
+test("codex：final_answer 不是最后一条时，报告仍取它", () => {
+  const result = normalizeCodex([
+    JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: { type: "AgentMessage", text: "终稿", phase: "final_answer" },
+      },
+    }),
+    JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "中间" }],
+      },
+    }),
+  ]);
+  assert.equal(result.report, "终稿");
+});
+
+test("codex：event_msg 信封里的 message 不当角色消息", () => {
+  const result = normalizeCodex([
+    JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "X" }],
+      },
+    }),
+  ]);
+  assert.deepEqual(result.events, []);
+});
+
+test("claude：assistant 记录里的 tool_result 不配对", () => {
+  const result = normalizeClaude([
+    JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "tool_use", id: "a", name: "Bash", input: { command: "ls" } }] },
+    }),
+    JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "tool_result", tool_use_id: "a", content: "Exit code 0" }] },
+    }),
+  ]);
+  assert.deepEqual(result.events, []);
+});
+
+test("claude：缺 id 的 tool_use 不参与配对", () => {
+  const result = normalizeClaude([
+    JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "tool_use", name: "Bash", input: { command: "ls" } }] },
+    }),
+    JSON.stringify({
+      type: "user",
+      message: { content: [{ type: "tool_result", content: "Exit code 0" }] },
+    }),
+  ]);
+  assert.deepEqual(result.events, []);
+});

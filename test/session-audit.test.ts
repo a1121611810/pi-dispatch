@@ -2,7 +2,7 @@
 // 每条用例都写明「实现写错时它凭什么红」——判词链是这一层的全部价值。
 //
 // ── 变异测试（`mutator --no-coverage --mutate-all src/audit`）───────────
-// 当前：350 个位点，杀掉 294，**幸存 56**（41 条给了等价推导，15 条未证；见 docs/audit-mutation.md）
+// 当前：350 个位点，杀掉 299，**幸存 51**（41 条给了等价推导，10 条未证；见 docs/audit-mutation.md）
 // 按类：`?? -> ||` 22、`&& -> ||` 17、`0 -> 1` 15、`=== -> !==` 7、`>= -> >` 6、`true -> false` 6。
 //
 // 能证死的等价类（两条，都不是猜的）：
@@ -698,4 +698,14 @@ test("非字符串路径不进收据、也不崩", () => {
     "改了 `src/a.ts`。",
   );
   assert.deepEqual(result.receipts.paths, ["src/a.ts"]);
+});
+
+test("失败类自述命中「跑过但失败」的收据 ⇒ verified", () => {
+  // wantOk=false 的路径：自述「失败了」，收据 exitCode 1 —— 对得上。
+  assert.equal(audit([bash("pnpm test", 1)], "`pnpm test` 失败了。").deliverable, "verified");
+});
+
+test("收据里的换行不拆成两条命令（否则会假装命中）", () => {
+  const result = audit([bash("pnpm test\npnpm lint", 0)], "`pnpm test` 跑通了。");
+  assert.equal(result.deliverable, "unverified");
 });
