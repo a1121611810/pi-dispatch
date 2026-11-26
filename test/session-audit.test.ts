@@ -2,7 +2,7 @@
 // 每条用例都写明「实现写错时它凭什么红」——判词链是这一层的全部价值。
 //
 // ── 变异测试（`mutator --no-coverage --mutate-all src/audit`）───────────
-// 当前：350 个位点，杀掉 282，**幸存 68**（逐条判定见 docs/audit-mutation.md），0 超时。**不是零幸存**——这是明账。
+// 当前：350 个位点，杀掉 288，**幸存 62**（41 条给了等价推导，21 条未证；见 docs/audit-mutation.md）
 // 按类：`?? -> ||` 22、`&& -> ||` 17、`0 -> 1` 15、`=== -> !==` 7、`>= -> >` 6、`true -> false` 6。
 //
 // 能证死的等价类（两条，都不是猜的）：
@@ -661,4 +661,41 @@ test("句点+空格也是句子边界（动词不跨过去）", () => {
 
 test("反引号里的逗号不切小句", () => {
   assert.deepEqual(extractClaims("改了 `a,b/c.ts`").paths, ["a,b/c.ts"]);
+});
+
+test("否定辖域不跨小句（半角逗号也是边界）", () => {
+  // 句子里有逗号：前一小句否定，后一小句是独立断言。
+  assert.deepEqual(extractClaims("没有改动,改了 `src/a.ts`").paths, ["src/a.ts"]);
+  assert.deepEqual(extractClaims("没有改动，改了 `src/a.ts`").paths, ["src/a.ts"]);
+});
+
+test("否定辖域不跨小句（动词也一样）", () => {
+  assert.deepEqual(extractClaims("没有读 `src/a.ts`").paths, []);
+});
+
+test("「完成」在句首也算完成词", () => {
+  assert.deepEqual(extractClaims("完成修复。").vagueBindings, [null]);
+});
+
+test("说了「没跑」的命令不当完成词的绑定目标", () => {
+  assert.deepEqual(extractClaims("没跑 `pnpm test`，已修复。").vagueBindings, [null]);
+});
+
+test("被否定的读动词不建立读取上下文（路径在辖域外）", () => {
+  // 「读」在否定辖域内（被跳过），路径在 12 字之外（不被否定）；
+  // 两个位置分开，才能区分「跳过动词」和「保留动词」。
+  const text = "没有读" + "x".repeat(9) + " `src/a.ts`";
+  assert.deepEqual(extractClaims(text).paths, []);
+});
+
+test("非字符串路径不进收据、也不崩", () => {
+  const result = audit(
+    [
+      { kind: "tool", name: "write", input: { path: 123 as unknown as string } },
+      { kind: "tool", name: "write", input: { path: "" } },
+      { kind: "tool", name: "write", input: { path: "src/a.ts" } },
+    ],
+    "改了 `src/a.ts`。",
+  );
+  assert.deepEqual(result.receipts.paths, ["src/a.ts"]);
 });
