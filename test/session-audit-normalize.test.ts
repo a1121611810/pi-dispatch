@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { normalizeClaude, normalizeCodex, unwrapShell } from "../src/audit/index.ts";
+import { audit, normalizeClaude, normalizeCodex, unwrapShell } from "../src/audit/index.ts";
 import type { SessionEvent } from "../src/audit/index.ts";
 
 const fixture = (name: string): string[] =>
@@ -219,6 +219,64 @@ test("claude：侧链的写不算主链收据", () => {
     }),
   ];
   assert.equal(writeOf(normalizeClaude(lines).events).length, 0);
+});
+
+test("跨流：同一份任务在 codex 与 claude 两条流上判词相同", () => {
+  // 验收第 3 条。两份夹具是**同一次任务**的两种形状（手工按真机形状写的）：
+  // 一条 `pnpm test`、一次写 `src/a.ts`、一句「改了 src/a.ts，pnpm test 跑通了」。
+  const codexLines = [
+    JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "exec_command",
+        call_id: "call_1",
+        arguments: '{"cmd":"pnpm test"}',
+      },
+    }),
+    JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: {
+          type: "CommandExecution",
+          id: "call_1",
+          command: ["/bin/zsh", "-lc", "pnpm test"],
+          exit_code: 0,
+        },
+      },
+    }),
+    JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: { type: "FileChange", changes: { "/repo/src/a.ts": { type: "add" } } },
+      },
+    }),
+    JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "改了 `src/a.ts`，`pnpm test` 跑通了。" }],
+      },
+    }),
+  ];
+  const claudeLines = [
+    claudeLine("assistant", [
+      { type: "tool_use", id: "t1", name: "Edit", input: { file_path: "/repo/src/a.ts" } },
+      { type: "tool_use", id: "t2", name: "Bash", input: { command: "pnpm test" } },
+    ]),
+    claudeLine("user", [
+      { type: "tool_result", tool_use_id: "t1", content: "ok" },
+      { type: "tool_result", tool_use_id: "t2", content: "Exit code 0\nall pass" },
+    ]),
+    claudeLine("assistant", [{ type: "text", text: "改了 `src/a.ts`，`pnpm test` 跑通了。" }]),
+  ];
+  const a = normalizeCodex(codexLines);
+  const b = normalizeClaude(claudeLines);
+  assert.equal(audit(a.events, a.report).deliverable, audit(b.events, b.report).deliverable);
+  assert.equal(audit(a.events, a.report).deliverable, "verified");
 });
 
 test("claude：非 Bash 的 result 里出现 `Exit code` 不会被当退出码", () => {
