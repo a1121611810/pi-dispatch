@@ -1005,3 +1005,131 @@ test("类型闸（表）：每个字段塞错类型都不产收据、也不崩",
     assert.equal(writeOf(result.events).length, 0, `${name} 不该产路径`);
   }
 });
+
+// ── 边界行为表：每行钉住一条规则的实际输出 ──────────────────────────────
+// 这些不是「顺手记下来的现状」，每一条都对应方案里的一条裁定：
+// 空命令不算收据、点开头的隐藏文件不算路径、侧链不算、没配对的 tool_result 丢掉、
+// `is_error` 没标记就丢、`Exit code N` 只认开头。
+
+test("codex 边界表", () => {
+  const J = JSON.stringify;
+  const cases: Array<[string[], number, string | undefined]> = [
+    // [行, 期望事件数, 期望第一个命令]
+    [
+      [
+        J({
+          type: "item.completed",
+          item: { type: "command_execution", command: ["sh", "-lc", "ls"], exit_code: 0 },
+        }),
+      ],
+      1,
+      "ls",
+    ],
+    [
+      [
+        J({
+          type: "item.completed",
+          item: { type: "command_execution", command: "", exit_code: 0 },
+        }),
+      ],
+      0,
+      undefined,
+    ],
+    [[J({ type: "item.completed", item: { type: "file_change", changes: {} } })], 0, undefined],
+    [
+      [
+        J({
+          type: "item.completed",
+          item: { type: "agent_message", text: "", phase: "final_answer" },
+        }),
+      ],
+      0,
+      undefined,
+    ],
+    [
+      [
+        J({ type: "session_meta", payload: { cwd: "/repo" } }),
+        J({ type: "item.completed", item: { type: "file_change", changes: [{ path: "/a.ts" }] } }),
+      ],
+      2,
+      undefined,
+    ],
+    [
+      [
+        J({
+          type: "item.completed",
+          item: { type: "command_execution", command: "ls", exit_code: -1 },
+        }),
+      ],
+      1,
+      "ls",
+    ],
+  ];
+  for (const [lines, count, first] of cases) {
+    const result = normalizeCodex(lines);
+    assert.equal(result.events.length, count, `事件数不对：${lines.join(" ")}`);
+    const commands = bashOf(result.events);
+    if (first === undefined) assert.equal(commands.length, 0);
+    else assert.equal(commands[0]!.input.command, first);
+  }
+});
+
+test("claude 边界表", () => {
+  const J = JSON.stringify;
+  const A = (content: unknown[], extra: Record<string, unknown> = {}): string =>
+    J({ type: "assistant", message: { content }, ...extra });
+  const U = (content: unknown[]): string => J({ type: "user", message: { content } });
+
+  // 配对的顺序不影响结果，退出码按各自的 tool_use_id 归位
+  const pair = normalizeClaude([
+    A([
+      { type: "tool_use", id: "a", name: "Bash", input: { command: "ls" } },
+      { type: "tool_use", id: "b", name: "Write", input: { file_path: "/x.ts" } },
+    ]),
+    U([
+      { type: "tool_result", tool_use_id: "b", content: "Exit code 0" },
+      { type: "tool_result", tool_use_id: "a", content: "Exit code 7" },
+    ]),
+  ]);
+  // 顺序：写盘在 tool_use 那一刻就落事件，命令要等 tool_result 配对后才落，
+  // 所以写在前、命令在后——下游 collectReceipts 不依赖顺序。
+  assert.deepEqual(pair.events, [
+    { kind: "tool", name: "write", input: { path: "/x.ts" } },
+    { kind: "tool", name: "bash", input: { command: "ls" }, exitCode: 7 },
+  ]);
+
+  // 不在写白名单里的工具（Read）不算路径；没过 is_error 也没标记的丢掉
+  const read = normalizeClaude([
+    A([{ type: "tool_use", id: "a", name: "Read", input: { file_path: "/x.ts" } }]),
+    U([{ type: "tool_result", tool_use_id: "a", content: "Exit code 0" }]),
+  ]);
+  assert.deepEqual(read.events, []);
+
+  const errored = normalizeClaude([
+    A([{ type: "tool_use", id: "a", name: "Bash", input: { command: "ls" } }]),
+    U([{ type: "tool_result", tool_use_id: "a", is_error: true }]),
+  ]);
+  assert.deepEqual(errored.events, []);
+
+  // `Exit code N` 只认输出开头：夹在中间的当普通输出，按「配对且没报错」记 0
+  const midMarker = normalizeClaude([
+    A([{ type: "tool_use", id: "a", name: "Bash", input: { command: "ls" } }]),
+    U([{ type: "tool_result", tool_use_id: "a", content: "输出\nExit code 3\ntail" }]),
+  ]);
+  assert.equal(bashOf(midMarker.events)[0]!.exitCode, 0);
+
+  // 侧链不算；没配对的 tool_result 丢掉
+  const sidechain = normalizeClaude([
+    A([{ type: "tool_use", id: "a", name: "Bash", input: { command: "ls" } }], {
+      isSidechain: true,
+    }),
+    U([{ type: "tool_result", tool_use_id: "a", content: "Exit code 0" }]),
+  ]);
+  assert.deepEqual(sidechain.events, []);
+
+  const orphan = normalizeClaude([
+    A([{ type: "tool_use", id: "a", name: "Bash", input: { command: "ls" } }]),
+    U([{ type: "tool_result", tool_use_id: "zzz", content: "Exit code 0" }]),
+  ]);
+  assert.deepEqual(orphan.events, []);
+});

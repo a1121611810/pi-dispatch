@@ -48,16 +48,8 @@ const EVENTS: SessionEvent[] = [
   { kind: "tool", name: "bash", input: { command: "pnpm lint" }, exitCode: 1 },
 ];
 
-function fingerprint(text: string): string {
-  const claims = extractClaims(text);
-  const result = audit(EVENTS, text);
-  const shape = {
-    claims,
-    verdict: result.deliverable,
-    mismatch: result.mismatch,
-    notes: result.notes,
-  };
-  const json = JSON.stringify(shape);
+function fingerprintOf(value: unknown): string {
+  const json = JSON.stringify(value);
   let hash = 2166136261 >>> 0;
   for (let i = 0; i < json.length; i++) {
     hash ^= json.charCodeAt(i);
@@ -65,6 +57,120 @@ function fingerprint(text: string): string {
   }
   return hash.toString(16);
 }
+
+function fingerprint(text: string): string {
+  const claims = extractClaims(text);
+  const result = audit(EVENTS, text);
+  return fingerprintOf({
+    claims,
+    verdict: result.deliverable,
+    mismatch: result.mismatch,
+    notes: result.notes,
+  });
+}
+
+const EXPECTED_SCENARIOS: string[] = [
+  "11f739d2",
+  "f08d2de5",
+  "8d66c386",
+  "f08d2de5",
+  "2c3fce45",
+  "26fc86ca",
+  "11f739d2",
+  "853ea80f",
+  "11f739d2",
+  "977f1081",
+  "50bb77a6",
+  "134ffabf",
+  "f08d2de5",
+  "650c9571",
+  "11f739d2",
+  "c2481c83",
+  "134ffabf",
+  "853ea80f",
+  "2c3fce45",
+  "11f739d2",
+  "5c9d879",
+  "8aa98f75",
+  "c7df25df",
+  "8aa98f75",
+  "c225e65e",
+  "d643b4c",
+  "5c9d879",
+  "91b81913",
+  "5c9d879",
+  "5d436353",
+  "b8d3602e",
+  "8eeb2c16",
+  "8aa98f75",
+  "4ac74abc",
+  "5c9d879",
+  "e846bd79",
+  "8eeb2c16",
+  "91b81913",
+  "c225e65e",
+  "5c9d879",
+  "20987048",
+  "79b82d9f",
+  "7527c17c",
+  "79b82d9f",
+  "708471a5",
+  "152e69d8",
+  "20987048",
+  "66bb72ef",
+  "20987048",
+  "20bde5bb",
+  "a61acb16",
+  "8312a4af",
+  "79b82d9f",
+  "5a389caf",
+  "20987048",
+  "af0a3db3",
+  "8312a4af",
+  "66bb72ef",
+  "708471a5",
+  "20987048",
+  "d6efcb8e",
+  "4213a350",
+  "5806b89d",
+  "4213a350",
+  "f919fde",
+  "6bc73052",
+  "d6efcb8e",
+  "cb7648f6",
+  "d6efcb8e",
+  "1e49a558",
+  "b54c98ef",
+  "b0ea11d2",
+  "4213a350",
+  "c375c3b4",
+  "d6efcb8e",
+  "d55cc066",
+  "b0ea11d2",
+  "cb7648f6",
+  "f919fde",
+  "d6efcb8e",
+  "b9d70d46",
+  "6689a21",
+  "f125741c",
+  "6689a21",
+  "32a84375",
+  "4ae202f",
+  "b9d70d46",
+  "19aa13bd",
+  "b9d70d46",
+  "631a401f",
+  "103d4712",
+  "e807de0a",
+  "6689a21",
+  "a7426bd1",
+  "b9d70d46",
+  "d52593c5",
+  "e807de0a",
+  "19aa13bd",
+  "32a84375",
+  "b9d70d46",
+];
 
 const EXPECTED = [
   "7a65b719",
@@ -146,4 +252,60 @@ test("行为指纹：同一输入跑两次结果相同（无隐藏状态）", ()
   for (const text of corpus().slice(0, 20)) {
     assert.equal(fingerprint(text), fingerprint(text));
   }
+});
+
+// ── 事件集维度：同一批报告 × 五种收据状态 ─────────────────────────────────
+// 判词层的大部分分支（命中/未命中/被截断/只有路径收据/过期）取决于收据而不
+// 取决于文字，所以固定文字、换事件集再打一遍指纹。
+
+const EVENT_SETS: Array<{ name: string; events: SessionEvent[]; opts?: { maxReceipts?: number } }> =
+  [
+    { name: "无收据", events: [] },
+    {
+      name: "命令全中",
+      events: [
+        { kind: "tool", name: "bash", input: { command: "pnpm test" }, exitCode: 0 },
+        { kind: "tool", name: "bash", input: { command: "pnpm lint" }, exitCode: 0 },
+        { kind: "tool", name: "write", input: { path: "src/a.ts" } },
+        { kind: "tool", name: "write", input: { path: "src/b.ts" } },
+      ],
+    },
+    {
+      name: "命令全挂",
+      events: [
+        { kind: "tool", name: "bash", input: { command: "pnpm test" }, exitCode: 1 },
+        { kind: "tool", name: "bash", input: { command: "pnpm lint" }, exitCode: 2 },
+      ],
+    },
+    {
+      name: "只有路径",
+      events: [{ kind: "tool", name: "write", input: { path: "src/a.ts" } }],
+    },
+    {
+      name: "截断",
+      events: [
+        { kind: "tool", name: "bash", input: { command: "pnpm test" }, exitCode: 0 },
+        { kind: "tool", name: "bash", input: { command: "pnpm lint" }, exitCode: 0 },
+      ],
+      opts: { maxReceipts: 1 },
+    },
+  ];
+
+function scenarioFingerprint(
+  text: string,
+  events: SessionEvent[],
+  opts?: { maxReceipts?: number },
+): string {
+  const result = opts === undefined ? audit(events, text) : audit(events, text, opts);
+  return fingerprintOf(result);
+}
+
+test("行为指纹：20 条报告 × 5 种收据状态逐条不漂移", () => {
+  const inputs = corpus().slice(0, 20);
+  const actual: string[] = [];
+  for (const set of EVENT_SETS) {
+    for (const text of inputs) actual.push(scenarioFingerprint(text, set.events, set.opts));
+  }
+  assert.equal(actual.length, 100);
+  assert.deepEqual(actual, EXPECTED_SCENARIOS);
 });

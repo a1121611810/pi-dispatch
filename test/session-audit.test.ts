@@ -2,7 +2,7 @@
 // 每条用例都写明「实现写错时它凭什么红」——判词链是这一层的全部价值。
 //
 // ── 变异测试（`mutator --no-coverage --mutate-all src/audit`）───────────
-// 当前：350 个位点，杀掉 261，**幸存 89**，0 超时。**不是零幸存**——这是明账。
+// 当前：350 个位点，杀掉 266，**幸存 84**，0 超时。**不是零幸存**——这是明账。
 // 按类：`?? -> ||` 22、`&& -> ||` 17、`0 -> 1` 15、`=== -> !==` 7、`>= -> >` 6、`true -> false` 6。
 //
 // 能证死的等价类（两条，都不是猜的）：
@@ -517,4 +517,20 @@ test("抽取：两个完成词各自绑定", () => {
   assert.equal(claims.commands.length, 2);
   assert.equal(claims.vagueBindings.length, 1, "「已修复」只绑最近的一条");
   assert.equal(claims.vagueBindings[0], 1);
+});
+
+test("抽取：贴着反引号边界的两段路径都要认", () => {
+  // 第二个路径正好从代码段的「结束位置」开始——辖域判定是左闭右开，所以它在外面。
+  assert.deepEqual(extractClaims("改了 `src/a.ts`src/b.ts").paths, ["src/a.ts", "src/b.ts"]);
+});
+
+test("抽取：点开头没有扩展名的隐藏文件不算路径", () => {
+  // `.env` / `.gitignore` 的「扩展名」在偏移 0，按规则不算路径（`dot <= 0`）。
+  assert.deepEqual(extractClaims("改了 /repo/.env").paths, []);
+  assert.deepEqual(extractClaims("改了 /repo/a/.gitignore").paths, []);
+});
+
+test("抽取：末段没有扩展名的不算路径", () => {
+  assert.deepEqual(extractClaims("改了 /repo/a/env").paths, []);
+  assert.deepEqual(extractClaims("改了 /repo/a/env.ts").paths, ["/repo/a/env.ts"]);
 });
