@@ -331,6 +331,161 @@ test("deliver：未核实的交付在通知里写出警告", async () => {
   assert.match(sent[0]!, /没有实测支撑/);
 });
 
+test("deliver：失败的任务不许说「退出码 0」——那是假账", async () => {
+  // 「空跑：退出码 0 但什么都没交」只有成功才成立。
+  // 判词对全终态生效后，failed 也拿 absent，那句文案会挂到退出码 2 的任务上。
+  const registry = new TaskRegistry();
+  const notifications = new NotificationCenter();
+  notifications.attach(registry as never);
+  await registry.submit({
+    kind: "spawn",
+    record: { id: "abcdef1234", status: "queued", task: "t" },
+  });
+  await registry.submit({ kind: "transition", id: "abcdef1234", to: "running" });
+  await registry.submit({ kind: "resolve-exit", id: "abcdef1234", exitCode: 2 });
+  const sent: string[] = [];
+  deliver(
+    { sendMessage: (m: { content?: string }) => sent.push(m.content ?? "") } as never,
+    notifications,
+  );
+  assert.ok(!sent[0]!.includes("退出码 0"), "退出码是 2，不能说 0");
+  assert.match(sent[0]!, /没有交付|未核实/);
+});
+
+test("deliver：成功的空跑仍然说「退出码 0 但什么都没交」", async () => {
+  const registry = new TaskRegistry();
+  const notifications = new NotificationCenter();
+  notifications.attach(registry as never);
+  await registry.submit({
+    kind: "spawn",
+    record: { id: "abcdef1234", status: "queued", task: "t" },
+  });
+  await registry.submit({ kind: "transition", id: "abcdef1234", to: "running" });
+  await registry.submit({ kind: "resolve-exit", id: "abcdef1234", exitCode: 0 });
+  const sent: string[] = [];
+  deliver(
+    { sendMessage: (m: { content?: string }) => sent.push(m.content ?? "") } as never,
+    notifications,
+  );
+  assert.match(sent[0]!, /空跑/, "成功但什么都没交，这句话要留着");
+});
+
+test("deliver：判词降级到 unverified 时通知里要说出来", async () => {
+  // 之前通知表只有 absent / partial 与两个硬旗，没有 unverified 分支——
+  // 判词降级了，父方一个字都看不到，只看到「成功」。
+  const registry = new TaskRegistry();
+  const notifications = new NotificationCenter();
+  notifications.attach(registry as never);
+  await registry.submit({
+    kind: "spawn",
+    record: { id: "abcdef1234", status: "queued", task: "t" },
+  });
+  await registry.submit({ kind: "transition", id: "abcdef1234", to: "running" });
+  await registry.submit({
+    kind: "attach-report",
+    id: "abcdef1234",
+    report: { summary: "s", why: "w", assessment: "a" },
+    channel: "prompt-json",
+  });
+  // 收据被上限截断 + 该维有自述 ⇒ 判词 unverified（不给盖章）
+  await registry.submit({
+    kind: "attach-report",
+    id: "abcdef1234",
+    report: { summary: "s", why: "w", assessment: "a", verified: [{ command: "pnpm test" }] },
+    channel: "prompt-json",
+    // 判词看的是 delivery 上的截断位，不是通知字段——引擎两边都会算
+    delivery: {
+      tools: { bash: 21 },
+      paths: [],
+      commands: Array.from({ length: 20 }, (_, i) => `cmd${i}`),
+      errors: 0,
+      textChars: 10,
+      commandsTruncated: true,
+    },
+    receiptTruncated: true,
+  });
+  await registry.submit({ kind: "resolve-exit", id: "abcdef1234", exitCode: 0 });
+  const sent: string[] = [];
+  deliver(
+    { sendMessage: (m: { content?: string }) => sent.push(m.content ?? "") } as never,
+    notifications,
+  );
+  assert.match(sent[0]!, /没法核对|未核实/, "判词降级了，通知里必须说出来");
+});
+
+test("deliver：收据截断但那一维没有自述 ⇒ 别把原因说成「收据超上限」", async () => {
+  // receiptGap 要求「被截断的那一维**有自述**」。没交报告的孩子压根没有自述要核，
+  // 判词 unverified 是因为「没报告」，不是「收据收不下」——通知不能张冠李戴。
+  const registry = new TaskRegistry();
+  const notifications = new NotificationCenter();
+  notifications.attach(registry as never);
+  await registry.submit({
+    kind: "spawn",
+    record: { id: "abcdef1234", status: "queued", task: "t" },
+  });
+  await registry.submit({ kind: "transition", id: "abcdef1234", to: "running" });
+  await registry.submit({
+    kind: "attach-report",
+    id: "abcdef1234",
+    // 压根没交报告（不是「交了但没自述」——那种是 unclaimed）
+    report: undefined,
+    channel: "none",
+    delivery: {
+      tools: { bash: 21 },
+      paths: [],
+      commands: Array.from({ length: 20 }, (_, i) => `cmd${i}`),
+      errors: 0,
+      textChars: 10,
+      commandsTruncated: true,
+    },
+    receiptTruncated: false,
+  });
+  await registry.submit({ kind: "resolve-exit", id: "abcdef1234", exitCode: 0 });
+  const sent: string[] = [];
+  deliver(
+    { sendMessage: (m: { content?: string }) => sent.push(m.content ?? "") } as never,
+    notifications,
+  );
+  assert.ok(!sent[0]!.includes("收据超出上限"), "那一维没有自述，谈不上「没法核对」");
+  assert.match(sent[0]!, /未核实|没法核对/, "降级还是要说");
+});
+
+test("deliver：截断型 unverified 与硬旗型说的是两回事", async () => {
+  // 硬旗说「没有实测支撑」（孩子在声称没兑现），截断说「收据收不下，没法核」。
+  // 父方该做的复核动作不同，通知不能混成一句话。
+  const registry = new TaskRegistry();
+  const notifications = new NotificationCenter();
+  notifications.attach(registry as never);
+  await registry.submit({
+    kind: "spawn",
+    record: { id: "abcdef1234", status: "queued", task: "t" },
+  });
+  await registry.submit({ kind: "transition", id: "abcdef1234", to: "running" });
+  await registry.submit({
+    kind: "attach-report",
+    id: "abcdef1234",
+    report: { summary: "s", why: "w", assessment: "a", verified: [{ command: "pnpm test" }] },
+    channel: "prompt-json",
+    delivery: {
+      tools: { bash: 21 },
+      paths: [],
+      commands: Array.from({ length: 20 }, (_, i) => `cmd${i}`),
+      errors: 0,
+      textChars: 10,
+      commandsTruncated: true,
+    },
+    receiptTruncated: true,
+  });
+  await registry.submit({ kind: "resolve-exit", id: "abcdef1234", exitCode: 0 });
+  const sent: string[] = [];
+  deliver(
+    { sendMessage: (m: { content?: string }) => sent.push(m.content ?? "") } as never,
+    notifications,
+  );
+  assert.ok(!sent[0]!.includes("没有实测支撑"), "截断不是「孩子在撒谎」，别这么说");
+  assert.match(sent[0]!, /没法核对/);
+});
+
 test("deliver：谎报自检在通知里写出警告", async () => {
   const registry = new TaskRegistry();
   const notifications = new NotificationCenter();
@@ -501,6 +656,34 @@ test("归约：小窗只认判词——报告齐全但判词没到（或不是 v
     resultWith({ report, reportChannel: "tool", deliverable: "unclaimed" }) as never,
   );
   assert.ok(unclaimed.text.includes("摘要见 report"), "只读任务的诚实形态不罚");
+});
+
+test("归约：失败的任务不吃小窗——失败最需要看全文找死因", () => {
+  // 判词对全终态生效后，failed 也可能拿到 verified（报告里的自述全对上但进程崩了）。
+  // 那不是「可信交付」，是「可信的报告 + 崩了的进程」：正文最该完整。
+  const report = {
+    summary: "s",
+    why: "w",
+    assessment: "主流程已验证。边界场景还没覆盖全，存在回归风险。",
+  };
+  const failed = excerptDeliverable(
+    resultWith({
+      report,
+      reportChannel: "tool",
+      deliverable: "verified",
+      status: "failed",
+    }) as never,
+  );
+  assert.ok(failed.text.length > 40 * 1024, "失败任务保持大窗");
+  const ok = excerptDeliverable(
+    resultWith({
+      report,
+      reportChannel: "tool",
+      deliverable: "verified",
+      status: "succeeded",
+    }) as never,
+  );
+  assert.ok(ok.text.length < 12 * 1024, "成功的才有小窗资格");
 });
 
 test("归约：回执空转或核对挂了 ⇒ 落回大窗", () => {

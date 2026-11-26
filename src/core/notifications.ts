@@ -19,6 +19,12 @@ export interface TaskNotification {
   deliveryUnverified?: boolean;
   /** 谎报自检（声称的命令没观测到） */
   verifyUnverified?: boolean;
+  /**
+   * 收据被上限截断：那一维没法对质了，判词因此不给盖章。
+   * 与硬旗分开报——硬旗说「没有实测支撑」，截断说「收据不够，没法核」，
+   * 两回事，父方该做的复核动作也不同。
+   */
+  receiptTruncated?: boolean;
   /** 工具通道报告早于最后一次转向送达（以最终正文为准） */
   reportStale?: true;
   /** 转向收据计数（只在任务真的被转向过时出现） */
@@ -71,6 +77,7 @@ export class NotificationCenter {
         ...(next.verifyPartial ? { verifyPartial: next.verifyPartial } : {}),
         ...(next.deliveryUnverified ? { deliveryUnverified: true } : {}),
         ...(next.verifyUnverified ? { verifyUnverified: true } : {}),
+        ...(next.receiptTruncated ? { receiptTruncated: true } : {}),
         ...(next.reportStale ? { reportStale: true as const } : {}),
         ...(next.steers && next.steers.length > 0 ? { steers: tallySteers(next.steers) } : {}),
         ...(next.budgetExhausted ? { budgetExhausted: true as const } : {}),

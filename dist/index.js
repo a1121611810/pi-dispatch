@@ -654,6 +654,11 @@ const READ_ONLY_TOOLS = [
 	"find",
 	"ls"
 ];
+/**
+* 会改文件的工具（pi 内置只有这两个）。收据只认白名单——
+* 黑名单会把「任何带 path 参数的调用」都当改文件，`child_report` 多传个 path 就能伪造收据。
+*/
+const WRITE_TOOLS = ["edit", "write"];
 /** 空串是坏值（会变成 `--model ""`），当没给处理。 */
 function nonEmpty(value) {
 	return value && value.trim() !== "" ? value : void 0;
@@ -746,6 +751,9 @@ function emptyStreamAcc() {
 		tools: Object.create(null),
 		paths: [],
 		commands: [],
+		failedCommands: [],
+		lostPath: false,
+		lostCommand: false,
 		pathsTruncated: false,
 		commandsTruncated: false,
 		errors: 0,
@@ -754,7 +762,8 @@ function emptyStreamAcc() {
 		queuedSteers: [],
 		deliveredSteers: [],
 		seenSteers: [],
-		pendingSeen: []
+		pendingSeen: [],
+		pendingWrites: /* @__PURE__ */ new Map()
 	};
 }
 function evidenceOf(acc) {
@@ -782,14 +791,21 @@ function declaredToolNames(sections) {
 	return names;
 }
 /**
-* 记一条改过的路径：只收写类工具给的 args.path。
+* 这是一次写类工具调用要记的路径（读类工具与 bash 不给路径）。
 * 读类工具（read/grep/find/ls）不算——读过不等于改过，否则「自述改了 N 个文件」
-* 只要把那 N 个文件读一遍就能对上（实测可洗白）。到上限就丢并置 truncated。
+* 只要把那 N 个文件读一遍就能对上（实测可洗白）。
 */
-function recordPath(toolName, args, acc) {
-	if (READ_ONLY_TOOLS.includes(toolName)) return;
+function writablePath(toolName, args) {
+	if (!WRITE_TOOLS.includes(toolName)) return void 0;
 	const path = args?.path;
-	if (typeof path !== "string" || !path) return;
+	if (typeof path !== "string" || !path) return void 0;
+	return path;
+}
+/**
+* 记一条改过的路径。到上限就丢并置 truncated。
+* 只在工具调用**成功**后才调（见 takeToolEvent）：失败的不算碰过。
+*/
+function recordPath(path, acc) {
 	if (acc.paths.includes(path)) return;
 	if (acc.paths.length >= MAX_PATHS) {
 		acc.pathsTruncated = true;
@@ -797,28 +813,87 @@ function recordPath(toolName, args, acc) {
 	}
 	acc.paths.push(path);
 }
-/** 记一条跑过的命令：只收 bash——只有它的效果就是命令行（codemode 最终也走 bash 执行）。原样记串不解析；保最近 N 条（交付前的验证命令在尾部）。 */
-function recordCommand(toolName, args, acc) {
-	if (toolName !== "bash") return;
+/**
+* 这次调用要记的命令串（只有 bash——它的效果就是命令行，codemode 最终也走 bash 执行）。
+* 与 `writablePath` 对称：只回答「要记什么」，不落账（落账时机由 takeToolEvent 定）。
+*/
+function commandOf(toolName, args) {
+	if (toolName !== "bash") return void 0;
 	const command = args?.command;
-	if (typeof command !== "string" || !command) return;
-	const kept = command.length > COMMAND_KEEP_CHARS ? `${command.slice(0, COMMAND_KEEP_CHARS)}…` : command;
-	if (acc.commands.includes(kept)) return;
-	acc.commands.push(kept);
+	if (typeof command !== "string" || !command) return void 0;
+	return command.length > COMMAND_KEEP_CHARS ? `${command.slice(0, COMMAND_KEEP_CHARS)}…` : command;
+}
+/**
+* 记一条跑过的命令。原样记串不解析；保最近 N 条（交付前的验证命令在尾部）。
+* 成功失败都记——跑过就是出勤。是不是「兑现」看 failedCommands（见 claimSatisfied）：
+* 声称 exitCode:0 的自述不能拿一条失败观测顶过去。
+*/
+function recordCommandText(command, acc) {
+	const at = acc.commands.indexOf(command);
+	if (at >= 0) acc.commands.splice(at, 1);
+	acc.commands.push(command);
 	if (acc.commands.length > MAX_COMMANDS) {
-		acc.commands.shift();
+		const dropped = acc.commands.shift();
+		if (dropped !== void 0) {
+			const i = acc.failedCommands.indexOf(dropped);
+			if (i >= 0) acc.failedCommands.splice(i, 1);
+		}
 		acc.commandsTruncated = true;
 	}
 }
-/** 工具轨迹：start 计次并记路径/命令，end 计错。 */
+/** 记一条跑挂的命令。账本跟 commands 同一条：淘汰同步，不单独设窗口。 */
+function recordFailedCommand(command, acc) {
+	if (acc.failedCommands.includes(command)) return;
+	acc.failedCommands.push(command);
+}
+/**
+* 同一条命令后来跑通了 ⇒ 把失败记录撤掉（末次结局胜）。
+* 不撤的话「跑挂 → 改代码 → 再跑通过」这个最常见的动作会被判成谎报。
+* 掩码过的「成功」不算数：`pnpm test || true` 整条成功，测试未必过。
+*/
+function clearFailedCommand(command, acc) {
+	if (hasMaskingSeparator(command)) return;
+	const i = acc.failedCommands.indexOf(command);
+	if (i >= 0) acc.failedCommands.splice(i, 1);
+}
+/**
+* 工具轨迹：start 计次并把收据**暂存**，end 计错并决定去留。
+*
+* 为什么要等 end：`isError` 只在 end 上，start 时不知道这次调用成没成。
+* 之前 start 就落账，于是两条洗白通道（都实测可达）：
+*   - 5 次全失败的 edit 也算「碰过 5 个文件」⇒ 照着自述写一遍就换到「已核对」
+*   - 跑挂的 `pnpm test` 也算「跑过」⇒ 声称 `exitCode: 0` 照样「已核对」
+* 路径和命令都按同一套走：**成了才算兑现**。
+*/
 function takeToolEvent(event, acc) {
 	if (event.type === "tool_execution_start") {
 		const name = typeof event.toolName === "string" ? event.toolName : "unknown";
 		acc.tools[name] = (acc.tools[name] ?? 0) + 1;
-		recordPath(name, event.args, acc);
-		recordCommand(name, event.args, acc);
+		const callId = typeof event.toolCallId === "string" ? event.toolCallId : void 0;
+		const path = writablePath(name, event.args);
+		const command = commandOf(name, event.args);
+		if (callId === void 0) {
+			if (path !== void 0) acc.lostPath = true;
+			if (command !== void 0) acc.lostCommand = true;
+		}
+		if (callId !== void 0 && (path !== void 0 || command !== void 0)) acc.pendingWrites.set(callId, {
+			...path !== void 0 ? { path } : {},
+			...command !== void 0 ? { command } : {}
+		});
 	} else if (event.type === "tool_execution_end") {
-		if (event.isError === true || event.result?.isError === true) acc.errors++;
+		const failed = event.isError === true || event.result?.isError === true;
+		if (failed) acc.errors++;
+		const callId = typeof event.toolCallId === "string" ? event.toolCallId : void 0;
+		if (callId === void 0) return;
+		const pending = acc.pendingWrites.get(callId);
+		if (pending === void 0) return;
+		acc.pendingWrites.delete(callId);
+		if (pending.path !== void 0 && !failed) recordPath(pending.path, acc);
+		if (pending.command !== void 0) {
+			recordCommandText(pending.command, acc);
+			if (failed) recordFailedCommand(pending.command, acc);
+			else clearFailedCommand(pending.command, acc);
+		}
 	}
 }
 /** 用量：自报的 cacheRead/cacheWrite/cost 缺省就不出键。逐字段 finite——NaN 会污染账。 */
@@ -1064,6 +1139,12 @@ function parseChildStream(stdout) {
 		}
 		takeToolReport(event.message, acc, lineNo);
 	}
+	let danglingPath = false;
+	let danglingCommand = false;
+	for (const pending of acc.pendingWrites.values()) {
+		if (pending.path !== void 0) danglingPath = true;
+		if (pending.command !== void 0) danglingCommand = true;
+	}
 	return {
 		text: acc.text,
 		toolReport: acc.toolReport,
@@ -1076,11 +1157,12 @@ function parseChildStream(stdout) {
 			tools: acc.tools,
 			paths: acc.paths,
 			commands: acc.commands,
+			...acc.failedCommands.length > 0 ? { failedCommands: [...acc.failedCommands] } : {},
 			errors: acc.errors,
 			textChars: acc.text.length,
 			...acc.malformed > 0 ? { malformed: acc.malformed } : {},
-			...acc.pathsTruncated ? { pathsTruncated: true } : {},
-			...acc.commandsTruncated ? { commandsTruncated: true } : {}
+			...acc.pathsTruncated || danglingPath || acc.lostPath ? { pathsTruncated: true } : {},
+			...acc.commandsTruncated || danglingCommand || acc.lostCommand ? { commandsTruncated: true } : {}
 		},
 		declaredTools: acc.declaredTools,
 		steerEvidence: evidenceOf(acc)
@@ -1196,9 +1278,10 @@ function pathMatches(claim, path) {
 }
 /** 自述改了文件、收据里一个都对不上 ⇒ 没有实测支撑。没自述或没收据时不判。 */
 function deliveryUnverified(report, delivery) {
-	const claims = report?.files_touched ?? [];
+	const claims = pathClaims(report);
 	if (claims.length === 0 || !delivery || delivery.pathsTruncated) return false;
-	return !claims.some((claim) => delivery.paths.some((path) => pathMatches(claim, path)));
+	const paths = delivery.paths ?? [];
+	return !claims.some((claim) => paths.some((path) => pathMatches(claim, path)));
 }
 /**
 * 自检自述里的命令（去空白）。对质与覆盖度共用同一口径——
@@ -1208,18 +1291,53 @@ function commandClaims(report) {
 	return (report?.verified ?? []).filter((claim) => claim.command.trim().length > 0);
 }
 /**
+* 改动自述里的路径（去空白）。与 commandClaims 同构——判词、硬旗、覆盖度、
+* 截断判定都得数「可核对的条数」，口径必须只有一处。
+* 之前路径侧完全没过滤：`files_touched: ["  "]` 也能换到「已核对」，
+* 与命令侧 `verified: [{command: "   "}]` 是同一个洞的两个入口。
+*/
+function pathClaims(report) {
+	return (report?.files_touched ?? []).map((path) => path.trim()).filter((path) => path.length > 0);
+}
+/**
+* 一条自述命令是否被观测到。
+*
+* 复合命令（`ls && pnpm test && pnpm lint`）的**每一段**都要被观测到才算兑现。
+* 之前用的是「任一段命中即算整条对上」——那孩子只要跑过 `ls` 就能拿一条
+* 声称三个命令都跑过的自述换到「已核对」（实测可达）。
+* 段内仍用 `segmentsMatch`（token 级 + 参数交错容忍）；段间要求每一段各自有出处，
+* 但不要求来自同一条 bash（真机常常拆成多次调用）。
+*/
+function claimSatisfied(claim, observed, failed) {
+	const wantOk = claim.exitCode === 0;
+	const claimTruncated = claim.command.length >= VERIFIED_COMMAND_MAX_CHARS && claim.command.endsWith("…");
+	const claimText = claim.command.replace(/\s+/g, " ").trim();
+	const usable = (command) => !wantOk || !failed.includes(command);
+	if (observed.some((command) => usable(command) && command.replace(/\s+/g, " ").trim() === claimText)) return true;
+	const claimSegs = scanCommand(claim.command, true);
+	if (claimSegs.length === 0) return false;
+	const observedSegs = observed.filter(usable).map((command) => scanCommand(command, false));
+	return claimSegs.every((seg) => observedSegs.some((segs) => segs.some((os) => (!wantOk || os.known) && segmentsMatch(seg.tokens, os.tokens, claimTruncated))));
+}
+/**
 * 自检对质：报告声称跑过的命令，收据里一条都没观测到 ⇒ 声称没有实测支撑。
 * 没声称就不判（只读档孩子没有 bash，契约允许 omit 此字段）。
 * 段级 × token 级：命令必须「是」观测里跑过的一条命令，不能只是别人嘴里的词
 * （echo/grep 正文里的同名字符串不算跑过）。参数交错与环境变量前缀容忍；
 * 方向仍是宁漏勿冤：标了由父方复核，和 deliveryUnverified 一个哲学。
-* shortcut: 不认 time/sudo/npx 等 wrapper 前缀（会误标未跑），也不拆换行（heredoc 由段首挡住）；
-* 误报出现再补 wrapper 白名单。
+* shortcut: 不认 time/sudo/npx 等 wrapper 前缀（会误标未跑），误报出现再补白名单。
+* shortcut: 旗标一律当装饰——`pnpm lint --help` 能满足声称的 `pnpm lint`。
+* 收紧它会把「旗标写法不同」的正常情况判成谎报，按 spec「别乱报警」的优先级放行。
+* shortcut: 刻意构造的字符串（转义引号、旗标值冒充 token）已按 shell 语义处理，
+* 但字符串启发式对「专门造一个来骗」的输入不可能做到滴水不漏——判词只是给父方的线索，
+* 真正的保证是父方会复核（spec「旗标≠一定在撒谎」）。
 */
 function verifyUnverified(report, delivery) {
 	const claims = commandClaims(report);
 	if (claims.length === 0 || !delivery || delivery.commandsTruncated) return false;
-	return !claims.some((claim) => commandSegments(claim.command).some((claimSeg) => delivery.commands.some((command) => commandSegments(command).some((observedSeg) => segmentsMatch(claimSeg, observedSeg)))));
+	const commands = delivery.commands ?? [];
+	const failed = delivery.failedCommands ?? [];
+	return !claims.some((claim) => claimSatisfied(claim, commands, failed));
 }
 /**
 * 改动自述的覆盖度：声称几条、对上几条。只在「部分对上」时返回（全对上/零对上都不返回）。
@@ -1227,9 +1345,10 @@ function verifyUnverified(report, delivery) {
 * 丢的是证据，不是罪证，这时候判「对不上」是冤枉真干活的孩子。
 */
 function deliveryCoverage(report, delivery) {
-	const claims = report?.files_touched ?? [];
+	const claims = pathClaims(report);
 	if (!delivery || delivery.pathsTruncated) return void 0;
-	const hit = claims.filter((claim) => delivery.paths.some((path) => pathMatches(claim, path)));
+	const paths = delivery.paths ?? [];
+	const hit = claims.filter((claim) => paths.some((path) => pathMatches(claim, path)));
 	return hit.length > 0 && hit.length < claims.length ? {
 		claimed: claims.length,
 		matched: hit.length
@@ -1239,59 +1358,198 @@ function deliveryCoverage(report, delivery) {
 function verifyCoverage(report, delivery) {
 	const claims = commandClaims(report);
 	if (!delivery || delivery.commandsTruncated) return void 0;
-	const seen = claims.filter((claim) => commandSegments(claim.command).some((claimSeg) => delivery.commands.some((command) => commandSegments(command).some((observedSeg) => segmentsMatch(claimSeg, observedSeg)))));
+	const failed = delivery.failedCommands ?? [];
+	const commands = delivery.commands ?? [];
+	const seen = claims.filter((claim) => claimSatisfied(claim, commands, failed));
 	return seen.length > 0 && seen.length < claims.length ? {
 		claimed: claims.length,
 		matched: seen.length
 	} : void 0;
 }
 /**
+* 收据缺口：被截断的那一维**有可核对的自述**，于是那一维没法对质。
+*
+* 判词、引擎、通知三处都用这一份口径——分开算的话，通知会说错降级原因
+* （实测：没交报告 + 命令收据截断 ⇒ 判词因「没报告」而 unverified，
+* 通知却说「收据超出上限」，而那一维根本没有自述要核）。
+*/
+function receiptGap(report, delivery) {
+	if (!delivery) return false;
+	const paths = delivery.paths ?? [];
+	const commands = delivery.commands ?? [];
+	const failed = delivery.failedCommands ?? [];
+	const pathGap = delivery.pathsTruncated === true && pathClaims(report).some((claim) => !paths.some((path) => pathMatches(claim, path)));
+	const commandGap = delivery.commandsTruncated === true && commandClaims(report).some((claim) => !claimSatisfied(claim, commands, failed));
+	return pathGap || commandGap;
+}
+/**
 * 交付判词。退出码只说进程怎么了，这一列说交付有没有实测支撑——两条轴分开记。
 * 只在定终态时算一次（registry 是唯一合法写入者），永不改 status。
-*   absent     没交报告、正文也是空的（空跑：跑了个寂寞）
-*   unverified 有正文没报告，或自述零命中，或 assessment 空转，或报告早于转向
+*   absent     没交报告、正文空的、也没改过文件（空跑：跑了个寂寞）
+*   unverified 有正文没报告，或自述零命中，或 assessment 空转，或报告早于转向，或收据没法对质
 *   partial    有自述，只对上一部分
 *   unclaimed  有报告但没有可核对的自述——只读分析任务的诚实形态，不罚
 *   verified   有自述且全对上
 */
 function deliverableOf(record) {
-	if (!record.report && (record.delivery?.textChars ?? 0) === 0) return "absent";
+	if (!record.report && (record.delivery?.textChars ?? 0) === 0 && (record.delivery?.paths?.length ?? 0) === 0 && record.delivery?.pathsTruncated !== true) return "absent";
 	if (!record.report) return "unverified";
+	if (!record.delivery) return "unverified";
 	if (record.deliveryUnverified || record.verifyUnverified || record.assessmentVacuous || record.reportStale) return record.deliveryPartial || record.verifyPartial ? "partial" : "unverified";
 	if (record.deliveryPartial || record.verifyPartial) return "partial";
-	if (record.delivery?.pathsTruncated && (record.report.files_touched?.length ?? 0) > 0 || record.delivery?.commandsTruncated && (record.report.verified?.length ?? 0) > 0) return "unverified";
-	return (record.report.files_touched?.length ?? 0) + (record.report.verified?.length ?? 0) === 0 ? "unclaimed" : "verified";
-}
-/** 空白归一 + 去截尾省略号：截断产生的 … 在 token 化前当通配抹掉。 */
-function normalizeCommand(command) {
-	return command.trim().replace(/\s+/g, " ").replace(/…$/, "");
+	if (receiptGap(record.report, record.delivery)) return "unverified";
+	return pathClaims(record.report).length + commandClaims(record.report).length === 0 ? "unclaimed" : "verified";
 }
 /**
-* 按 shell 分隔符切成「命令段」，每段成 token 表；段首 VAR=value 剥掉。
-* 不按换行切——heredoc 正文留在 cat 段内，段首不是声称命令就不算跑过。
+* 扫一遍命令串，切成段并标出每段「整条成功时能否推出它成功」。引号和反斜杠按 shell 的意思处理：
+* 引号内的分隔符不切、`\"` 不是闭合引号（否则 `echo "x\" && pnpm test"` 会被切出
+* 一段干净的 pnpm test）。`&` 紧邻 `>` 是重定向（2>&1 / &>log），不算控制符。
+*
+* 「能否推出」的规则：整条命令的退出码只反映**最后一组**的成败；组与组之间只有 `&&` 会把
+* 成功往前传（`a && b` 成功 ⇒ a 也成功），而 `;` `||` 后台 `&` 和未加引号的换行都会切断。
+* 管道 `|` 是一组：只有末段的成败代表整组（`pnpm test && ls | cat` 里 pnpm test 仍然可信，
+* ls 则不可信）。观测侧不按换行切——heredoc 正文留在 cat 段里，段首对不上声称命令。
 */
-function commandSegments(command) {
-	return normalizeCommand(command).split(/&&|\|\||;|\|/).map((segment) => {
-		const tokens = segment.trim().split(/\s+/).filter(Boolean);
+function scanCommand(command, splitNewlines) {
+	let quote = null;
+	const hasHeredoc = command.includes("<<");
+	const stages = [];
+	const groupSafe = [];
+	let group = 0;
+	let current = "";
+	const takeTokens = () => {
+		const tokens = current.trim().replace(/\s+/g, " ").split(" ").filter(Boolean);
 		while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) tokens.shift();
+		current = "";
 		return tokens;
-	}).filter((tokens) => tokens.length > 0);
+	};
+	const closeStage = () => {
+		const tokens = takeTokens();
+		if (tokens.length > 0) stages.push({
+			tokens,
+			group,
+			lastInGroup: false
+		});
+	};
+	const closeGroup = (nextSafe) => {
+		closeStage();
+		groupSafe[group] = nextSafe;
+		group += 1;
+	};
+	for (let i = 0; i < command.length; i++) {
+		const ch = command[i];
+		if (quote !== null) {
+			current += ch;
+			if (ch === "\\" && i + 1 < command.length) {
+				current += command[++i];
+				continue;
+			}
+			if (ch === quote) quote = null;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < command.length) {
+			current += ch + command[++i];
+			continue;
+		}
+		if (ch === "\"" || ch === "'") {
+			quote = ch;
+			current += ch;
+			continue;
+		}
+		const next = command[i + 1];
+		if (ch === "\n" || ch === "\r") {
+			if (splitNewlines || !hasHeredoc) closeGroup(false);
+			else current += " ";
+			continue;
+		}
+		if (ch === "&" && next === "&") {
+			closeGroup(true);
+			i++;
+			continue;
+		}
+		if (ch === "&") {
+			if (command[i - 1] === ">" || next === ">") {
+				current += ch;
+				continue;
+			}
+			closeGroup(false);
+			continue;
+		}
+		if (ch === "|" && next === "|") {
+			closeGroup(false);
+			i++;
+			continue;
+		}
+		if (ch === "|") {
+			closeStage();
+			continue;
+		}
+		if (ch === ";") {
+			closeGroup(false);
+			continue;
+		}
+		current += ch;
+	}
+	closeGroup(true);
+	const lastStage = /* @__PURE__ */ new Map();
+	stages.forEach((stage, index) => lastStage.set(stage.group, index));
+	for (const index of lastStage.values()) stages[index].lastInGroup = true;
+	const groupKnown = Array.from({ length: group }, () => false);
+	let acc = true;
+	for (let g = group - 1; g >= 0; g--) {
+		acc = acc && groupSafe[g];
+		groupKnown[g] = acc;
+	}
+	return stages.map((stage) => ({
+		tokens: stage.tokens,
+		known: groupKnown[stage.group] === true && stage.lastInGroup
+	}));
 }
-/** a 是 b 的 token 前缀；最后一个 token 允许前缀（截断/半词宽容）。 */
-function tokensPrefix(a, b) {
-	if (a.length === 0 || a.length > b.length) return false;
-	for (let i = 0; i < a.length - 1; i++) if (a[i] !== b[i]) return false;
-	return b[a.length - 1].startsWith(a[a.length - 1]);
+/**
+* 这条命令的成败有没有被掩码（`;` `|` `||` 后台 `&` 未加引号的换行）。
+* 直接复用扫描器的结论——两处各写一遍扫描器是上一轮漂移的根因。
+*/
+function hasMaskingSeparator(command) {
+	return scanCommand(command, false).some((seg) => !seg.known);
 }
-/** 同一条基础命令、参数交错：a 的 token 按序出现在 b 里（首 token 必须相同）。 */
-function tokensRunInOrder(a, b) {
-	if (a.length === 0 || a[0] !== b[0]) return false;
-	let j = 1;
-	for (let i = 1; i < b.length && j < a.length; i++) if (b[i] === a[j]) j++;
-	return j === a.length;
+/**
+* 两个 token 是否同一个。观测侧可能被截断（带 …），那时按前缀认；
+* **自述侧只有自己也被截断**（超过报告上限、由 normalizeReport 打的 …）才当通配——
+* 否则 `verified:[{command:"…"}]` 能命中任意一条观测，一条 ls 就换到「已核对」。
+*/
+function tokensEquivalent(claimTok, obsTok, claimTruncated) {
+	if (claimTok === obsTok) return true;
+	if (obsTok.endsWith("…")) return claimTok.startsWith(obsTok.slice(0, -1));
+	if (claimTruncated && claimTok.endsWith("…")) return obsTok.startsWith(claimTok.slice(0, -1));
+	return false;
 }
-function segmentsMatch(a, b) {
-	return tokensPrefix(a, b) || tokensPrefix(b, a) || tokensRunInOrder(a, b) || tokensRunInOrder(b, a);
+/**
+* 自述的一段 vs 观测的一段。
+* 自述 token 要按序出现，中间只许夹旗标**及其值**（值被吃掉，不能反手当自述 token，
+* 否则 `npm --prefix test install` 能满足声称的 `npm test`）。
+* 观测比自述多出来的尾巴（--coverage 之类）放行。
+*/
+function segmentsMatch(claim, observed, claimTruncated) {
+	if (claim.length === 0) return false;
+	let j = 0;
+	let afterFlag = false;
+	for (let i = 0; i < observed.length && j < claim.length; i++) {
+		const token = observed[i];
+		if (afterFlag) {
+			afterFlag = false;
+			continue;
+		}
+		if (tokensEquivalent(claim[j], token, claimTruncated)) {
+			j++;
+			continue;
+		}
+		if (token.startsWith("-")) {
+			afterFlag = true;
+			continue;
+		}
+		return false;
+	}
+	return j === claim.length;
 }
 // src/core/cache-warming.ts
 /** 预热决策：depth > 0 ⇒ 停；depth === 0 ⇒ 不表态（undefined）。 */
@@ -3340,6 +3598,7 @@ var TaskEngine = class {
 		};
 		const unverified = deliveryUnverified(report, parsed.delivery);
 		const verifyFailed = verifyUnverified(report, parsed.delivery);
+		const receiptTruncated = receiptGap(report, parsed.delivery);
 		const deliveryPartial = deliveryCoverage(report, parsed.delivery);
 		const verifyPartial = verifyCoverage(report, parsed.delivery);
 		const base = this.#registry.get(taskId)?.worktree;
@@ -3361,6 +3620,7 @@ var TaskEngine = class {
 			cache: cacheObservation,
 			unverified,
 			verifyUnverified: verifyFailed,
+			receiptTruncated,
 			vacuous: assessmentVacuous(report),
 			deliveryPartial,
 			verifyPartial
@@ -3402,6 +3662,7 @@ var TaskEngine = class {
 			delivery: record.delivery,
 			deliveryUnverified: record.deliveryUnverified,
 			verifyUnverified: record.verifyUnverified,
+			receiptTruncated: record.receiptTruncated,
 			assessmentVacuous: record.assessmentVacuous,
 			deliverable: record.deliverable,
 			deliveryPartial: record.deliveryPartial,
@@ -3682,9 +3943,17 @@ function applyAttachBudget(current, command) {
 		changed: true
 	};
 }
-/** 成功终态才带判词：退出码 0 也要说清交付有没有实测支撑，两件事分开记。 */
-function deliverablePatch(current, to) {
-	return to === "succeeded" ? { deliverable: deliverableOf(current) } : {};
+/**
+* 终态都带判词：退出码 0 也要说清交付有没有实测支撑，两件事分开记。
+* failed / canceled 同样要判——「没有交付」本身就是一条判词（通常是 absent），
+* 父方看到「failed + absent」就知道这单既没成功也没交东西，而不是对着 undefined 猜。
+*
+* 正文窗口在 src/index.ts 的 hasReliableReport 里另有一道门：**只有 succeeded** 才可能换小窗。
+* 失败的任务即便报告里的自述全对上，也拿全文——失败最需要看死因看现场，
+* 「报告可信」不等于「进程没崩」。
+*/
+function deliverablePatch(current) {
+	return { deliverable: deliverableOf(current) };
 }
 /**
 * resolve-exit 的判定：
@@ -3694,22 +3963,19 @@ function deliverablePatch(current, to) {
 * 只算「去哪 + 补什么」，真正的写入仍由 #move 在写锁内做。
 */
 function applyResolveExit(current, command) {
-	if (current.status === "stopping") {
-		const to = command.exitCode === 0 ? "succeeded" : "canceled";
-		return {
-			to,
-			patch: {
-				...deliverablePatch(current, to),
-				...command.notStarted ? { startedAt: void 0 } : {},
-				exitCode: command.exitCode,
-				...command.exitCode !== 0 && command.detail && !current.stopReason ? { stopReason: command.detail } : {}
-			}
-		};
-	}
+	if (current.status === "stopping") return {
+		to: command.exitCode === 0 ? "succeeded" : "canceled",
+		patch: {
+			...deliverablePatch(current),
+			...command.notStarted ? { startedAt: void 0 } : {},
+			exitCode: command.exitCode,
+			...command.exitCode !== 0 && command.detail && !current.stopReason ? { stopReason: command.detail } : {}
+		}
+	};
 	if (current.status === "running") return {
 		to: command.exitCode === 0 ? "succeeded" : "failed",
 		patch: {
-			...deliverablePatch(current, command.exitCode === 0 ? "succeeded" : "failed"),
+			...deliverablePatch(current),
 			...command.notStarted ? { startedAt: void 0 } : {},
 			exitCode: command.exitCode,
 			...command.exitCode !== 0 && command.detail ? { stopReason: command.detail } : {}
@@ -3847,6 +4113,7 @@ var TaskRegistry = class {
 					cache: command.cache ?? current.cache,
 					...command.unverified ? { deliveryUnverified: true } : {},
 					...command.verifyUnverified ? { verifyUnverified: true } : {},
+					...command.receiptTruncated ? { receiptTruncated: true } : {},
 					...command.vacuous ? { assessmentVacuous: true } : {},
 					...command.deliveryPartial ? { deliveryPartial: command.deliveryPartial } : {},
 					...command.verifyPartial ? { verifyPartial: command.verifyPartial } : {}
@@ -3922,7 +4189,8 @@ var TaskRegistry = class {
 			...patch,
 			status: to,
 			startedAt: "startedAt" in patch ? patch.startedAt : to === "running" ? Date.now() : current.startedAt,
-			finishedAt: isTerminal(to) ? Date.now() : current.finishedAt
+			finishedAt: isTerminal(to) ? Date.now() : current.finishedAt,
+			...isTerminal(to) && !("deliverable" in patch) ? deliverablePatch(current) : {}
 		};
 		this.#records.set(id, next);
 		this.#emit(next, current);
@@ -3973,6 +4241,7 @@ var NotificationCenter = class {
 				...next.verifyPartial ? { verifyPartial: next.verifyPartial } : {},
 				...next.deliveryUnverified ? { deliveryUnverified: true } : {},
 				...next.verifyUnverified ? { verifyUnverified: true } : {},
+				...next.receiptTruncated ? { receiptTruncated: true } : {},
 				...next.reportStale ? { reportStale: true } : {},
 				...next.steers && next.steers.length > 0 ? { steers: tallySteers(next.steers) } : {},
 				...next.budgetExhausted ? { budgetExhausted: true } : {},
@@ -4170,6 +4439,7 @@ const BIG_WINDOW_MAX_CHARS = 51200;
 * unclaimed 也算可信：只读分析任务本来就没有可核对项，没证据不等于假话。
 */
 function hasReliableReport(result) {
+	if (result.status !== "succeeded") return false;
 	return result.deliverable === "verified" || result.deliverable === "unclaimed";
 }
 function excerptDeliverable(result) {
@@ -4476,10 +4746,11 @@ function deliver(pi, notifications) {
 		const text = batch.map((n) => {
 			const partial = n.deliveryPartial ?? n.verifyPartial;
 			const hint = [
-				n.deliverable === "absent" ? "｜空跑：退出码 0 但什么都没交" : "",
+				n.deliverable === "absent" ? n.status === "succeeded" ? "｜空跑：退出码 0 但什么都没交" : "｜没有交付" : "",
 				n.deliverable === "partial" && partial ? `｜交付只对上 ${partial.matched}/${partial.claimed} 条（查 dispatch_list 复核）` : "",
 				n.deliveryUnverified ? "｜报告里的改动没有实测支撑（查 dispatch_list 复核）" : "",
 				n.verifyUnverified ? "｜报告声称的自检没有实测支撑（查 dispatch_list 复核）" : "",
+				n.deliverable === "unverified" && !n.deliveryUnverified && !n.verifyUnverified ? n.receiptTruncated ? "｜收据被截断或缺失（上限／流被切），那一维没法核对" : "｜交付判词为「未核实」（查 dispatch_list 看原因）" : "",
 				n.reportStale ? "｜工具报告早于最后一次转向（以最终正文为准）" : "",
 				n.steers ? steerHint(n.steers) : "",
 				n.budgetExhausted ? "｜预算到点（降级交付）" : "",
@@ -4586,6 +4857,7 @@ function registerTools(pi, current) {
 				delivery: r.delivery,
 				deliveryUnverified: r.deliveryUnverified,
 				verifyUnverified: r.verifyUnverified,
+				receiptTruncated: r.receiptTruncated,
 				assessmentVacuous: r.assessmentVacuous,
 				deliverable: r.deliverable,
 				deliveryPartial: r.deliveryPartial,

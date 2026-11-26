@@ -932,9 +932,36 @@ test("状态机：判词四档——unclaimed / unverified / partial / verified"
   );
 });
 
-test("状态机：失败终态不带判词（没有交付可言）", () => {
+test("状态机：被取消 / 丢失的终态也带判词（判词轴不许半截）", async () => {
+  // 只有 resolve-exit 那条路会算判词的话，「同是被取消」：
+  // 走 stopping→resolve-exit 的有判词，走 queued→cancel-queued 的没有（实测 undefined）。
+  const registry = new TaskRegistry();
+  await registry.submit({ kind: "spawn", record: { id: "q1", status: "queued", task: "t" } });
+  await registry.submit({ kind: "cancel-queued", id: "q1", reason: "父方叫停" });
+  const canceled = registry.get("q1");
+  assert.equal(canceled?.status, "canceled");
+  assert.equal(canceled?.deliverable, "absent", "没交东西的取消 ⇒ absent，不是 undefined");
+
+  await registry.submit({ kind: "spawn", record: { id: "l1", status: "queued", task: "t" } });
+  await registry.submit({ kind: "transition", id: "l1", to: "running" });
+  await registry.submit({ kind: "reconcile-lost", id: "l1", reason: "宿主重启" });
+  assert.equal(
+    registry.get("l1")?.deliverable,
+    "absent",
+    "丢失的也要有判词（没报告没正文 ⇒ absent）",
+  );
+});
+
+test("状态机：失败终态也带判词（没有交付 ⇒ absent）", () => {
+  // 失败不是「交付不合格」，是「没有交付」——那正是 absent 的语义。
+  // 之前失败终态不带判词（deliverable 是 undefined），下游只能当「不可信」处理，
+  // 于是失败任务反而拿到最长的正文窗口（8KB→50KB），方向是反的。
   const current: TaskRecord = { id: "v", status: "running", task: "t", startedAt: 1 };
   const next = applyResolveExit(current, { kind: "resolve-exit", id: "v", exitCode: 2 });
   assert.equal(next?.to, "failed");
-  assert.equal("deliverable" in (next?.patch ?? {}), false, "失败不是「交付不合格」，是没有交付");
+  assert.equal(
+    (next?.patch ?? {}).deliverable,
+    "absent",
+    "失败且什么都没交 ⇒ absent（不是 undefined）",
+  );
 });

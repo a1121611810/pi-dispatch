@@ -52,6 +52,9 @@ const BIG_WINDOW_MAX_CHARS = 50 * 1024;
  * unclaimed 也算可信：只读分析任务本来就没有可核对项，没证据不等于假话。
  */
 function hasReliableReport(result: DispatchResult): boolean {
+  // 只有真的成功才有资格换小窗。失败的任务最需要看全文找死因——
+  // 「报告里的自述全对上」不代表进程没崩，拿判词单独放行会让失败的反而看得更少。
+  if (result.status !== "succeeded") return false;
   return result.deliverable === "verified" || result.deliverable === "unclaimed";
 }
 
@@ -410,12 +413,24 @@ export function deliver(pi: ExtensionAPI, notifications: NotificationCenter): vo
       .map((n) => {
         const partial = n.deliveryPartial ?? n.verifyPartial;
         const hint = [
-          n.deliverable === "absent" ? "｜空跑：退出码 0 但什么都没交" : "",
+          // 「空跑」是成功才有的说法：退出码 0 却什么都没交。失败的调用说这句是在报假账。
+          n.deliverable === "absent"
+            ? n.status === "succeeded"
+              ? "｜空跑：退出码 0 但什么都没交"
+              : "｜没有交付"
+            : "",
           n.deliverable === "partial" && partial
             ? `｜交付只对上 ${partial.matched}/${partial.claimed} 条（查 dispatch_list 复核）`
             : "",
           n.deliveryUnverified ? "｜报告里的改动没有实测支撑（查 dispatch_list 复核）" : "",
           n.verifyUnverified ? "｜报告声称的自检没有实测支撑（查 dispatch_list 复核）" : "",
+          // 判词降级了要说出来。分两种：硬旗已经说了「没有实测支撑」，
+          // 截断是另一种——收据太多收不下，那一维没法核，不等于孩子在撒谎。
+          n.deliverable === "unverified" && !n.deliveryUnverified && !n.verifyUnverified
+            ? n.receiptTruncated
+              ? "｜收据被截断或缺失（上限／流被切），那一维没法核对"
+              : "｜交付判词为「未核实」（查 dispatch_list 看原因）"
+            : "",
           n.reportStale ? "｜工具报告早于最后一次转向（以最终正文为准）" : "",
           n.steers ? steerHint(n.steers) : "",
           n.budgetExhausted ? "｜预算到点（降级交付）" : "",
@@ -546,6 +561,7 @@ function registerTools(pi: ExtensionAPI, current: () => TaskEngine): void {
           delivery: r.delivery,
           deliveryUnverified: r.deliveryUnverified,
           verifyUnverified: r.verifyUnverified,
+          receiptTruncated: r.receiptTruncated,
           assessmentVacuous: r.assessmentVacuous,
           deliverable: r.deliverable,
           deliveryPartial: r.deliveryPartial,

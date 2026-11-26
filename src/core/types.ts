@@ -133,15 +133,24 @@ export type ChildDelivery = {
   paths: string[];
   /** 实际跑过的 bash 命令（原样记串不解析；去重、有上限）——对质「自检跑了没」的观测侧 */
   commands: string[];
+  /**
+   * 其中**跑挂了**的那些（同受 commands 的上限）。
+   * 「跑了但没通过」是出勤，不是兑现：诚实报告失败的自检不该被判成谎报，
+   * 而声称 exitCode:0 的自述也不能拿一条失败观测顶过去。
+   */
+  failedCommands?: string[];
   /** 工具执行失败次数 */
   errors: number;
   /** 孩子最终正文长度（字符）——0 = 空交 */
   textChars: number;
   /** 畸形事件行数（不是合法事件的行）：好行照留，坏行计数 */
   malformed?: number;
-  /** 路径收据到上限被丢弃过：截断只是丢了证据，判「对不上」时要放行 */
+  /**
+   * 这一维的收据不完整：撞到上限丢了条目，或流被切（有 start 没 end，结局未知）。
+   * 都是「丢了证据」——判「对不上」时要放行，但那一维有自述时判词也不盖章。
+   */
   pathsTruncated?: true;
-  /** 命令收据按「留最近 N 条」丢过旧条目 */
+  /** 同上，命令维度 */
   commandsTruncated?: true;
 };
 
@@ -217,9 +226,9 @@ export type Deliverable =
   | "unclaimed"
   /** 有自述，只有一部分对上 */
   | "partial"
-  /** 有自述但零命中、assessment 空转、或工具报告早于最后一次转向 */
+  /** 有自述但零命中、assessment 空转、工具报告早于最后一次转向、或收据被截断没法对质 */
   | "unverified"
-  /** 没交报告，正文也是空的（空跑） */
+  /** 没交报告、正文空的、也没改过文件（空跑）。收据被截断时不判这一档——证据丢了不等于没做 */
   | "absent";
 
 /** 自述覆盖度：声称几条、对上了几条。只在 0 < matched < claimed 时记。 */
@@ -279,6 +288,8 @@ export interface TaskRecord {
   deliveryUnverified?: boolean;
   /** 谎报自检被抓：声称跑过的命令，收据里一条都没观测到 */
   verifyUnverified?: boolean;
+  /** 收据被上限截断：那一维没法对质，判词因此不给盖章 */
+  receiptTruncated?: boolean;
   /** assessment 空转（缺/过短/全正面）——小窗资格粗筛结果，信任只走记账规则 */
   assessmentVacuous?: boolean;
   /** 交付判词：退出码之外的第二条轴，定终态时算一次 */
@@ -340,6 +351,8 @@ export interface DispatchResult {
   deliveryUnverified?: boolean;
   /** 谎报自检被抓：声称跑过的命令，收据里一条都没观测到 */
   verifyUnverified?: boolean;
+  /** 收据被上限截断：那一维没法对质，判词因此不给盖章 */
+  receiptTruncated?: boolean;
   /** assessment 空转（缺/过短/全正面）——小窗资格粗筛结果，信任只走记账规则 */
   assessmentVacuous?: boolean;
   /** 交付判词：退出码之外的第二条轴 */
