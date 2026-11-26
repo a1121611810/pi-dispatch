@@ -2,7 +2,7 @@
 // 每条用例都写明「实现写错时它凭什么红」——判词链是这一层的全部价值。
 //
 // ── 变异测试（`mutator --no-coverage --mutate-all src/audit`）───────────
-// 当前：345 个位点，杀掉 240，**幸存 105**，0 超时。**不是零幸存**——这是明账。
+// 当前：345 个位点，杀掉 241，**幸存 104**，0 超时。**不是零幸存**——这是明账。
 // 按类：`?? -> ||` 22、`&& -> ||` 17、`0 -> 1` 15、`=== -> !==` 7、`>= -> >` 6、`true -> false` 6。
 //
 // 能证死的等价类：`?? -> ||` 的前提是左值只可能是 `string | undefined`（`str()`
@@ -460,4 +460,16 @@ test("切句：裸句点不切（`a.ts` 里那个点不算句子边界）", () =
   assert.deepEqual(extractClaims("改了 `src/a.ts`，然后跑 `pnpm test` 通过了。").paths, [
     "src/a.ts",
   ]);
+});
+
+test("审计：显式传空报告就是没正文，不回落去用流里的 assistant 文本", () => {
+  // `report ?? …` 与 `report || …` 在这里分道：空串是「作者没写」，不是「没给」。
+  const result = audit([bash("pnpm test", 0), say("`pnpm test` 跑通了。")], "");
+  assert.equal(result.deliverable, "absent");
+});
+
+test("审计：maxReceipts 传 0 就是一条都不留（不是回落到默认 20）", () => {
+  const result = audit([bash("a", 0)], null, { maxReceipts: 0 });
+  assert.equal(result.receipts.commands.length, 0);
+  assert.equal(result.truncated, true);
 });
