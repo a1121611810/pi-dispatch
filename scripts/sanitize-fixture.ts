@@ -153,7 +153,8 @@ function scrub(value: unknown): unknown {
       // 规则里的正则带引号匹配的是 `"key":"value"` 整体——但值在这里是独立的字符串，
       // 不带引号，所以按键名改，别指望那条正则。
       if (key === "model" || key === "requestedModel") {
-        out[key] = typeof item === "string" ? item.replace(/^group\/[a-z-]+$/, "test/model") : item;
+        // 带后缀的也认（形如 group/<名字>[1m]）：按前缀换，别要求整串都是 [a-z-]。
+        out[key] = typeof item === "string" ? item.replace(/^group\/.*$/, "test/model") : item;
         continue;
       }
       if (key === "provider") {
