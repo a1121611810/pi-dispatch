@@ -311,3 +311,226 @@ test("claude：非 Bash 的 result 里出现 `Exit code` 不会被当退出码",
   assert.equal(bashOf(events).length, 0);
   assert.equal(writeOf(events).length, 0);
 });
+
+// ── 逐分支补测：把变异测试里幸存的分支钉住 ──────────────────────────────
+
+test("codex：UserMessage 走 content[]，role 是 user", () => {
+  const lines = [
+    JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: { type: "UserMessage", content: [{ type: "text", text: "帮我看看" }] },
+      },
+    }),
+  ];
+  const roles = normalizeCodex(lines)
+    .events.filter((e) => e.kind === "message")
+    .map((e) => (e.kind === "message" ? e.role : ""));
+  assert.deepEqual(roles, ["user"]);
+});
+
+test("codex：多条 final_answer 时报告取最后一条", () => {
+  const lines = [
+    JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: "第一版", phase: "final_answer" },
+    }),
+    JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: "第二版", phase: "final_answer" },
+    }),
+  ];
+  assert.equal(normalizeCodex(lines).report, "第二版");
+});
+
+test("codex：没有 final_answer 时回落到最后一条 assistant", () => {
+  const lines = [
+    JSON.stringify({
+      type: "item.completed",
+      item: { type: "agent_message", text: "旁白", phase: "commentary" },
+    }),
+  ];
+  assert.equal(normalizeCodex(lines).report, "旁白");
+});
+
+test("codex：AgentMessage 只有 content[] 没有 text 也能取到", () => {
+  const lines = [
+    JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: { type: "AgentMessage", content: [{ type: "Text", text: "正文在 content 里" }] },
+      },
+    }),
+  ];
+  assert.equal(normalizeCodex(lines).report, "正文在 content 里");
+});
+
+test("codex：arguments 不是合法 JSON 时返回 undefined，不抛", () => {
+  const lines = [
+    JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "exec_command",
+        call_id: "c1",
+        arguments: "不是 JSON",
+      },
+    }),
+  ];
+  assert.equal(bashOf(normalizeCodex(lines).events).length, 0);
+});
+
+test("codex：坏行计入 malformed，不影响好行", () => {
+  const result = normalizeCodex([
+    "{ 坏行",
+    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "好" } }),
+  ]);
+  assert.equal(result.malformed, 1);
+  assert.equal(result.report, "好");
+});
+
+test("codex：`meta` 带 cwd 时写进事件流，file:// 前缀去掉", () => {
+  const lines = [JSON.stringify({ type: "session_meta", payload: { cwd: "file:///repo/x" } })];
+  const meta = normalizeCodex(lines).events.find((e) => e.kind === "meta");
+  assert.equal(meta?.kind === "meta" ? meta.cwd : undefined, "/repo/x");
+});
+
+test("claude：第一条 user 文本是任务，后面才是转向", () => {
+  const lines = [
+    claudeLine("user", [{ type: "text", text: "任务" }]),
+    claudeLine("user", [{ type: "text", text: "转向" }]),
+  ];
+  const messages = messageOf(normalizeClaude(lines).events);
+  assert.equal(messages.length, 2);
+  assert.equal(messages[0]!.kind === "message" ? messages[0]!.steer : true, undefined);
+  assert.equal(messages[1]!.kind === "message" ? messages[1]!.steer : false, true);
+});
+
+test("claude：配不上 tool_use 的 tool_result 直接忽略", () => {
+  const lines = [
+    claudeLine("user", [{ type: "tool_result", tool_use_id: "不存在", content: "Exit code 0" }]),
+  ];
+  const result = normalizeClaude(lines);
+  assert.equal(bashOf(result.events).length, 0);
+  assert.equal(result.malformed, 0);
+});
+
+test("claude：tool_result 的 content 是数组时也能取文本", () => {
+  const lines = [
+    claudeLine("assistant", [
+      { type: "tool_use", id: "t1", name: "Bash", input: { command: "ls" } },
+    ]),
+    claudeLine("user", [
+      {
+        type: "tool_result",
+        tool_use_id: "t1",
+        content: [{ type: "text", text: "Exit code 3\nboom" }],
+      },
+    ]),
+  ];
+  const bash = bashOf(normalizeClaude(lines).events);
+  assert.equal(bash[0]!.exitCode, 3);
+});
+
+test("claude：NotebookEdit 也进路径收据", () => {
+  const lines = [
+    claudeLine("assistant", [
+      {
+        type: "tool_use",
+        id: "t1",
+        name: "NotebookEdit",
+        input: { notebook_path: "/repo/n.ipynb" },
+      },
+    ]),
+    claudeLine("user", [{ type: "tool_result", tool_use_id: "t1", content: "ok" }]),
+  ];
+  const writes = writeOf(normalizeClaude(lines).events);
+  assert.equal(writes[0]!.input.path, "/repo/n.ipynb");
+});
+
+test("claude：没有 tool_result 的写不算收据", () => {
+  const lines = [
+    claudeLine("assistant", [
+      { type: "tool_use", id: "t1", name: "Write", input: { file_path: "/repo/a.ts" } },
+    ]),
+  ];
+  assert.equal(writeOf(normalizeClaude(lines).events).length, 0);
+});
+
+test("claude：侧链的 assistant 文本不进报告", () => {
+  const lines = [
+    claudeLine("assistant", [{ type: "text", text: "主链正文" }]),
+    claudeLine("assistant", [{ type: "text", text: "侧链正文" }], { isSidechain: true }),
+  ];
+  assert.equal(normalizeClaude(lines).report, "主链正文");
+});
+
+// ── 再补一批：分词器的边界与「字段缺省」分支 ────────────────────────────
+
+test("codex：CommandExecution 缺 id 时照样收命令（只是没有原文可对）", () => {
+  const lines = [
+    JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: { type: "CommandExecution", command: ["/bin/sh", "-c", "ls"], exit_code: 0 },
+      },
+    }),
+  ];
+  const bash = bashOf(normalizeCodex(lines).events);
+  assert.equal(bash.length, 1);
+  assert.equal(bash[0]!.input.command, "ls");
+});
+
+test("codex：空 changes 不产路径收据，也不崩", () => {
+  const lines = [
+    JSON.stringify({
+      type: "event_msg",
+      payload: { type: "item_completed", item: { type: "FileChange", changes: {} } },
+    }),
+  ];
+  assert.equal(writeOf(normalizeCodex(lines).events).length, 0);
+});
+
+test("codex：不认识的 item 类型直接跳过", () => {
+  const lines = [
+    JSON.stringify({
+      type: "event_msg",
+      payload: { type: "item_completed", item: { type: "SomethingElse" } },
+    }),
+  ];
+  const result = normalizeCodex(lines);
+  assert.equal(result.events.length, 0);
+  assert.equal(result.malformed, 0);
+});
+
+test("claude：tool_use 缺 id 时跳过（配不上结果）", () => {
+  const lines = [
+    claudeLine("assistant", [{ type: "tool_use", name: "Bash", input: { command: "ls" } }]),
+  ];
+  assert.equal(bashOf(normalizeClaude(lines).events).length, 0);
+});
+
+test("claude：Bash 缺 command 时不产收据", () => {
+  const lines = [
+    claudeLine("assistant", [{ type: "tool_use", id: "t1", name: "Bash", input: {} }]),
+    claudeLine("user", [{ type: "tool_result", tool_use_id: "t1", content: "Exit code 0" }]),
+  ];
+  const result = normalizeClaude(lines);
+  // 空命令会被 collectReceipts 丢掉，这里断言归一化层也没崩。
+  assert.equal(result.malformed, 0);
+});
+
+test("claude：空文本块不进消息", () => {
+  const lines = [claudeLine("assistant", [{ type: "text", text: "" }])];
+  assert.equal(messageOf(normalizeClaude(lines).events).length, 0);
+});
+
+test("claude：content 既不是数组也不是字符串时安全跳过", () => {
+  const lines = [JSON.stringify({ type: "assistant", message: { content: 42 } })];
+  const result = normalizeClaude(lines);
+  assert.equal(result.events.length, 0);
+  assert.equal(result.malformed, 0);
+});

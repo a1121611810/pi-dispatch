@@ -1,12 +1,16 @@
 // 会话审计的判词层：五档、八条对抗样本、纯函数性。
 // 每条用例都写明「实现写错时它凭什么红」——判词链是这一层的全部价值。
 //
-// ── 变异测试欠账（`mutator --no-coverage src/audit`）─────────────────────
-// 当前：345 个位点，杀掉 217，**幸存 128**。没有逐个证明等价，这是一笔明账，不是
-// 「全绿」。按类看：`?? -> ||` 22、`&& -> ||` 19、`0 -> 1` 17、`=== -> !==` 10、
-// `true -> false` 9、`! -> 空` 7、`>= -> >` 6。多数落在归一化层的可选字段默认值上
-// （那份日志里字段恒有值），但要一个个对着真夹具证实才算数——下一轮补，别当已经绿了。
-// 已经钉死的边界：否定辖域的 12 字端点、路径去重、命令/路径两维各自的窗口方向、
+// ── 变异测试（`mutator --no-coverage --mutate-all src/audit`）───────────
+// 当前：345 个位点，杀掉 239，**幸存 106**，0 超时。**不是零幸存**——这是明账。
+// 按类：`?? -> ||` 22、`&& -> ||` 18、`0 -> 1` 15、`=== -> !==` 7、`>= -> >` 6、`true -> false` 6。
+//
+// 能证死的等价类：`?? -> ||` 的前提是左值只可能是 `string | undefined`（`str()`
+// 把空串也映射成 undefined）或 `RegExpExecArray.index`（只可能 0 或正数，没有
+// NaN），这两种情况下 `??` 与 `||` 外延相等。
+// 其余没有逐个证明，记成欠账——别当已经绿了。
+// 已经钉死的边界：否定辖域 12 字端点、路径去重、两维窗口方向、命中两分支、
+// 空命令自述、分词器的「命令 vs 路径」优先、字段缺省分支。
 // 声称成功/声称跑过两条命中分支、空命令自述。
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -320,4 +324,140 @@ test("规模：审计模块每个文件 ≤ 600 行", () => {
     const text = readFileSync(new URL(file, dir), "utf8");
     assert.ok(text.split("\n").length <= 600, `${file} 超了 600 行`);
   }
+});
+
+// ── 逐分支补测（二）：抽取 / 命中 / 判定链的边角 ────────────────────────
+
+test("抽取：转折词切小句，否定只作用于自己的小句", () => {
+  assert.deepEqual(extractClaims("没有修改 `src/a.ts` 但是改了 `src/b.ts`。").paths, ["src/b.ts"]);
+});
+
+test("抽取：分号切句子，后半句照常抽", () => {
+  assert.deepEqual(extractClaims("没有改 `src/a.ts`；改了 `src/b.ts`。").paths, ["src/b.ts"]);
+});
+
+test("抽取：围栏代码块的第一行算命令", () => {
+  const report = "跑过了：\n```\npnpm test\n```\n";
+  assert.deepEqual(
+    extractClaims(report).commands.map((c) => c.command),
+    ["pnpm test"],
+  );
+});
+
+test("路径识别：URL 不算路径", () => {
+  assert.deepEqual(extractClaims("看了 `https://example.com/a.ts`，没有改动。").paths, []);
+});
+
+test("路径识别：没有斜杠的不算路径（README.md 这类）", () => {
+  assert.deepEqual(extractClaims("改了 `README.md`。").paths, []);
+});
+
+test("归一：绝对路径原样保留", () => {
+  assert.equal(normalizePath("/repo/src/a.ts"), "/repo/src/a.ts");
+});
+
+test("审计：调用方给了结构化自述就不跑散文抽取", () => {
+  const result = audit([bash("pnpm test", 0)], "这段散文完全对不上", {
+    claims: { paths: [], commands: [{ command: "pnpm test", wantOk: true }], vagueBindings: [] },
+  });
+  assert.equal(result.deliverable, "verified");
+  assert.deepEqual(result.claims.commands, ["pnpm test"]);
+});
+
+test("审计：maxReceipts 可调（收 1 条就截断）", () => {
+  const result = audit([bash("a", 0), bash("b", 0)], null, { maxReceipts: 1 });
+  assert.equal(result.receipts.commands.length, 1);
+  assert.equal(result.truncated, true);
+});
+
+test("审计：mismatch 精确列出没对上的路径与命令", () => {
+  const result = audit([write("src/a.ts")], "改了 `src/a.ts` 和 `src/b.ts`，`pnpm test` 跑通了。");
+  assert.deepEqual(result.mismatch.paths, ["src/b.ts"]);
+  assert.deepEqual(result.mismatch.commands, ["pnpm test"]);
+});
+
+test("命中：整串逐字相等走快路（无分隔符）", () => {
+  assert.equal(
+    claimHit(claim("pnpm test --silent"), [
+      { command: "pnpm  test --silent", exitCode: 0, trusted: true },
+    ]),
+    true,
+  );
+});
+
+test("命中：多段自述里有一段找不到就不命中", () => {
+  assert.equal(
+    claimHit(claim("pnpm test && pnpm lint"), [
+      { command: "pnpm test", exitCode: 0, trusted: true },
+    ]),
+    false,
+  );
+});
+
+test("判定链：stale 与 vague 同时成立时 notes 两条都在", () => {
+  const result = audit(
+    [bash("pnpm test", 1), say("`pnpm test` 失败。已修复。"), say("再试一次", "user", true)],
+    null,
+  );
+  assert.equal(result.deliverable, "unverified");
+  assert.ok(result.notes.includes("report predates last steer"));
+});
+
+test("抽取：路径写在动词前面不算改动自述（已知盲区）", () => {
+  assert.deepEqual(extractClaims("`src/a.ts` 被改了。").paths, []);
+});
+
+test("抽取：倒装的失败词绑不到命令（已知盲区）", () => {
+  // 「失败：`pnpm test`」里失败词在命令前面，绑不到——写进盲区，不当谎报。
+  const claims = extractClaims("失败：`pnpm test`。");
+  assert.equal(claims.commands.length, 1);
+  assert.equal(claims.commands[0]!.wantOk, true);
+});
+
+test("抽取：一句话里多条命令，失败只绑最近的前一条", () => {
+  const claims = extractClaims("`pnpm lint` 跑通了，`pnpm test` 失败了。").commands;
+  assert.deepEqual(
+    claims.map((c) => [c.command, c.wantOk]),
+    [
+      ["pnpm lint", true],
+      ["pnpm test", false],
+    ],
+  );
+});
+
+test("审计：转向在报告之前不算陈旧", () => {
+  const result = audit(
+    [say("先看看", "user", true), bash("pnpm test", 0), say("`pnpm test` 跑通了。")],
+    null,
+  );
+  assert.equal(result.deliverable, "verified");
+  assert.deepEqual(result.notes, []);
+});
+
+test("命中：自述带多余空白也能对上", () => {
+  assert.equal(
+    claimHit(claim("  pnpm   test  "), [{ command: "pnpm test", exitCode: 0, trusted: true }]),
+    true,
+  );
+});
+
+test("抽取：反引号里同时像命令又像路径时，按命令算（首 token 是 runner）", () => {
+  const claims = extractClaims("跑了 `node ./scripts/gen.ts`。");
+  assert.equal(claims.commands.length, 1);
+  assert.deepEqual(claims.paths, []);
+});
+
+test("抽取：反引号里的路径只算一条（不被裸 token 再数一遍）", () => {
+  assert.deepEqual(extractClaims("改了 `src/a.ts`。").paths, ["src/a.ts"]);
+});
+
+test("抽取：否定词在目标之后不生效", () => {
+  // 「改了 a，没有报错」里的「没有」在「改」后面，不能把改动否掉。
+  assert.deepEqual(extractClaims("改了 `src/a.ts`，没有报错。").paths, ["src/a.ts"]);
+});
+
+test("切句：裸句点不切（`a.ts` 里那个点不算句子边界）", () => {
+  assert.deepEqual(extractClaims("改了 `src/a.ts`，然后跑 `pnpm test` 通过了。").paths, [
+    "src/a.ts",
+  ]);
 });
