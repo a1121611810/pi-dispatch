@@ -55,9 +55,16 @@ test("打包：pi 入口被 files 覆盖（否则装出来是空包）", () => {
   assert.match(pkg.main as string, /^\.\/dist\//);
 });
 
-test("打包：能发布——不 private、版本不是占位 0.0.0、git 装能先构建", () => {
+test("打包：能发布——不 private、版本不是占位 0.0.0、用自己的 scope 名", () => {
   assert.notEqual(pkg.private, true, "private:true 会让 npm publish 直接拒绝");
   assert.notEqual(pkg.version, "0.0.0", "0.0.0 是没发过版的占位");
-  assert.ok(scripts.prepare, "dist 不入库，git 装必须靠 prepare 先构建");
   assert.notEqual(pkgName, "pi-dispatch", "裸名在 npm 上属于别人的项目，必须换自己的 scope");
+  assert.match(pkgName, /^@[a-z0-9._-]+\//, "必须是 scoped 名：@<npm 用户名>/<包名>");
+});
+
+test("打包：git 装必须靠入库的 dist，不靠 prepare 现场构建", () => {
+  // pi 的 git 装是 clone + 在 clone 里跑一次包管理器安装（--omit=dev / --prod），
+  // devDeps 不装、pnpm 分支不跑 prepare ⇒ 现场构建这条路不存在。
+  // 正确形态：dist 入库（.gitignore 不再忽略它），装的时候直接有产物。
+  assert.equal(scripts.prepare, undefined, "prepare 会让 npm-only 用户 pnpm: command not found");
 });

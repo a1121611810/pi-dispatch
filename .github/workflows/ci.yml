@@ -20,8 +20,10 @@ jobs:
         with:
           node-version: 22.19.0
           cache: pnpm
-      # pnpm install 会跑 prepare → pnpm build，所以 dist 在这里就有了
+      # dist 入库了，但 CI 仍要重建一次：确认入库的产物与源码一致（防陈旧）
       - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm build:check
       - run: pnpm fmt:check
       - run: pnpm lint
       - run: pnpm check
@@ -37,24 +39,39 @@ jobs:
     needs: gate
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    # 前提两条，任一不成立这一步就红（不是代码问题）：
-    #   ① 仓库是公开的——provenance 靠 OIDC 取签名，私有仓拿不到；
-    #   ② npm 上已经有 @a1121611810 这个 scope 且在你名下（npm org create）。
-    # 私有仓也不许放弃可追溯性的话，改成像 omp 建议的那样：去掉 --provenance，
-    # 用签名 tag + 版本矩阵里的 commit 列顶着。
+    # 用 npm trusted publishing：workflow 在 npmjs.com 上注册为这个包的 trusted
+    # publisher，用 GitHub 的 OIDC token 认证，不需要长期 NPM_TOKEN。
+    #   前提：① 仓库公开（attestation 要求）；② npmjs.com 上给 @goodali/pi-dispatch
+    #   配好 trusted publisher（包名 + workflow 名 + repo）。
+    # tag 就是这次发布的身份：它指着 tarball 构建自的那个 commit，tag 与
+    # package.json 对不上就拒绝发布。
     permissions:
       contents: read
-      id-token: write # provenance 要它
+      id-token: write # trusted publishing 的 OIDC 换 token 要它
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22.19.0
-          cache: pnpm
-          registry-url: https://registry.npmjs.org
+          # Node 是钉死的而非 lts/*：trusted publishing 需要 npm CLI >= 11.5.1
+          node-version: 24
+          # 不设 registry-url：它会往 .npmrc 写一个占位 _authToken，
+          # 把 OIDC 兑换失败变成 PUT 上的误导性 404
+          package-manager-cache: false
       - run: pnpm install --frozen-lockfile
-      # prepublishOnly 在这里再跑一遍廉价门禁：tag 是人打的，别信上一次 run
-      - run: npm publish --provenance --access public
+      - name: 校验 tag 与 package.json 的版本一致
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "${TAG#v}" != "$version" ]; then
+            echo "tag $TAG 与 package.json 版本 $version 不一致" >&2
+            exit 1
+          fi
+      - run: pnpm build
+      # prepublishOnly 在这里再跑一遍廉价门禁：tag 是人打的，别信上一次 run
+      # prepack 必须在 publish 之前单独跑一次：npm 校验 bin 字段是在读 manifest 时做的，
+      # 那时 lifecycle 脚本还没执行——新 clone 没有 dist 时它会先报警再发。
+      - run: npm run prepack
+      # trusted publishing 下 npm 自动生成 attestation，不需要 --provenance
+      - run: npm publish --access public --loglevel verbose

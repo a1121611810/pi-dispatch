@@ -1,5 +1,5 @@
 {
-  "name": "@a1121611810/pi-dispatch",
+  "name": "@goodali/pi-dispatch",
   "version": "0.1.0",
   "description": "Programmable subagent dispatch for pi: queue, spawn, watch, stop, and account for child agents",
   "keywords": [
@@ -17,6 +17,7 @@
   },
   "files": [
     "dist/**/*.js",
+    "CHANGELOG.md",
     "README.md",
     "LICENSE"
   ],
@@ -27,13 +28,13 @@
   },
   "scripts": {
     "build": "rolldown -c",
-    "prepare": "pnpm build",
-    "prepack": "pnpm build",
+    "prepack": "npm run build",
     "prepublishOnly": "pnpm fmt:check && pnpm lint && pnpm check && pnpm test && pnpm check:privacy",
+    "build:check": "pnpm build && git diff --exit-code -- dist",
     "check": "tsrs -p tsconfig.json",
-    "lint": "oxlint",
-    "fmt": "oxfmt",
-    "fmt:check": "oxfmt --check",
+    "lint": "oxlint --ignore-path .oxfmtignore",
+    "fmt": "oxfmt --ignore-path .oxfmtignore",
+    "fmt:check": "oxfmt --check --ignore-path .oxfmtignore",
     "test": "node scripts/test.ts",
     "check:privacy": "node scripts/privacy-gate.ts",
     "sanitize:fixture": "node scripts/sanitize-fixture.ts",

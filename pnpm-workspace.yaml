@@ -8,6 +8,14 @@
 # every machine.
 minimumReleaseAge: 0
 
+# `autoInstallPeers` — pi 装 git 包时跑的是
+#   pnpm install --prod --config.auto-install-peers=false …（package-manager.js:1613-1619）
+# 这个开关写死在 pi 那边，改不了。而 lockfile 里记的是 settings.autoInstallPeers，
+# 两者不一致时 pnpm 直接拒绝安装：
+#   ERR_PNPM_LOCKFILE_CONFIG_MISMATCH ⇒ pnpm 用户装这个包直接失败。
+# 所以这里必须钉成 false，让 lockfile 与 pi 传的参数一致。
+autoInstallPeers: false
+
 # pi 的传递依赖带 install/postinstall 脚本（@google/genai、protobufjs）。它们对本扩展
 # 无用；pnpm 12 用 `allowBuilds` 显式声明「审阅过、不跑」（`onlyBuiltDependencies` 已移除）。
 allowBuilds:

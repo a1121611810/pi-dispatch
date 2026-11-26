@@ -82,13 +82,28 @@ pnpm test:mode         # 真机验收（print/json/rpc/tui + 隔离/黑板/非 g
 
 ## 安装
 
-从 git 装（`dist` 不入库，`prepare` 会在装的时候构建）：
+两种装法都支持，装到的是同一份产物：
 
 ```bash
 pi install git:github.com/a1121611810/pi-dispatch
 ```
 
-本地目录改完想试就用 `pi install ./`。**不要**用 `npm:pi-dispatch`：npm 上那个名字属于别人的项目。
+```bash
+pi install npm:@goodali/pi-dispatch
+```
+
+本地目录改完想试就用 `pi install ./`。
+
+**不要**用 `npm:pi-dispatch`：npm 上那个裸名属于别人的项目（另一个多账号分发工具）。要钉版本就在
+末尾加 `@v0.1.0`（git 装）或 `@0.1.0`（npm 装）。
+
+装完先确认一下扩展真的加载了——pi 找不到入口时**不报错**，只是静默跳过：
+
+```bash
+pi -p "派一个 dispatch_task 并回它的 taskId"
+```
+
+回得出 taskId 才算装对。
 
 ## 许可证
 
