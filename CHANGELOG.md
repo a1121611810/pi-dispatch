@@ -5,6 +5,16 @@
 格式按 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号按
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.2] - 2026-11-26
+
+无功能变化。补齐 npm 搜索关键词，并给包目录加预览图。
+
+- `keywords` 从 4 个补到 16 个，补上 `pi-extension`、`pi-coding-agent`、`subagent`、
+  `multi-agent`、`parallel`、`verification` 等搜索词。
+- `pi.image` 指向 `assets/social-preview.png`；Pi 包目录的卡片会显示这张图。
+- README 重写为英文主文档加中文版，补了安装自检、竞品边界和限制说明。
+- 新增 `CONTRIBUTING.md`、`workflows/release.md` 和社交预览图源文件。
+
 ## [0.1.1] - 2026-11-26
 
 无功能变化。这次发布用来验证 CI 发版链路：打 tag 触发 workflow，用 npm trusted publishing
