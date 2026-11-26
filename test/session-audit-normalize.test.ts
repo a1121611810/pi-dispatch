@@ -221,6 +221,15 @@ test("claude：侧链的写不算主链收据", () => {
   assert.equal(writeOf(normalizeClaude(lines).events).length, 0);
 });
 
+test("claude 真夹具（只读会话）：5 条命令、0 条路径收据", () => {
+  const result = normalizeClaude(fixture("claude-readonly.jsonl"));
+  const bash = bashOf(result.events);
+  assert.equal(bash.length, 5);
+  assert.equal(bash.filter((e) => typeof e.exitCode === "number").length, 5);
+  assert.equal(writeOf(result.events).length, 0, "Read 不算写");
+  assert.equal(result.malformed, 0);
+});
+
 test("跨流：同一份任务在 codex 与 claude 两条流上判词相同", () => {
   // 验收第 3 条。两份夹具是**同一次任务**的两种形状（手工按真机形状写的）：
   // 一条 `pnpm test`、一次写 `src/a.ts`、一句「改了 src/a.ts，pnpm test 跑通了」。
