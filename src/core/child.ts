@@ -437,7 +437,7 @@ interface StreamEvent {
   toolName?: string;
   args?: { path?: unknown; command?: unknown };
   isError?: boolean;
-  result?: { isError?: boolean; structuredContent?: { exit_code?: unknown } };
+  result?: { isError?: boolean };
   /** 工具调用 id：start 与 end 带同一个值，用来把「发起」和「成败」配成一对 */
   toolCallId?: string;
   steering?: unknown;
@@ -507,6 +507,8 @@ function writablePath(toolName: string, args: { path?: unknown } | undefined): s
   // 白名单而不是黑名单。黑名单只排读类工具，于是**任何**带 `path` 参数的工具调用成功
   // 都会被当成「改过文件」——`child_report` 多传一个 `path` 就能凭空造一条收据换到
   // 「已核对」（实测可达）。pi 内置的写类工具只有 edit / write。
+  // shortcut: `sed -i` / `cat >` 这类 bash 副作用没有 args.path，进不了路径收据——
+  // 全程用 bash 改文件又不写正文的孩子可能被判 absent。要么看 worktree，要么认这个盲区。
   if (!WRITE_TOOLS.includes(toolName)) return undefined;
   const path = args?.path;
   if (typeof path !== "string" || !path) return undefined;
@@ -543,19 +545,37 @@ function commandOf(toolName: string, args: { command?: unknown } | undefined): s
  * 声称 exitCode:0 的自述不能拿一条失败观测顶过去。
  */
 function recordCommandText(command: string, acc: StreamAcc): void {
-  if (acc.commands.includes(command)) return;
+  // 同一串重跑：移到队尾（淘汰顺序按最近一次跑），旧条目只留一条。
+  const at = acc.commands.indexOf(command);
+  if (at >= 0) acc.commands.splice(at, 1);
   acc.commands.push(command);
   if (acc.commands.length > MAX_COMMANDS) {
-    acc.commands.shift();
+    const dropped = acc.commands.shift();
+    // 淘汰必须同步：failed 只能是 commands 的子集，
+    // 否则两本账的窗口错位，会把「跑挂过、后来被挤出失败列表」的命令当成功。
+    if (dropped !== undefined) {
+      const i = acc.failedCommands.indexOf(dropped);
+      if (i >= 0) acc.failedCommands.splice(i, 1);
+    }
     acc.commandsTruncated = true;
   }
 }
 
-/** 记一条跑挂的命令（与 commands 同受上限：被挤掉就当没观测到成功过）。 */
+/** 记一条跑挂的命令。账本跟 commands 同一条：淘汰同步，不单独设窗口。 */
 function recordFailedCommand(command: string, acc: StreamAcc): void {
   if (acc.failedCommands.includes(command)) return;
   acc.failedCommands.push(command);
-  if (acc.failedCommands.length > MAX_COMMANDS) acc.failedCommands.shift();
+}
+
+/**
+ * 同一条命令后来跑通了 ⇒ 把失败记录撤掉（末次结局胜）。
+ * 不撤的话「跑挂 → 改代码 → 再跑通过」这个最常见的动作会被判成谎报。
+ * 掩码过的「成功」不算数：`pnpm test || true` 整条成功，测试未必过。
+ */
+function clearFailedCommand(command: string, acc: StreamAcc): void {
+  if (hasMaskingSeparator(command)) return;
+  const i = acc.failedCommands.indexOf(command);
+  if (i >= 0) acc.failedCommands.splice(i, 1);
 }
 
 /**
@@ -602,6 +622,7 @@ function takeToolEvent(event: StreamEvent, acc: StreamAcc): void {
     if (pending.command !== undefined) {
       recordCommandText(pending.command, acc);
       if (failed) recordFailedCommand(pending.command, acc);
+      else clearFailedCommand(pending.command, acc);
     }
   }
 }
@@ -1091,7 +1112,9 @@ export function deliveryUnverified(
   const claims = pathClaims(report);
   // 截断过就不判：丢的是收据条目，不是「没改过」的证据
   if (claims.length === 0 || !delivery || delivery.pathsTruncated) return false;
-  return !claims.some((claim) => delivery.paths.some((path) => pathMatches(claim, path)));
+  // 恢复出来的旧记录可能只有 `delivery: {}`：裸读数组会抛错，把整条队列堵死。
+  const paths = delivery.paths ?? [];
+  return !claims.some((claim) => paths.some((path) => pathMatches(claim, path)));
 }
 
 /**
@@ -1130,16 +1153,32 @@ function claimSatisfied(
   observed: string[],
   failed: string[],
 ): boolean {
-  const segments = commandSegments(claim.command, true);
-  if (segments.length === 0) return false;
-  // 明确声称「exitCode:0」的自述，不能拿一条跑挂的观测顶过去。
-  // 没写 exitCode 的就当「跑过即可」——诚实报告「跑了但挂了」不该被判成谎报。
+  // 明确声称「exitCode:0」= 声称跑通了：只认没跑挂、且成败没被掩码的观测。
+  // 没写 exitCode 的只声称「跑过」——诚实报告「跑了但挂了」不该被判成谎报。
   const wantOk = claim.exitCode === 0;
-  return segments.every((claimSeg) =>
-    observed.some(
-      (command) =>
-        !(wantOk && (failed.includes(command) || hasMaskingSeparator(command))) &&
-        commandSegments(command).some((observedSeg) => segmentsMatch(claimSeg, observedSeg)),
+  const claimTruncated =
+    claim.command.length >= VERIFIED_COMMAND_MAX_CHARS && claim.command.endsWith("…");
+  const claimText = claim.command.replace(/\s+/g, " ").trim();
+  const usable = (command: string): boolean => !wantOk || !failed.includes(command);
+
+  // 照实抄整串（含多行）永远算兑现——「commands exactly as run」写的就该认，
+  // 不该因为观测侧不按换行切而冤枉它。
+  if (
+    observed.some((command) => usable(command) && command.replace(/\s+/g, " ").trim() === claimText)
+  ) {
+    return true;
+  }
+
+  // 否则逐段对质：声称的每一段都要在某条观测里找到出处，
+  // 声称跑通时还要求那一段的成败没被掩码（scanCommand 的 known）。
+  const claimSegs = scanCommand(claim.command, true);
+  if (claimSegs.length === 0) return false;
+  const observedSegs = observed.filter(usable).map((command) => scanCommand(command, false));
+  return claimSegs.every((seg) =>
+    observedSegs.some((segs) =>
+      segs.some(
+        (os) => (!wantOk || os.known) && segmentsMatch(seg.tokens, os.tokens, claimTruncated),
+      ),
     ),
   );
 }
@@ -1150,8 +1189,12 @@ function claimSatisfied(
  * 段级 × token 级：命令必须「是」观测里跑过的一条命令，不能只是别人嘴里的词
  * （echo/grep 正文里的同名字符串不算跑过）。参数交错与环境变量前缀容忍；
  * 方向仍是宁漏勿冤：标了由父方复核，和 deliveryUnverified 一个哲学。
- * shortcut: 不认 time/sudo/npx 等 wrapper 前缀（会误标未跑），也不拆换行（heredoc 由段首挡住）；
- * 误报出现再补 wrapper 白名单。
+ * shortcut: 不认 time/sudo/npx 等 wrapper 前缀（会误标未跑），误报出现再补白名单。
+ * shortcut: 旗标一律当装饰——`pnpm lint --help` 能满足声称的 `pnpm lint`。
+ * 收紧它会把「旗标写法不同」的正常情况判成谎报，按 spec「别乱报警」的优先级放行。
+ * shortcut: 刻意构造的字符串（转义引号、旗标值冒充 token）已按 shell 语义处理，
+ * 但字符串启发式对「专门造一个来骗」的输入不可能做到滴水不漏——判词只是给父方的线索，
+ * 真正的保证是父方会复核（spec「旗标≠一定在撒谎」）。
  */
 export function verifyUnverified(
   report: ChildReport | undefined,
@@ -1160,8 +1203,9 @@ export function verifyUnverified(
   const claims = commandClaims(report);
   // 截断过就不判：观测只留最近 N 条，旧命令被挤掉不是「没跑过」
   if (claims.length === 0 || !delivery || delivery.commandsTruncated) return false;
+  const commands = delivery.commands ?? [];
   const failed = delivery.failedCommands ?? [];
-  return !claims.some((claim) => claimSatisfied(claim, delivery.commands, failed));
+  return !claims.some((claim) => claimSatisfied(claim, commands, failed));
 }
 
 /**
@@ -1175,7 +1219,8 @@ export function deliveryCoverage(
 ): ClaimCoverage | undefined {
   const claims = pathClaims(report);
   if (!delivery || delivery.pathsTruncated) return undefined;
-  const hit = claims.filter((claim) => delivery.paths.some((path) => pathMatches(claim, path)));
+  const paths = delivery.paths ?? [];
+  const hit = claims.filter((claim) => paths.some((path) => pathMatches(claim, path)));
   return hit.length > 0 && hit.length < claims.length
     ? { claimed: claims.length, matched: hit.length }
     : undefined;
@@ -1189,7 +1234,8 @@ export function verifyCoverage(
   const claims = commandClaims(report);
   if (!delivery || delivery.commandsTruncated) return undefined;
   const failed = delivery.failedCommands ?? [];
-  const seen = claims.filter((claim) => claimSatisfied(claim, delivery.commands, failed));
+  const commands = delivery.commands ?? [];
+  const seen = claims.filter((claim) => claimSatisfied(claim, commands, failed));
   return seen.length > 0 && seen.length < claims.length
     ? { claimed: claims.length, matched: seen.length }
     : undefined;
@@ -1254,8 +1300,7 @@ export function deliverableOf(record: DeliverableInput): Deliverable {
     !record.report &&
     (record.delivery?.textChars ?? 0) === 0 &&
     (record.delivery?.paths?.length ?? 0) === 0 &&
-    record.delivery?.pathsTruncated !== true &&
-    record.delivery?.commandsTruncated !== true
+    record.delivery?.pathsTruncated !== true
   ) {
     return "absent";
   }
@@ -1280,27 +1325,63 @@ export function deliverableOf(record: DeliverableInput): Deliverable {
   return claims === 0 ? "unclaimed" : "verified";
 }
 
-/** 空白归一 + 去截尾省略号：截断产生的 … 在 token 化前当通配抹掉。 */
-function normalizeCommand(command: string): string {
-  return command.trim().replace(/\s+/g, " ").replace(/…$/, "");
+/**
+ * 一条切出来的命令段。
+ * `known` ＝ 整条命令成功时，这一段的成功能否被推出来：
+ * 只有和末尾用 `&&` 串起来的那些段才算（`a && b` 成功 ⇒ a、b 都成功）；
+ * 一旦中间隔了 `;` `|` `||` `&` 或换行，前面那些段的成败就被掩掉了。
+ */
+interface CommandSegment {
+  tokens: string[];
+  known: boolean;
 }
 
 /**
- * 按 shell 分隔符切成「命令段」，每段成 token 表；段首 VAR=value 剥掉。
- * 不按换行切——heredoc 正文留在 cat 段内，段首不是声称命令就不算跑过。
+ * 扫一遍命令串，切成段并标出每段「整条成功时能否推出它成功」。引号和反斜杠按 shell 的意思处理：
+ * 引号内的分隔符不切、`\"` 不是闭合引号（否则 `echo "x\" && pnpm test"` 会被切出
+ * 一段干净的 pnpm test）。`&` 紧邻 `>` 是重定向（2>&1 / &>log），不算控制符。
+ *
+ * 「能否推出」的规则：整条命令的退出码只反映**最后一组**的成败；组与组之间只有 `&&` 会把
+ * 成功往前传（`a && b` 成功 ⇒ a 也成功），而 `;` `||` 后台 `&` 和未加引号的换行都会切断。
+ * 管道 `|` 是一组：只有末段的成败代表整组（`pnpm test && ls | cat` 里 pnpm test 仍然可信，
+ * ls 则不可信）。观测侧不按换行切——heredoc 正文留在 cat 段里，段首对不上声称命令。
  */
-function commandSegments(command: string, splitNewlines = false): string[][] {
-  // 引号里的分隔符不切：`echo "x && pnpm test"` 是一段，不是「跑了 pnpm test」。
-  // 换行当分隔符：声称「pnpm test\npnpm lint」是两条命令，不能折成一段靠前缀蒙混。
-  const text = command.trim();
-  const raw: string[] = [];
-  let current = "";
+function scanCommand(command: string, splitNewlines: boolean): CommandSegment[] {
+  type Stage = { tokens: string[]; group: number; lastInGroup: boolean };
   let quote: string | null = null;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i]!;
+  const hasHeredoc = command.includes("<<");
+  const stages: Stage[] = [];
+  const groupSafe: boolean[] = []; // 第 i 组与下一组之间的分隔符是不是 &&
+  let group = 0;
+  let current = "";
+  const takeTokens = (): string[] => {
+    const tokens = current.trim().replace(/\s+/g, " ").split(" ").filter(Boolean);
+    while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0]!)) tokens.shift();
+    current = "";
+    return tokens;
+  };
+  const closeStage = () => {
+    const tokens = takeTokens();
+    if (tokens.length > 0) stages.push({ tokens, group, lastInGroup: false });
+  };
+  const closeGroup = (nextSafe: boolean) => {
+    closeStage();
+    groupSafe[group] = nextSafe;
+    group += 1;
+  };
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!;
     if (quote !== null) {
       current += ch;
+      if (ch === "\\" && i + 1 < command.length) {
+        current += command[++i]!;
+        continue;
+      }
       if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "\\" && i + 1 < command.length) {
+      current += ch + command[++i]!;
       continue;
     }
     if (ch === '"' || ch === "'") {
@@ -1308,114 +1389,106 @@ function commandSegments(command: string, splitNewlines = false): string[][] {
       current += ch;
       continue;
     }
-    if (ch === "\n") {
-      // 观测侧不按换行切：heredoc 正文留在 cat 那一段里，段首是 cat 就匹配不上声称的命令。
-      // 声称侧要切：`pnpm test\npnpm lint` 是两条命令，折成一段会被前缀蒙混过去。
-      if (splitNewlines) {
-        raw.push(current);
-        current = "";
-      } else {
-        current += " ";
-      }
+    const next = command[i + 1];
+    if (ch === "\n" || ch === "\r") {
+      // 未加引号的换行就是命令分隔符：整条退出码只反映最后一行，
+      // 所以它前面的命令成败一律不可信（和 `;` 同罪）。
+      // 例外：heredoc 的正文里有换行，那不是命令——把正文留在 cat 那一段里
+      // （段首是 cat，声称的命令自然对不上），整条按「掩码」处理。
+      if (splitNewlines || !hasHeredoc) closeGroup(false);
+      else current += " ";
       continue;
     }
-    const pair = text.slice(i, i + 2);
-    if (pair === "&&" || pair === "||") {
-      raw.push(current);
-      current = "";
+    if (ch === "&" && next === "&") {
+      closeGroup(true);
       i++;
       continue;
     }
-    if (ch === ";" || ch === "|") {
-      raw.push(current);
-      current = "";
+    if (ch === "&") {
+      const prev = command[i - 1];
+      if (prev === ">" || next === ">") {
+        current += ch;
+        continue;
+      }
+      closeGroup(false);
+      continue;
+    }
+    if (ch === "|" && next === "|") {
+      closeGroup(false);
+      i++;
+      continue;
+    }
+    if (ch === "|") {
+      // 管道：同组换段，不关组
+      closeStage();
+      continue;
+    }
+    if (ch === ";") {
+      closeGroup(false);
       continue;
     }
     current += ch;
   }
-  raw.push(current);
-  return raw
-    .map((segment) => {
-      const tokens = segment.trim().replace(/\s+/g, " ").split(" ").filter(Boolean);
-      while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0]!)) tokens.shift();
-      return tokens;
-    })
-    .filter((tokens) => tokens.length > 0);
+  closeGroup(true);
+
+  // 每组只有末段代表整组；组的可信度从后往前靠 && 传递。
+  const lastStage = new Map<number, number>();
+  stages.forEach((stage, index) => lastStage.set(stage.group, index));
+  for (const index of lastStage.values()) stages[index]!.lastInGroup = true;
+
+  const groupKnown: boolean[] = Array.from({ length: group }, () => false);
+  let acc = true;
+  for (let g = group - 1; g >= 0; g--) {
+    acc = acc && groupSafe[g]!;
+    groupKnown[g] = acc;
+  }
+  return stages.map((stage) => ({
+    tokens: stage.tokens,
+    known: groupKnown[stage.group] === true && stage.lastInGroup,
+  }));
 }
-
-/** a 是 b 的 token 前缀；最后一个 token 允许前缀（截断/半词宽容）。 */
-function tokensPrefix(a: string[], b: string[]): boolean {
-  if (a.length === 0 || a.length > b.length) return false;
-  for (let i = 0; i < a.length - 1; i++) if (a[i] !== b[i]) return false;
-  const lastA = a[a.length - 1]!;
-  const lastB = b[a.length - 1]!;
-  // 末 token 允许前缀，但只在观测确实被截断（… 结尾）时。
-  // 无条件前缀会让 `pnpm test` 被 `pnpm test:unit` 满足——跑了单测就宣称跑过全量。
-  return lastA === lastB || (lastB.endsWith("…") && lastB.slice(0, -1).startsWith(lastA));
-}
-
-/** 同一条基础命令、参数交错：a 的 token 按序出现在 b 里（首 token 必须相同）。 */
-
 /**
- * 两个 token 是否算同一个：完全相等，或某一侧被截断（带 …）时按前缀认。
- * 截断信息留在 token 上（不整串剥掉），所以「pnpm test」不会被「pnpm test:unit」满足。
- */
-function tokensEquivalent(a: string, b: string): boolean {
-  if (a === b) return true;
-  if (a.endsWith("…")) return b.startsWith(a.slice(0, -1));
-  if (b.endsWith("…")) return a.startsWith(b.slice(0, -1));
-  return false;
-}
-
-/**
- * 命令里有没有**会掩码失败**的分隔符（`||`、`;`、`|`、单个 `&`）。
- * pi 只给整条命令一个成败：`pnpm test || true` 整体成功，但 `pnpm test` 到底过没过不知道。
- * 所以这类观测不能拿来当「exitCode:0 已被证实」。`&&` 是安全的（全跑完才算成功）。
+ * 这条命令的成败有没有被掩码（`;` `|` `||` 后台 `&` 未加引号的换行）。
+ * 直接复用扫描器的结论——两处各写一遍扫描器是上一轮漂移的根因。
  */
 function hasMaskingSeparator(command: string): boolean {
-  let quote: string | null = null;
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i]!;
-    if (quote !== null) {
-      if (ch === quote) quote = null;
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      quote = ch;
-      continue;
-    }
-    if (ch === ";") return true;
-    if (ch === "|") return true; // | 和 || 都掩码（后一条的成败不代表前一条）
-    if (ch === "&") {
-      if (command[i + 1] === "&") i++; // && 安全
-      else return true;
-    }
-  }
+  return scanCommand(command, false).some((seg) => !seg.known);
+}
+
+/**
+ * 两个 token 是否同一个。观测侧可能被截断（带 …），那时按前缀认；
+ * **自述侧只有自己也被截断**（超过报告上限、由 normalizeReport 打的 …）才当通配——
+ * 否则 `verified:[{command:"…"}]` 能命中任意一条观测，一条 ls 就换到「已核对」。
+ */
+function tokensEquivalent(claimTok: string, obsTok: string, claimTruncated: boolean): boolean {
+  if (claimTok === obsTok) return true;
+  if (obsTok.endsWith("…")) return claimTok.startsWith(obsTok.slice(0, -1));
+  if (claimTruncated && claimTok.endsWith("…")) return obsTok.startsWith(claimTok.slice(0, -1));
   return false;
 }
 
-function segmentsMatch(claim: string[], observed: string[]): boolean {
-  // 自述的 token 要按序在观测里出现，中间只许夹**旗标及其值**。
-  // 之前是「任意乱序命中」：`pnpm exec echo test` 也算跑过 `pnpm test`（实测可换 verified），
-  // `pnpm test:unit` 也能顶 `pnpm test`。现在非旗标的多余 token 一律不认。
-  // 观测被截断（末 token 带 …）时放宽末 token 为前缀——那是真丢了字，不是宽容。
+/**
+ * 自述的一段 vs 观测的一段。
+ * 自述 token 要按序出现，中间只许夹旗标**及其值**（值被吃掉，不能反手当自述 token，
+ * 否则 `npm --prefix test install` 能满足声称的 `npm test`）。
+ * 观测比自述多出来的尾巴（--coverage 之类）放行。
+ */
+function segmentsMatch(claim: string[], observed: string[], claimTruncated: boolean): boolean {
   if (claim.length === 0) return false;
   let j = 0;
   let afterFlag = false;
   for (let i = 0; i < observed.length && j < claim.length; i++) {
     const token = observed[i]!;
-    if (tokensEquivalent(claim[j]!, token)) {
-      j++;
-      afterFlag = false;
-      continue;
-    }
-    // 旗标本身、以及紧跟在旗标后面的那个值（`--filter core`），算装饰放过
-    if (token.startsWith("-")) {
-      afterFlag = true;
-      continue;
-    }
     if (afterFlag) {
       afterFlag = false;
+      continue;
+    }
+    if (tokensEquivalent(claim[j]!, token, claimTruncated)) {
+      j++;
+      continue;
+    }
+    if (token.startsWith("-")) {
+      afterFlag = true;
       continue;
     }
     return false;

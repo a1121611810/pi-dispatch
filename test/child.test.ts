@@ -1318,8 +1318,47 @@ test("交付判词：收据被截断时不下「空跑」结论", () => {
         commandsTruncated: true,
       },
     }),
-    "unverified",
+    // 命令那一维截断不阻断「空跑」：命令不是交付物，跑了 21 条 bash 却什么都没交，
+    // 父方仍然什么都收不到。路径那一维截断才不能下结论——文件确实可能被改过。
+    "absent",
+    "命令截断不影响「没改过文件」的判断",
   );
+});
+
+test("交付判词：截断但声称的都在保留收据里 ⇒ 不算缺口", () => {
+  // 收窄后的口径：截断**且确实有条自述在保留的收据里找不到**才算缺口。
+  // 21 条命令之后声称最后一条——它就留在窗口里、也确实对得上——不该被判「没法核对」。
+  const delivery = {
+    tools: {},
+    paths: [],
+    commands: ["pnpm test"],
+    errors: 0,
+    textChars: 10,
+    commandsTruncated: true as const,
+  };
+  const report = { summary: "s", why: "", assessment: "", verified: [{ command: "pnpm test" }] };
+  assert.equal(receiptGap(report, delivery), false, "声称的那条还在窗口里 ⇒ 核过了");
+  assert.equal(
+    receiptGap({ ...report, verified: [{ command: "pnpm lint" }] }, delivery),
+    true,
+    "声称的那条被挤出去了 ⇒ 真的没法核",
+  );
+});
+
+test("收件：缺 toolCallId 时记「结局未知」，不静默丢", () => {
+  // 没有 id 就配不上 end，不知道成没成。静默丢掉会让收据凭空变少、
+  // 判词把诚实孩子判成「没有实测支撑」——所以要留下「这一维有东西没核到」的痕迹。
+  const pathOnly = parseChildStream(
+    '{"type":"tool_execution_start","toolName":"edit","args":{"path":"/a"}}',
+  ).delivery;
+  assert.equal(pathOnly.paths.length, 0, "不知道成没成，不落账");
+  assert.equal(pathOnly.pathsTruncated, true, "但要标出这一维有缺口");
+
+  const cmdOnly = parseChildStream(
+    '{"type":"tool_execution_start","toolName":"bash","args":{"command":"pnpm test"}}',
+  ).delivery;
+  assert.equal(cmdOnly.commands.length, 0);
+  assert.equal(cmdOnly.commandsTruncated, true);
 });
 
 test("交付判词：收据缺口按「那一维有自述」算", () => {
@@ -1610,6 +1649,118 @@ test("自检对质：声称带旗标、观测没带 ⇒ 不算命中", () => {
     ),
     false,
     "观测带旗标、声称不带 ⇒ 认",
+  );
+});
+
+test("自检对质：未加引号的换行也是掩码", () => {
+  // shell 里换行就是命令分隔符，整条退出码只反映最后一行。
+  // `pnpm test\necho ok` 成功只说明 echo 成功，测试到底过没过不知道。
+  const ok = {
+    summary: "s",
+    why: "",
+    assessment: "",
+    verified: [{ command: "pnpm test", exitCode: 0 }],
+  };
+  assert.equal(verifyUnverified(ok, cmdDelivery(["pnpm test\necho ok"])), true, "换行掩码了成败");
+  // 照实抄整串不算谎报（「commands exactly as run」就该认）
+  const honest = {
+    summary: "s",
+    why: "",
+    assessment: "",
+    verified: [{ command: "pnpm test\npnpm lint", exitCode: 0 }],
+  };
+  assert.equal(verifyUnverified(honest, cmdDelivery(["pnpm test\npnpm lint"])), false);
+});
+
+test("自检对质：重定向 2>&1 / &>log 不是掩码", () => {
+  // `&` 紧邻 `>` 是重定向，退出码照旧反映命令本身。
+  // 把它当后台控制符会把「捕获日志」这种最常见写法判成谎报。
+  for (const cmd of ["pnpm test 2>&1", "pnpm test &>log", "pnpm test >out 2>&1"]) {
+    // 声称写成命令本体（不含重定向）——这样才能测到掩码判定，
+    // 否则会走「照实抄整串」的捷径，绕过这段逻辑。
+    const claim = {
+      summary: "s",
+      why: "",
+      assessment: "",
+      verified: [{ command: "pnpm test", exitCode: 0 }],
+    };
+    assert.equal(verifyUnverified(claim, cmdDelivery([cmd])), false, `${cmd} 不是掩码`);
+  }
+});
+
+test("自检对质：先失败后跑通，末次结局为准", () => {
+  const stream = [
+    '{"type":"tool_execution_start","toolCallId":"r1","toolName":"bash","args":{"command":"pnpm test"}}',
+    '{"type":"tool_execution_end","toolCallId":"r1","toolName":"bash","isError":true}',
+    '{"type":"tool_execution_start","toolCallId":"r2","toolName":"bash","args":{"command":"pnpm test"}}',
+    '{"type":"tool_execution_end","toolCallId":"r2","toolName":"bash","isError":false}',
+  ].join("\n");
+  const parsed = parseChildStream(stream);
+  assert.equal(parsed.delivery.failedCommands, undefined, "跑通后失败记录要撤掉（空就不出这个键）");
+  assert.equal(
+    verifyUnverified(
+      { summary: "s", why: "", assessment: "", verified: [{ command: "pnpm test", exitCode: 0 }] },
+      parsed.delivery,
+    ),
+    false,
+    "改完再跑通过是常态，不该判谎报",
+  );
+});
+
+test("自检对质：掩码过的「成功」不清失败记录", () => {
+  // `pnpm test || true` 整条成功，但测试未必过——不能拿它把失败记录洗掉。
+  const stream = [
+    '{"type":"tool_execution_start","toolCallId":"m1","toolName":"bash","args":{"command":"pnpm test"}}',
+    '{"type":"tool_execution_end","toolCallId":"m1","toolName":"bash","isError":true}',
+    '{"type":"tool_execution_start","toolCallId":"m2","toolName":"bash","args":{"command":"pnpm test || true"}}',
+    '{"type":"tool_execution_end","toolCallId":"m2","toolName":"bash","isError":false}',
+  ].join("\n");
+  const parsed = parseChildStream(stream);
+  assert.deepEqual(parsed.delivery.failedCommands, ["pnpm test"], "掩码的成功不算数");
+});
+
+test("自检对质：自述侧的 … 只在真被截断时才是通配", () => {
+  // 报告里的命令超过上限时由 normalizeReport 打上 …，那是真截断；
+  // 孩子自己写一个 "…" 不是——否则一条 ls 就能换到「已核对」。
+  const wildcard = { summary: "s", why: "", assessment: "", verified: [{ command: "…" }] };
+  assert.equal(verifyUnverified(wildcard, cmdDelivery(["ls"])), true, "裸 … 不是通配");
+  const fake = { summary: "s", why: "", assessment: "", verified: [{ command: "pnpm test…" }] };
+  assert.equal(verifyUnverified(fake, cmdDelivery(["pnpm test:unit"])), true, "自加的 … 也顶不了");
+});
+
+test("自检对质：反斜杠转义的引号不是闭合引号", () => {
+  // `echo "x\" && pnpm test"` 只打印一句话，没跑 pnpm test。
+  // 把 \" 当闭合引号的话会在 && 处切出一段干净的 pnpm test。
+  const report = { summary: "s", why: "", assessment: "", verified: [{ command: "pnpm test" }] };
+  assert.equal(verifyUnverified(report, cmdDelivery(['echo "x\\" && pnpm test'])), true);
+});
+
+test("自检对质：旗标的值被吃掉，不能反手当自述 token", () => {
+  // `npm --prefix test install` 不是 `npm test`：--prefix 的值 test 是被吃掉的装饰。
+  const claim = {
+    summary: "s",
+    why: "",
+    assessment: "",
+    verified: [{ command: "npm test", exitCode: 0 }],
+  };
+  assert.equal(verifyUnverified(claim, cmdDelivery(["npm --prefix test install"])), true);
+});
+
+test("自检对质：&& 链末端的管道不污染前面那段的成败", () => {
+  // `pnpm test && ls | cat` 整体成功 ⇒ pnpm test 一定成功（否则 && 短路）。
+  // 管道 `ls | cat` 里只有 cat 代表整组，ls 的成败不知道。
+  const claim = {
+    summary: "s",
+    why: "",
+    assessment: "",
+    verified: [{ command: "pnpm test", exitCode: 0 }],
+  };
+  assert.equal(verifyUnverified(claim, cmdDelivery(["pnpm test && ls | cat"])), false);
+  const ls = { summary: "s", why: "", assessment: "", verified: [{ command: "ls", exitCode: 0 }] };
+  assert.equal(
+    verifyUnverified(ls, cmdDelivery(["pnpm test && ls | cat"])),
+    true,
+    "管道首段成败未知",
   );
 });
 

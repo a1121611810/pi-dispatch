@@ -2342,7 +2342,8 @@
             只看正文会把「改了文件但没写报告」误判成空跑，所以 <code>paths</code> 非空就不算；但<b
               >只看 paths 不看 commands</b
             >：跑一句 <code>ls</code> 不代表有交付， 拿 <code>commands</code> 当豁免会让「跑了个 ls
-            就啥也没交」也失去空跑信号。
+            就啥也没交」也失去空跑信号。 <code>paths</code> 那一维被截断时也不判这一档——
+            证据丢了不等于什么都没做；命令那一维截断则不影响（命令不是交付物）。
           </li>
         </ul>
         <p>
@@ -2364,12 +2365,21 @@
             读过不等于改过，否则把声称改过的文件读一遍就能对上；
           </li>
           <li>
-            <b>成功才算兑现。</b>收据在 <code>tool_execution_start</code> 暂存、等
-            <code>tool_execution_end</code> 且
-            <code>isError !== true</code> 才落账——路径和命令同一套。 失败的不算：5 次全失败的
-            <code>edit</code>、跑挂的 <code>pnpm test</code>，都不能拿来换「已核对」。 只有
-            <code>start</code> 没有 <code>end</code>（子代理被杀、日志被切）＝ 不知道成没成，
-            同样不落账，并置截断位；
+            <b>路径：成功才算碰过。</b>在 <code>tool_execution_start</code> 暂存，等
+            <code>tool_execution_end</code> 且 <code>isError !== true</code> 才落账—— 5 次全失败的
+            <code>edit</code> 不能拿来换「已核对」。 只有 <code>start</code> 没有
+            <code>end</code>（子代理被杀、日志被切）＝ 不知道成没成，
+            同样不落账，并置那一维的截断位；缺 <code>toolCallId</code> 时同样处理（不静默丢）。
+            收据只认写类工具的<b>白名单</b>（<code>edit</code> / <code>write</code>）——
+            黑名单会让任何带 <code>path</code> 参数的调用都算「改过文件」，连
+            <code>child_report</code> 多传一个 <code>path</code> 都能伪造收据；
+          </li>
+          <li>
+            <b>命令：跑过就记账，结局跟着记。</b>失败也进 <code>commands</code>（另记
+            <code>failedCommands</code>），因为「跑了但没通过」是出勤不是撒谎——孩子如实写
+            <code>exitCode:1</code> 不该被判成谎报。声称 <code>exitCode:0</code> 要达到「跑通」，
+            观测必须是没跑挂、且成败没被掩码的那一段；没写 <code>exitCode</code> 只声称「跑过」，
+            失败观测也算数。同一串重跑<b>末次结局为准</b>（成功撤掉失败记录）， 两条账窗口同步淘汰；
           </li>
           <li>
             <b>空白自述不算自述。</b><code>files_touched: [" "]</code> 和
@@ -2386,8 +2396,10 @@
           <li>
             两处上限（路径留前 20、命令留最近 20）撞到时置 <code>pathsTruncated</code> /
             <code>commandsTruncated</code>，<b>截断就不判「对不上」</b>——丢的是证据，不是罪证。
-            但那一维<b>有自述</b>时判词也不盖章（<code>receiptGap</code>），否则「先攒满 20
-            条收据，再随便写」是一条洗白通道；
+            缺口（<code>receiptGap</code>）的定义更窄：截断<b>且确实有条自述在保留的收据里找不到</b>。
+            只按「有自述 + 截断过」算的话，第 21 条命令之后声称最后一条（它就留在窗口里、也确实
+            对得上）也会被判「没法核对」——那是冤枉。这条窄口径同时堵住「先攒满 20 条收据、
+            再随便写」的洗白通道；
           </li>
           <li>
             <code>bash</code>/<code>sed</code> 改的文件进不了收据（没有 <code>args.path</code>），
