@@ -68,3 +68,21 @@ test("打包：git 装必须靠入库的 dist，不靠 prepare 现场构建", ()
   // 正确形态：dist 入库（.gitignore 不再忽略它），装的时候直接有产物。
   assert.equal(scripts.prepare, undefined, "prepare 会让 npm-only 用户 pnpm: command not found");
 });
+
+test("打包：bin 指向 dist 里真实存在、带 shebang 的入口", () => {
+  // 空 bin 映射会在装完之后才疼：命令不存在，但 npm pack 一路绿。
+  const bin = (pkg.bin ?? {}) as Record<string, string>;
+  assert.equal(bin["session-audit"], "./dist/session-audit.js", "bin 要指向 dist 里的 CLI");
+  const entry = new URL(bin["session-audit"]!.replace(/^\.\//, ""), root);
+  const text = readFileSync(entry, "utf8");
+  assert.match(text.split("\n")[0] ?? "", /^#!\/usr\/bin\/env node$/, "首行必须是 shebang");
+});
+
+test("打包：审计库面有子路径导出", () => {
+  const exports = (pkg.exports ?? {}) as Record<string, string>;
+  assert.equal(exports["./audit"], "./dist/audit.js");
+  assert.ok(
+    readFileSync(new URL("dist/audit.js", root), "utf8").includes("audit"),
+    "产物存在且非空",
+  );
+});

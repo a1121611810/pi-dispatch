@@ -1405,17 +1405,19 @@ function deliverableOf(record) {
 * 引号内的分隔符不切、`\"` 不是闭合引号（否则 `echo "x\" && pnpm test"` 会被切出
 * 一段干净的 pnpm test）。`&` 紧邻 `>` 是重定向（2>&1 / &>log），不算控制符。
 *
-* 「能否推出」的规则：整条命令的退出码只反映**最后一组**的成败；组与组之间只有 `&&` 会把
-* 成功往前传（`a && b` 成功 ⇒ a 也成功），而 `;` `||` 后台 `&` 和未加引号的换行都会切断。
-* 管道 `|` 是一组：只有末段的成败代表整组（`pnpm test && ls | cat` 里 pnpm test 仍然可信，
-* ls 则不可信）。观测侧不按换行切——heredoc 正文留在 cat 段里，段首对不上声称命令。
+* 信任按 shell 的优先级建树后**自顶向下**传播——`|` 最高，`&&`/`||` 同级左结合，
+* `;`/`&`/未加引号换行最低：
+*   And(l,r)           ⇒ 两边都可推（`a && b` 成功 ⇒ a、b 都成功）
+*   Or(l,r)            ⇒ 两边都不可推（`a || b` 成功只说明「至少一边」，另一条可能根本没跑）
+*   Seq(l,r)/Pipe(l,r) ⇒ 只有右边可推；左边的成败被整条退出码掩掉
+* 父节点不可推时，整棵子树一律不可推。观测侧不按换行切——heredoc 正文留在 cat 段里，
+* 段首对不上声称命令。
 */
 function scanCommand(command, splitNewlines) {
+	const stages = [];
+	const seps = [];
 	let quote = null;
 	const hasHeredoc = command.includes("<<");
-	const stages = [];
-	const groupSafe = [];
-	let group = 0;
 	let current = "";
 	const takeTokens = () => {
 		const tokens = current.trim().replace(/\s+/g, " ").split(" ").filter(Boolean);
@@ -1425,16 +1427,11 @@ function scanCommand(command, splitNewlines) {
 	};
 	const closeStage = () => {
 		const tokens = takeTokens();
-		if (tokens.length > 0) stages.push({
-			tokens,
-			group,
-			lastInGroup: false
-		});
+		if (tokens.length > 0) stages.push(tokens);
 	};
-	const closeGroup = (nextSafe) => {
+	const pushSep = (sep) => {
 		closeStage();
-		groupSafe[group] = nextSafe;
-		group += 1;
+		if (stages.length > 0 && seps.length === stages.length - 1) seps.push(sep);
 	};
 	for (let i = 0; i < command.length; i++) {
 		const ch = command[i];
@@ -1458,12 +1455,12 @@ function scanCommand(command, splitNewlines) {
 		}
 		const next = command[i + 1];
 		if (ch === "\n" || ch === "\r") {
-			if (splitNewlines || !hasHeredoc) closeGroup(false);
+			if (splitNewlines || !hasHeredoc) pushSep("seq");
 			else current += " ";
 			continue;
 		}
 		if (ch === "&" && next === "&") {
-			closeGroup(true);
+			pushSep("and");
 			i++;
 			continue;
 		}
@@ -1472,37 +1469,83 @@ function scanCommand(command, splitNewlines) {
 				current += ch;
 				continue;
 			}
-			closeGroup(false);
+			pushSep("seq");
 			continue;
 		}
 		if (ch === "|" && next === "|") {
-			closeGroup(false);
+			pushSep("or");
 			i++;
 			continue;
 		}
 		if (ch === "|") {
-			closeStage();
+			pushSep("pipe");
 			continue;
 		}
 		if (ch === ";") {
-			closeGroup(false);
+			pushSep("seq");
 			continue;
 		}
 		current += ch;
 	}
-	closeGroup(true);
-	const lastStage = /* @__PURE__ */ new Map();
-	stages.forEach((stage, index) => lastStage.set(stage.group, index));
-	for (const index of lastStage.values()) stages[index].lastInGroup = true;
-	const groupKnown = Array.from({ length: group }, () => false);
-	let acc = true;
-	for (let g = group - 1; g >= 0; g--) {
-		acc = acc && groupSafe[g];
-		groupKnown[g] = acc;
-	}
-	return stages.map((stage) => ({
-		tokens: stage.tokens,
-		known: groupKnown[stage.group] === true && stage.lastInGroup
+	closeStage();
+	while (seps.length > 0 && seps.length >= stages.length) seps.pop();
+	if (stages.length === 0) return [];
+	const PREC = {
+		pipe: 3,
+		and: 2,
+		or: 2,
+		seq: 1
+	};
+	let cursor = 0;
+	const parseExpr = (minPrec) => {
+		let left = { leaf: cursor };
+		while (cursor < seps.length) {
+			const op = seps[cursor];
+			if (PREC[op] < minPrec) break;
+			cursor++;
+			left = {
+				op,
+				l: left,
+				r: parseExpr(PREC[op] + 1)
+			};
+		}
+		return left;
+	};
+	const tree = parseExpr(1);
+	const known = stages.map(() => false);
+	const markAll = (node, value) => {
+		if ("leaf" in node) known[node.leaf] = value;
+		else {
+			markAll(node.l, value);
+			markAll(node.r, value);
+		}
+	};
+	const mark = (node, trusted) => {
+		if (!trusted) {
+			markAll(node, false);
+			return;
+		}
+		if ("leaf" in node) {
+			known[node.leaf] = true;
+			return;
+		}
+		if (node.op === "and") {
+			mark(node.l, true);
+			mark(node.r, true);
+			return;
+		}
+		if (node.op === "or") {
+			markAll(node.l, false);
+			markAll(node.r, false);
+			return;
+		}
+		mark(node.l, false);
+		mark(node.r, true);
+	};
+	mark(tree, true);
+	return stages.map((tokens, index) => ({
+		tokens,
+		known: known[index] === true
 	}));
 }
 /**
