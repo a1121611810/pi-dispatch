@@ -2,7 +2,7 @@
 // 每条用例都写明「实现写错时它凭什么红」——判词链是这一层的全部价值。
 //
 // ── 变异测试（`mutator --no-coverage --mutate-all src/audit`）───────────
-// 当前：350 个位点，杀掉 299，**幸存 51**（41 条给了等价推导，10 条未证；见 docs/audit-mutation.md）
+// 当前：350 个位点，杀掉 300，**幸存 50**（49 条给了等价推导，1 条未证；见 docs/audit-mutation.md）
 // 按类：`?? -> ||` 22、`&& -> ||` 17、`0 -> 1` 15、`=== -> !==` 7、`>= -> >` 6、`true -> false` 6。
 //
 // 能证死的等价类（两条，都不是猜的）：
@@ -707,5 +707,20 @@ test("失败类自述命中「跑过但失败」的收据 ⇒ verified", () => {
 
 test("收据里的换行不拆成两条命令（否则会假装命中）", () => {
   const result = audit([bash("pnpm test\npnpm lint", 0)], "`pnpm test` 跑通了。");
+  assert.equal(result.deliverable, "unverified");
+});
+
+test("带分隔符的失败类自述逐段核对", () => {
+  // 含分隔符的自述走逐段校验（不走整串快路），wantOk=false 时每段都要对得上失败收据。
+  const result = audit(
+    [bash("pnpm test", 1), bash("pnpm lint", 1)],
+    "`pnpm test && pnpm lint` 失败了。",
+  );
+  assert.equal(result.deliverable, "verified");
+});
+
+test("自述比收据长时不算命中（不按前缀放行）", () => {
+  // claimTruncated 是 false：`pnpm test --watch` 不能靠 `pnpm test` 的前缀蒙过去。
+  const result = audit([bash("pnpm test", 0)], "`pnpm test --watch` 跑通了。");
   assert.equal(result.deliverable, "unverified");
 });

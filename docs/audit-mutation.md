@@ -3,10 +3,10 @@
 `pnpm mutate:audit`（收缩到 `src/audit` + 四个测试文件）：
 
 ```
-350 个位点   杀掉 299   幸存 51   超时 0   退出码 3（基线）
+350 个位点   杀掉 300   幸存 50   超时 0   退出码 3（基线）
 ```
 
-**不是零幸存。** 下面把 51 个逐条摆出来：每条要么是「在可达输入上等价」（给推导），
+**不是零幸存。** 下面把 50 个逐条摆出来：每条要么是「在可达输入上等价」（给推导），
 要么是「还没证」（标 G）。
 
 清单怎么来的：`mutator` 每次运行把结局逐条打到 stdout，
@@ -48,6 +48,23 @@
   在可达输入上不可观测。codex 的 `textOf` 不一样——它的结果直接当消息正文用，
   所以那边同一处变异已经被杀掉了。
 
+- **E15** `verdict.ts:45` `scanCommand(r.command, false)` → `true`：**自述侧根本不含换行**——
+  `splitSentences` 先把 `\n` 当硬边界切开，所以 claim 里的命令永远没有换行；
+  而收据侧在这条路径上拿到的命令同样是单段（`collectReceipts` 之前已经按分隔切过）。
+  把变异打进去跑「右侧段命中」「换行自述」两种输入，判词与基线完全一致。
+- **E16** `verdict.ts:30` `scanCommand(claim.command, true)` → `false`：同上，
+  claim 里不存在换行，拆不拆都是同一段。
+- **E17** `normalize-codex.ts:110` `callId !== undefined && cmd !== undefined` → `||`：
+  即使往 `originals` 里写进 `undefined` 键，取值那一步（第 181 行）要求
+  `command.id !== undefined` 才查表，`undefined` 键永远读不到。
+- **E18** `verdict.ts:30` `.filter((seg) => seg.tokens.length > 0)` → `>= 0`：
+  空段只可能来自「以分隔符开头的自述」，而自述命令全部来自代码段、首 token 必须是
+  runner——空段构造不出来；即使构造出来，`usable.length === 0` 的早退也拦在前面。
+- **E19** `normalize-claude.ts:111` `id === undefined || name === undefined` → `&&`：
+  只漏 id 时入表键是 `undefined`，而取表那一步（第 136 行）同样要求
+  `tool_use_id` 有值，键永远读不到；只漏 name 时查到也走不进任何分支
+  （写白名单与 Bash 判定都不成立）。两种输入实测都是空事件流。
+
 ## 还没证的（G）
 
 句读切分、归一化类型闸、判词边界这三类里剩下的条目，每条都标了位点和源码原文。
@@ -81,21 +98,20 @@
 | `normalize-claude.ts:33`  | `&& ->          |                                                                              | `      | `if (typeof b.text === "string" && b.text !== "") parts.push(b.text);`       | `E14` |
 | `normalize-claude.ts:36`  | `> -> >=`       | `return parts.length > 0 ? parts.join("\n") : undefined;`                    | `E14`  |
 | `normalize-claude.ts:76`  | `?? ->          |                                                                              | `      | `const message = (record.message ?? {}) as { content?: unknown };`           | `E5`  |
-| `normalize-claude.ts:111` | `               |                                                                              | -> &&` | `if (id === undefined                                                        |       | name === undefined) continue;` | `G` |
+| `normalize-claude.ts:111` | `               |                                                                              | -> &&` | `if (id === undefined                                                        |       | name === undefined) continue;` | `E19` |
 | `normalize-claude.ts:112` | `?? ->          |                                                                              | `      | `const input = (block.input ?? {}) as {`                                     | `E5`  |
 | `normalize-claude.ts:140` | `?? ->          |                                                                              | `      | `const output = textOf(block.content) ?? "";`                                | `E1`  |
 | `normalize-codex.ts:89`   | `?? ->          |                                                                              | `      | `const payload = (record.payload ?? {}) as {`                                | `E5`  |
-| `normalize-codex.ts:110`  | `&& ->          |                                                                              | `      | `if (callId !== undefined && cmd !== undefined) originals.set(callId, cmd);` | `G`   |
+| `normalize-codex.ts:110`  | `&& ->          |                                                                              | `      | `if (callId !== undefined && cmd !== undefined) originals.set(callId, cmd);` | `E17` |
 | `normalize-codex.ts:116`  | `?? ->          |                                                                              | `      | `topType === "item.completed" ? ((record as { item?: Raw }).item ?? undefin` | `E5`  |
 | `normalize-codex.ts:117`  | `?? ->          |                                                                              | `      | `const item = envelopeItem ?? topItem;`                                      | `E5`  |
 | `normalize-codex.ts:121`  | `?? ->          |                                                                              | `      | `const type = (item.type ?? "").toLowerCase().replace(/[_-]/g, "");`         | `E1`  |
 | `normalize-codex.ts:150`  | `?? ->          |                                                                              | `      | `const text = str(item.text) ?? textOf(item.content);`                       | `E1`  |
 | `normalize-codex.ts:161`  | `?? ->          |                                                                              | `      | `const text = textOf(item.content) ?? str(item.text);`                       | `E1`  |
 | `normalize-codex.ts:181`  | `?? ->          |                                                                              | `      | `(command.id !== undefined ? originals.get(command.id) : undefined) ?? comm` | `E1`  |
-| `verdict.ts:30`           | `true -> false` | `const segs = scanCommand(claim.command, true).filter((seg) => seg.tokens.l` | `G`    |
-| `verdict.ts:30`           | `> -> >=`       | `const segs = scanCommand(claim.command, true).filter((seg) => seg.tokens.l` | `G`    |
-| `verdict.ts:45`           | `false -> true` | `scanCommand(r.command, false).some(`                                        | `G`    |
-| `verdict.ts:46`           | `true -> false` | `(os) => (claim.wantOk ? os.known : true) && segmentsMatch(seg.tokens, os.t` | `G`    |
+| `verdict.ts:30`           | `true -> false` | `const segs = scanCommand(claim.command, true).filter((seg) => seg.tokens.l` | `E16`  |
+| `verdict.ts:30`           | `> -> >=`       | `const segs = scanCommand(claim.command, true).filter((seg) => seg.tokens.l` | `E18`  |
+| `verdict.ts:45`           | `false -> true` | `scanCommand(r.command, false).some(`                                        | `E15`  |
 | `verdict.ts:46`           | `false -> true` | `(os) => (claim.wantOk ? os.known : true) && segmentsMatch(seg.tokens, os.t` | `G`    |
 | `verdict.ts:129`          | `0 -> 1`        | `if (facts.total > 0 && facts.hits === 0) return "unverified";`              | `E10`  |
 | `verdict.ts:131`          | `> -> >=`       | `if (facts.hits > 0 && facts.hits < facts.total) return "partial";`          | `E11`  |
@@ -109,10 +125,10 @@
 | `verdict.ts:188`          | `?? ->          |                                                                              | `      | `const claims = opts.claims ?? extractClaims(text);`                         | `E5`  |
 | `verdict.ts:212`          | `> -> >=`       | `stale: lastSteerIndex(events) > reportIndex(events),`                       | `E7`   |
 
-合计：**44 条给了等价推导，7 条未证**。
+合计：**49 条给了等价推导，1 条未证**。
 
 ## 已有的守备
 
-- 1051 条测试（其中审计 177 条），160 条是确定性语料的行为指纹
+- 1053 条测试（其中审计 179 条），160 条是确定性语料的行为指纹
 - 376 条破坏点全 killed（`pnpm check:breakpoints`）
 - 真机跨流门 `pnpm test:audit-cross`：codex / claude 同判词
