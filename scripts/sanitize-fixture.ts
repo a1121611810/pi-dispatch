@@ -10,7 +10,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 /** 替换规则：按顺序应用。 */
 export const REPLACEMENTS: readonly { from: RegExp; to: string; why: string }[] = [
   {
-    // 家目录：把 /Users/<任何用户名> 换成 /home/dev（不写死某个用户名——规则本身不该带真名）
+    // 家目录：把家目录前缀换成 /home/dev（不写死某个用户名——规则本身不该带真名）
     from: /\/Users\/[A-Za-z0-9._-]+/g,
     to: "/home/dev",
     why: "家目录路径",
@@ -51,6 +51,11 @@ export const REPLACEMENTS: readonly { from: RegExp; to: string; why: string }[] 
     from: /"(sessionId|uuid|parentUuid|session_id|thread_id)":\s*"[0-9a-fA-F-]{8,}"/g,
     to: '"$1":"00000000-0000-4000-8000-000000000000"',
     why: "会话 / 消息 / 工具 id",
+  },
+  {
+    from: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g,
+    to: "dev@example.com",
+    why: "邮箱（git 作者、提交信息里最常见）",
   },
 ];
 
@@ -147,7 +152,7 @@ function scrub(value: unknown): unknown {
       // 这些键的值是标识符（模型路由名 / 供应商 / uuid / 工具调用 id / 绝对时刻），
       // 规则里的正则带引号匹配的是 `"key":"value"` 整体——但值在这里是独立的字符串，
       // 不带引号，所以按键名改，别指望那条正则。
-      if (key === "model") {
+      if (key === "model" || key === "requestedModel") {
         out[key] = typeof item === "string" ? item.replace(/^group\/[a-z-]+$/, "test/model") : item;
         continue;
       }
@@ -169,18 +174,17 @@ function scrub(value: unknown): unknown {
         }
       }
       // 正文同理：样本只用来验「抽不抽得出自述」，不需要几百 KB 的散文。
-      if ((key === "text" || key === "content") && typeof item === "string" && item.length > 2000) {
-        out[key] = `${item.slice(0, 2000)}…`;
+      if ((key === "text" || key === "content") && typeof item === "string") {
+        // 先脱敏再截断：先截断会把后半段的家目录原样留下，而截断点之后没人再看。
+        const clean = scrubString(item);
+        out[key] = clean.length > 2000 ? `${clean.slice(0, 2000)}…` : clean;
         continue;
       }
       // 工具输出是样本里最大的一块，而审计只数「有没有这条命令 / 退出码是多少」，
       // 不看正文。截断它能把样本从几百 KB 压到几十 KB，不影响任何一条断言。
-      if (
-        (key === "aggregated_output" || key === "output") &&
-        typeof item === "string" &&
-        item.length > 120
-      ) {
-        out[key] = `${item.slice(0, 120)}…`;
+      if ((key === "aggregated_output" || key === "output") && typeof item === "string") {
+        const clean = scrubString(item);
+        out[key] = clean.length > 120 ? `${clean.slice(0, 120)}…` : clean;
         continue;
       }
       if (key === "timestamp" && typeof item === "number" && item > 1_000_000_000_000) {
@@ -189,13 +193,18 @@ function scrub(value: unknown): unknown {
       }
       out[key] = scrub(item);
     }
-    return out;
+    // 键也要脱：`FileChange.changes` 的键就是绝对路径，只改值不够。
+    const renamed: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(out)) renamed[scrubString(key)] = item;
+    return renamed;
   }
   return value;
 }
 
 function scrubString(text: string): string {
-  let out = text;
+  // JSON 里嵌 JSON 时斜杠会被转义成 `\/`，正则匹配不到家目录前缀。两者在 JSON 字符串里
+  // 等价，先还原再脱——否则「引号里塞了一份日志」这种字段会把家目录原样带出去。
+  let out = text.replace(/\\\//g, "/");
   for (const { from, to } of REPLACEMENTS) out = out.replace(from, to);
   return out;
 }
