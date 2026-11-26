@@ -728,3 +728,42 @@ test("表驱动：claude 的每种工具与结果组合", () => {
     assert.equal(writeOf(normalized.events).length, item.write, `${item.name}：路径`);
   }
 });
+
+test("类型闸：非字符串的 text 不当正文", () => {
+  const lines = [
+    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: 123 } }),
+  ];
+  assert.equal(messageOf(normalizeCodex(lines).events).length, 0);
+});
+
+test("类型闸：空字符串 text 不当正文", () => {
+  const lines = [
+    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "" } }),
+  ];
+  assert.equal(messageOf(normalizeCodex(lines).events).length, 0);
+});
+
+test("类型闸：字符串形式的 exit_code 不算退出码", () => {
+  const lines = [
+    JSON.stringify({
+      type: "item.completed",
+      item: { type: "command_execution", command: "ls", exit_code: "0" },
+    }),
+  ];
+  const bash = bashOf(normalizeCodex(lines).events);
+  assert.equal(bash.length, 1);
+  assert.equal(typeof bash[0]!.exitCode, "undefined");
+});
+
+test("类型闸：content 是 null 的 tool_result 不崩", () => {
+  const lines = [
+    claudeLine("assistant", [
+      { type: "tool_use", id: "t1", name: "Bash", input: { command: "ls" } },
+    ]),
+    claudeLine("user", [{ type: "tool_result", tool_use_id: "t1", content: null }]),
+  ];
+  const result = normalizeClaude(lines);
+  assert.equal(result.malformed, 0);
+  // 空输出按成功算：marker 没有、is_error 没有、也没后台标记。
+  assert.equal(bashOf(result.events).length, 1);
+});
