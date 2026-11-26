@@ -1,110 +1,200 @@
 # pi-dispatch
 
-Programmable subagent dispatch for [pi](https://github.com/earendil-works/pi).
+[![CI](https://github.com/a1121611810/pi-dispatch/actions/workflows/ci.yml/badge.svg)](https://github.com/a1121611810/pi-dispatch/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/@goodali/pi-dispatch)](https://www.npmjs.com/package/@goodali/pi-dispatch)
+[![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 
-派子代理出去干活，并且管住他们：排队、限流、盯住别卡死、能停、留痕、核对。
+Subagent dispatch for [pi](https://pi.dev): queue children against a memory budget, watch them
+for stalls, stop them, steer them mid-run, and check what they claim against what they actually did.
 
-## 状态
+> Pi ships with powerful defaults but skips features like sub-agents and plan mode. Ask Pi to
+> build what you want, or install a package that does it your way.
+> — [pi's own README](https://github.com/earendil-works/pi)
 
-核心已落地。`src/core/` 是 pi 无关的核心层（可独立测试），`src/index.ts` 是 pi 适配层。
+**A dispatch returns two independent answers: how the process exited, and whether what the child
+claimed matches what it actually did.** Those are recorded separately and never merged.
 
-## 它能干什么
-
-- **派子代理** —— `dispatch_task` 递一段任务，立刻拿编号（长驻宿主 rpc/tui）或等它跑完拿交付物（一次性宿主 print/json）
-- **排队** —— 座位是从内存池切出来的份额，满了 FIFO 排队等，**永远不拒绝**
-- **管住** —— 盯卡住（静默 5 分钟 + 无在飞工具）、超时收掉、能停（排队中的抽掉，在跑的 SIGTERM→SIGKILL）
-- **转向** —— 孩子还在跑时 `dispatch_steer` 插一句话，它在下一个回合边界看到后调整方向继续干；不打断在飞工具，收据分 `sent` / `queued` / `delivered` / `seen` / `undelivered`；终态通知汇总「转向 N 条：送达 D / 生效 S（未送达 U）」
-- **留痕** —— 每次派发一条记录，落 `~/.pi/dispatch/<项目桶>/`，原子写、压缩归档、重启恢复
-- **核对** —— 收据从子代理的动作抽（不依赖它自述）；报告三种通道（tool / prompt-json / none）；自述的文件和收据一个都对不上时标 `deliveryUnverified`（后缀匹配，相对/绝对路径都认），只对上一部分时带 `deliveryPartial`（`{claimed, matched}`）；谎报自检（`verified` 声称跑过的命令、收据 commands 里一条都没观测到）标 `verifyUnverified`，同一部分命中走 `verifyPartial`——意思是「没有实测支撑」，不是「一定在撒谎」
-- **两条轴** —— `status` 只有退出码一个来源，它**不是**质量结论；交付另有一列 `deliverable`（`verified` / `unclaimed` / `partial` / `unverified` / `absent`），定终态时由 registry 算一次。空跑退出 0 = `succeeded` + `absent`，v0.1.0 起账上不再把「进程退 0」当成「干成了」
-
-## 父方工具
-
-| 工具                  | 作用                                                           |
-| --------------------- | -------------------------------------------------------------- |
-| `dispatch_task`       | 派任务（10 个参数：`taskDescription` 必填，其余可选）          |
-| `dispatch_list`       | 查记录（状态 / 时长 / 用量 / 报告 / 收据）                     |
-| `dispatch_blackboard` | 读本会话的共享黑板（只读；板上的话恒为 `trust=unverified`）    |
-| `dispatch_stop`       | 停任务                                                         |
-| `dispatch_steer`      | 运行中改方向（只受理 running；≤4096 字符，一个任务最多 16 条） |
-
-## 设计要点
-
-- **核心层不 import pi** —— 全部业务规则在 `src/core/`，四个依赖（spawn / 读机器 / 时钟 / 存储目录）可注入
-- **转向不新增状态** —— 记录上的一组 `steers` 收据；信箱在任务目录，孩子扩展在 `turn_end` 读，argv / stdin / 退出语义零改动
-- **等待语义由宿主模式定** —— rpc/tui 异步（立刻编号 + 终态通知），print/json 同步等终态（一次性宿主进程会先退出，异步会丢交付物）
-- **TUI 人看面** —— tui 宿主挂常驻 widget + footer 状态（在飞/排队逐条 + 汇总，全部跑完即清）；只算本会话任务（主方戳双对），restore 的历史不上板；人可用 `/steer [消息]` 给在飞孩子插话，回执只承诺 `sent`
-- **座位 = 内存池份额** —— 池子量 = 可用 − 预留（总内存 10%），每座份额 = max(512 MiB, 总内存 2%)（实测校准：子代理峰值 RSS 约 148 MiB）
-- **`allowScripts`** —— 一个布尔透传到拼命令：宽档只加 `-e builtin:codemode`（不动工具表），只读档在 `--tools` 名单里补上 `codemode`——两处都要，漏一处能力就看不见
-
-## 两个开关：隔离与黑板
-
-两个都默认关；不开时记录、argv、孩子工具表、磁盘目录<b>逐字节与以前相同</b>。
-
-- **`isolation: "worktree"`** —— 把子代理放进独立 git worktree（干净检出）。三条代价：① 检出里没有 `node_modules`，要跑测试得自己装依赖；② 交付前**子代理必须自己 commit**（父方不代提交）；③ **merge 归父方**——review 完自己 `git merge --ff-only pi-dispatch/<taskId>`，然后手动 `git worktree remove` + `branch -d` 收尾（清扫只在无账本且过期时做，且非强制）。非 git 仓库里会被安检拒掉（零记录）。**隔离不是沙箱**：它只隔离工作目录，不隔离网络、进程与主目录。
-- **`blackboard: true`** —— 会话级一块板：本会话里开黑板的子代理彼此读写留言，父方用 `dispatch_blackboard` 读。**板上的话不可信**——兄弟子代理写的，读信封恒带 `trust=unverified`，文件里自报的信任一律不认；当线索看，别当事实。作者戳是工具契约（作者取自任务编号，参数伪造不了），**不是安全边界**。`readOnly=strict` 也照样可读可写。只有一个孩子时别开（没人交换，板只是噪音）。
-
-## 已知边界
-
-- **转向的送达点是回合边界** —— 孩子在跑的长工具不会被打断；消息在「工具批次跑完、下一次 LLM 调用前」才进上下文。`sent` 只表示写进了信箱，送到没送到看收据 `state`：`queued`（pi 队列见过）→ `delivered`（user 回显）→ `seen`（其后有过 assistant 回合）。只有 `queued` 证据的退出后保留 `queued`——**已入队、没进 transcript**，不是收据里的 `undelivered`（通知的「未送达」计数会把它算进去）。
-- **最后一个 `turn_end` 之后写进去的转向永远送不到** —— 孩子退出即结束，不重放、不复活；父方看到 `undelivered`，要补就重派。旧 pi 没有 `sendUserMessage` 时孩子不装收件箱，任务照跑，转向同样落 `undelivered`。
-- **报告可能早于最后一次转向** —— 工具通道的报告若早于最后一次送达，记 `reportStale`，失去小窗资格；以最终正文 + delivery 为准复核。
-- **一次性宿主没有插话窗口** —— print/json 里父方阻塞在 `dispatch_task`，转向只对 rpc/tui 有意义。
-- **通知在 turn 边界投递** —— rpc/tui 长驻宿主的终态通知 `deliverAs: "nextTurn"`，要等**下一个** turn 才到模型眼前。子代理在 turn N 结束时完成的通知，turn N 的 turn_end 已过了，最早 turn N+1 才投递。交互式使用没问题（用户会持续发消息）；纯脚本驱动要预期这一点。tui 里人的实时状态看常驻 widget，不依赖这条通道。
-- **print/json 同步等待可能很长** —— 子代理跑几分钟，父方工具调用就一直挂着。有 `timeoutMs` 与卡住判定兜底。
-- **座位 0 时一次性宿主直接退回** —— 机器太挤（可用低于预留）时 `seatCap` 是 0，这个进程里没有任何子代理能结束并腾出座位，因此不等、直接回「machine is too tight」，避免挂死父方。
-- **只读档位不是沙箱** —— strict 挡「改」不挡「读」，pi 的读工具没有目录囚禁。
-- **交付核对只认能在收据里对上的路径** —— 收据只记**写类工具**（edit / write）的 `args.path`；`read`/`grep`/`find`/`ls` 不算（读过不等于改过），`bash`/`sed` 改的文件、或 `..` 这类要按工作目录解析的写法进不了收据，自述这些文件会被标 `deliveryUnverified`。收据撞到 20 条上限被截断时不判对不上（`pathsTruncated` / `commandsTruncated`）。提示的意思是「没有实测支撑」，不是「一定在撒谎」。
-
-## 开发
-
-```bash
-pnpm build             # rolldown 打包到 dist/
-pnpm check             # tsrs 类型检查
-pnpm lint              # oxlint
-pnpm fmt               # oxfmt
-pnpm test              # node:test（Node 22.19+ 原生跑 TS）
-pnpm test:node22       # 用 Node 22.19.0（engines floor）跑一遍
-pnpm check:breakpoints # 破坏点表：每个功能点改坏一处，指名的测试用例必须红
-pnpm mutate            # 广谱变异（需本机 mutator 工具）
-pnpm test:mode         # 真机验收（print/json/rpc/tui + 隔离/黑板/非 git 拒绝腿，真模型调用，慢且花钱；tui 腿需 python3+pyte）
+```
+parent session
+  │
+  ├─ dispatch_task  ──▶ seat pool ──▶ child pi ──▶ tool calls
+  │                     (memory budget)
+  │                     └─ no seat free? queue, FIFO, never reject
+  │
+  ├─ dispatch_steer ──▶ mailbox ──▶ child reads at next turn boundary
+  ├─ dispatch_stop  ──▶ SIGTERM ──▶ SIGKILL
+  │
+  └─ dispatch_list  ◀── ledger ◀── receipts
+                        └─ ~/.pi/dispatch/<project bucket>/
+                           status      = exit code
+                           deliverable = claims vs receipts
 ```
 
-### 两条测试纪律
+## Install
 
-- **每个功能点都要有一条「改坏就必须红」的测试用例。** 写在 `scripts/breakpoints.ts`：
-  `from` 改一处源码（必须唯一出现），`to` 是破坏版，`red` 是必须变红的那条用例标题。
-  `pnpm check:breakpoints` 逐条验：假绿（改了还是绿的）、红错地方（红的是别的用例）、
-  标题写错（0 命中时 node 输出 `ok 1 - <文件名>`、退出码 0，看着像通过）都判红。
-  写不出单行破坏点的功能点列在该文件顶部，逐条写明理由，不静默缺。
-- **真机验收的判断不落在模型散文上。** `scripts/verdicts.ts` 里是纯函数，断言只看任务记录与
-  子代理的 `output.log`；它们自己有夹具用例（`test/verdicts.test.ts`），也各自进破坏点表。
-
-## 安装
-
-两种装法都支持，装到的是同一份产物：
-
-```bash
-pi install git:github.com/a1121611810/pi-dispatch
-```
+Either one installs the same build:
 
 ```bash
 pi install npm:@goodali/pi-dispatch
 ```
 
-本地目录改完想试就用 `pi install ./`。
-
-**不要**用 `npm:pi-dispatch`：npm 上那个裸名属于别人的项目（另一个多账号分发工具）。要钉版本就在
-末尾加 `@v0.1.0`（git 装）或 `@0.1.0`（npm 装）。
-
-装完先确认一下扩展真的加载了——pi 找不到入口时**不报错**，只是静默跳过：
-
 ```bash
-pi -p "派一个 dispatch_task 并回它的 taskId"
+pi install git:github.com/a1121611810/pi-dispatch
 ```
 
-回得出 taskId 才算装对。
+The git form tracks `main`; append `@v0.1.1` to pin. The npm form takes `@0.1.1`.
 
-## 许可证
+Use the scoped name. `pi-dispatch` on npm is a different project by another author.
 
-MIT，见 [LICENSE](./LICENSE)。
+pi does not report an extension whose entry point is missing — it skips it silently. Confirm the
+extension actually loaded:
+
+```bash
+pi -p "dispatch a task and give me its taskId"
+```
+
+A `taskId` in the reply means it is installed. No reply means it is not.
+
+## Compatibility
+
+- Node.js >= 22.19.0
+- `@earendil-works/pi-coding-agent` >= 1.0.0 (peer)
+- Host modes: `rpc` and `tui` dispatch asynchronously and notify on completion; `print` and `json`
+  wait for the terminal state, because a one-shot host process exits before a background child
+  could deliver anything.
+
+## What it does
+
+**Queue.** Seats come from a memory pool: available memory, minus a reserve of 10% of total memory.
+Each seat is 512 MiB or 2% of total, whichever is larger. When seats run out, tasks wait in FIFO
+order.
+`dispatch_task` never rejects for capacity — the official subagent example returns an error past
+8 parallel tasks instead.
+
+**Watch.** A child with no activity for 5 minutes, and no tool call in flight, counts as stalled
+and is shut down.
+
+**Stop.** `dispatch_stop` removes a queued task, or sends SIGTERM then SIGKILL to a running one.
+Stopping one child leaves the others running; Ctrl+C in the official example kills all of them.
+
+**Steer.** `dispatch_steer` writes into a mailbox the child reads at its next turn boundary. In-flight
+tool calls are not interrupted. Up to 4096 characters per message, 16 messages per task.
+
+**Keep a ledger.** Every dispatch writes a record under `~/.pi/dispatch/<project bucket>/`, with
+atomic writes, compressed archives, and restore on restart. Records survive the session.
+
+**Check the delivery.** The report can arrive by tool call, by a JSON block in the prompt, or not
+at all. Paths the child says it wrote are matched against the receipts taken from its `edit` and
+`write` tool calls; commands it says it ran are matched against observed command receipts. See
+[Receipts, not self-reports](#receipts-not-self-reports).
+
+## Why not the built-in subagent example
+
+pi ships `examples/extensions/subagent`, an extension you can copy. It spawns children, streams
+their output, shows per-child token usage, and aborts all of them on Ctrl+C. If one fire-and-forget
+child at a time is all you need, it is smaller than this package.
+
+The two differ where supervision starts to matter:
+
+|                                    | `examples/extensions/subagent`               | pi-dispatch                                  |
+| ---------------------------------- | -------------------------------------------- | -------------------------------------------- |
+| A 9th parallel task                | returns `Too many parallel tasks. Max is 8.` | waits in the queue                           |
+| Stop one child                     | Ctrl+C kills every child                     | `dispatch_stop <taskId>`                     |
+| Change a running child's direction | not supported                                | `dispatch_steer`                             |
+| After a restart                    | records gone                                 | records restored                             |
+| Did it deliver?                    | exit code and output                         | exit code **and** a checked delivery verdict |
+
+`pi-subagents` is the popular package in this space (about 986K downloads a month at the time of
+writing) and it already covers steering and worktree isolation. What it does not do is queue
+against a memory budget or audit a child's claims against its receipts.
+
+## Receipts, not self-reports
+
+The final report a child writes is a claim. The receipts are what pi observed it do. A dispatch
+ends with two values that are computed separately:
+
+- `status` — the process outcome. Exit code is its only source. It says nothing about quality.
+- `deliverable` — whether claims are supported by receipts.
+
+| `deliverable` | Meaning                                                                                               |
+| ------------- | ----------------------------------------------------------------------------------------------------- |
+| `verified`    | Every claimed path and command was found in the receipts.                                             |
+| `unclaimed`   | A report arrived, but it claimed no paths or commands to check. A read-only analysis looks like this. |
+| `partial`     | Some claims matched; the child reports how many of each.                                              |
+| `unverified`  | Claims exist and the receipts do not support them, or the receipt was truncated.                      |
+| `absent`      | No report, empty text, no paths touched. A child that exits 0 having done nothing lands here.         |
+
+`unverified` means **no observed evidence**, not proof of lying. A command run through `bash`, a
+file edited with `sed -i`, or a path written as `..` cannot appear in a receipt, so an honest child
+can be marked `unverified`. The record states what was observed; it does not conclude that the
+child lied.
+
+The exact matching rules — suffix matching for paths, per-segment trust for compound commands, the
+20-entry receipt cap — are in [`docs/spec/core-spec.html`](./docs/spec/core-spec.html).
+
+## Tools
+
+| Tool                  | What it does                                                                  |
+| --------------------- | ----------------------------------------------------------------------------- |
+| `dispatch_task`       | Dispatch a child. `taskDescription` is required; everything else is optional. |
+| `dispatch_list`       | Read records: status, duration, usage, report, receipts.                      |
+| `dispatch_blackboard` | Read this session's shared blackboard. Read-only.                             |
+| `dispatch_steer`      | Change a running child's direction. Running tasks only.                       |
+| `dispatch_stop`       | Stop a task: remove it from the queue, or signal it.                          |
+
+Optional `dispatch_task` parameters include `readOnly` (`strict` or `lenient`), `model`,
+`thinkingLevel`, `timeoutMs`, `projectContext`, `allowScripts`, `isolation`, `blackboard`, and
+`usageBudget`.
+
+## Isolation and blackboard
+
+Both are off by default. With both off, records, argv, the child's tool list, and the on-disk
+layout are unchanged from a plain dispatch.
+
+**`isolation: "worktree"`** puts the child in a separate git worktree with a clean checkout. Three
+costs: the checkout has no `node_modules`, so running tests means installing dependencies; the
+child must commit its own work, because the parent does not commit for it; and merging is the
+parent's job — review, then `git merge --ff-only pi-dispatch/<taskId>`, then remove the worktree
+and delete the branch. Outside a git repository the check refuses the dispatch, leaving no record.
+**Isolation is not a sandbox** — it isolates the working directory, not the network, the process
+tree, or the home directory.
+
+**`blackboard: true`** gives children in this session a shared board they can read and write.
+`dispatch_blackboard` reads it from the parent. **Nothing on the board is trusted**: every message
+arrives with `trust=unverified`, and any trust a file claims about itself is ignored. Treat it as
+leads, not facts. The author stamp is a tool contract, not a security boundary. `readOnly: "strict"`
+children can still read and write the board. With a single child there is nothing to exchange, so
+the board is just noise.
+
+## Limits
+
+- **Steering lands at a turn boundary.** A long tool call in progress is not interrupted; the
+  message enters the child's context after the current tool batch finishes. `sent` only means the
+  message reached the mailbox. Delivery is a separate receipt state: `queued`, `delivered`, `seen`,
+  `undelivered`.
+- **A steer written after the child's last `turn_end` is never delivered.** The child is done; it
+  will not be replayed. The parent sees `undelivered` and must dispatch again.
+- **A report can predate the last steer.** If the tool-channel report is older than the last
+  delivered steer, the record is marked stale and loses its short-window eligibility.
+- **One-shot hosts have no steering window.** In `print` and `json` the parent is blocked inside
+  `dispatch_task`, so steering only makes sense in `rpc` and `tui`.
+- **Notifications arrive at a turn boundary.** In long-lived hosts the completion notification is
+  delivered on the _next_ turn, so a child finishing at the end of turn N is seen at turn N+1.
+- **A synchronous wait can be long.** In `print` and `json` the parent's tool call stays open for the
+  child's whole run. `timeoutMs` and the stall check bound it.
+- **Zero seats returns immediately.** Under memory pressure `seatCap` is 0; no child in this process
+  can finish and free a seat, so the dispatch returns "machine is too tight" rather than hanging.
+- **`readOnly: "strict"` is not a sandbox.** It blocks writes, not reads.
+
+## Documentation
+
+- [`docs/spec/core-spec.html`](./docs/spec/core-spec.html) — design and the delivery verdict rules
+- [`GLOSSARY.md`](./GLOSSARY.md) — terms used in records, receipts, and specs
+- [`CHANGELOG.md`](./CHANGELOG.md) — what changed in each version
+- [`CONTRIBUTING.md`](./CONTRIBUTING.md) — build, test, and the breakpoint discipline
+- [`AGENTS.md`](./AGENTS.md) — working notes for coding agents (in Chinese)
+- [`workflows/release.md`](./workflows/release.md) — release procedure (in Chinese)
+
+## License
+
+MIT, see [LICENSE](./LICENSE).
