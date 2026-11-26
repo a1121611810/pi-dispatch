@@ -116,7 +116,9 @@ export function normalizeCodex(lines: Iterable<string>): NormalizedCodex {
       topType === "item.completed" ? ((record as { item?: Raw }).item ?? undefined) : undefined;
     const item = envelopeItem ?? topItem;
     if (item !== undefined) {
-      const type = (item.type ?? "").toLowerCase();
+      // 历史是 PascalCase，实时是 snake_case——统一去掉分隔符再比，
+      // 否则 `file_change` / `agent_message` 全部认不出来（真机重跑门逮到过）。
+      const type = (item.type ?? "").toLowerCase().replace(/[_-]/g, "");
       if (type === "commandexecution") {
         const command = unwrapShell(item.command);
         if (command !== undefined) {
@@ -132,12 +134,16 @@ export function normalizeCodex(lines: Iterable<string>): NormalizedCodex {
         continue;
       }
       if (type === "filechange") {
+        // 历史：`changes` 是「绝对路径 → {type}」的对象；实时：是 [{path, kind}] 的数组。
         const changes = item.changes;
-        if (changes && typeof changes === "object") {
-          for (const path of Object.keys(changes as Record<string, unknown>)) {
-            writes.push({ path, ...(cwd !== undefined ? { cwd } : {}) });
-          }
-        }
+        const paths = Array.isArray(changes)
+          ? changes
+              .map((entry) => (entry as { path?: unknown }).path)
+              .filter((p): p is string => typeof p === "string")
+          : changes && typeof changes === "object"
+            ? Object.keys(changes as Record<string, unknown>)
+            : [];
+        for (const path of paths) writes.push({ path, ...(cwd !== undefined ? { cwd } : {}) });
         continue;
       }
       if (type === "agentmessage") {

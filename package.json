@@ -59,7 +59,8 @@
     "mutate": "mutator --no-coverage src",
     "test:node24": "npx -y node@24 scripts/test.ts",
     "test:mode": "node scripts/verify-modes.ts",
-    "check:breakpoints": "node scripts/breakpoints.ts"
+    "check:breakpoints": "node scripts/breakpoints.ts",
+    "test:audit-cross": "node scripts/verify-audit-cross.ts"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.5.2",

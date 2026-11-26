@@ -36,6 +36,16 @@ test("codex 真夹具（只读会话）：11 条命令、0 条路径收据", () 
   assert.equal(result.malformed, 0);
 });
 
+test("codex 实时流（真跑抓的）：snake_case 的 file_change / agent_message 都要认", () => {
+  // 这份夹具是 `codex exec --json` 的真输出。历史是 PascalCase、实时是 snake_case，
+  // 而且实时的 `changes` 是数组不是对象——两处都踩过。
+  const result = normalizeCodex(fixture("codex-live.jsonl"));
+  const writes = writeOf(result.events);
+  assert.equal(writes.length, 1, "file_change 的数组形状");
+  assert.equal(writes[0]!.input.path, "/tmp/cx/src/a.txt");
+  assert.ok((result.report ?? "").includes("src/a.txt"), "agent_message.text 要直取");
+});
+
 test("claude 真夹具：13 条命令、3 条写收据、Read 不算写", () => {
   const result = normalizeClaude(fixture("claude-write.jsonl"));
   const bash = bashOf(result.events);
