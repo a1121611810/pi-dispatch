@@ -3,10 +3,10 @@
 `pnpm mutate:audit`（收缩到 `src/audit` + 四个测试文件）：
 
 ```
-350 个位点   杀掉 288   幸存 62   超时 0   退出码 3（基线）
+350 个位点   杀掉 294   幸存 56   超时 0   退出码 3（基线）
 ```
 
-**不是零幸存。** 下面把 62 个逐条摆出来：每条要么是「在可达输入上等价」（给推导），
+**不是零幸存。** 下面把 56 个逐条摆出来：每条要么是「在可达输入上等价」（给推导），
 要么是「还没证」（标 G）。
 
 清单怎么来的：`mutator` 每次运行把结局逐条打到 stdout，
@@ -76,17 +76,11 @@
 | `normalize-claude.ts:33`  | `&& ->          |                                                                              | `      | `if (typeof b.text === "string" && b.text !== "") parts.push(b.text);`       | `G`   |
 | `normalize-claude.ts:36`  | `> -> >=`       | `return parts.length > 0 ? parts.join("\n") : undefined;`                    | `G`    |
 | `normalize-claude.ts:76`  | `?? ->          |                                                                              | `      | `const message = (record.message ?? {}) as { content?: unknown };`           | `E5`  |
-| `normalize-claude.ts:108` | `&& ->          |                                                                              | `      | `if (kind === "tool_use" && type === "assistant") {`                         | `G`   |
 | `normalize-claude.ts:111` | `               |                                                                              | -> &&` | `if (id === undefined                                                        |       | name === undefined) continue;` | `G` |
 | `normalize-claude.ts:112` | `?? ->          |                                                                              | `      | `const input = (block.input ?? {}) as {`                                     | `E5`  |
-| `normalize-claude.ts:127` | `true -> false` | `...(input.run_in_background === true ? { runInBackground: true } : {}),`    | `G`    |
-| `normalize-claude.ts:127` | `true -> false` | `...(input.run_in_background === true ? { runInBackground: true } : {}),`    | `G`    |
 | `normalize-claude.ts:134` | `&& ->          |                                                                              | `      | `if (kind === "tool_result" && type === "user") {`                           | `G`   |
 | `normalize-claude.ts:140` | `?? ->          |                                                                              | `      | `const output = textOf(block.content) ?? "";`                                | `E1`  |
-| `normalize-claude.ts:147` | `true -> false` | `const exitCode = exitCodeOf(output, isError, tool.input.runInBackground ==` | `G`    |
-| `normalize-claude.ts:173` | `true -> false` | `...(message.sidechain ? { sidechain: true as const } : {}),`                | `G`    |
 | `normalize-codex.ts:89`   | `?? ->          |                                                                              | `      | `const payload = (record.payload ?? {}) as {`                                | `E5`  |
-| `normalize-codex.ts:104`  | `&& ->          |                                                                              | `      | `if (cwd === undefined && metaCwd !== undefined) cwd = metaCwd;`             | `G`   |
 | `normalize-codex.ts:110`  | `&& ->          |                                                                              | `      | `if (callId !== undefined && cmd !== undefined) originals.set(callId, cmd);` | `G`   |
 | `normalize-codex.ts:116`  | `?? ->          |                                                                              | `      | `topType === "item.completed" ? ((record as { item?: Raw }).item ?? undefin` | `E5`  |
 | `normalize-codex.ts:117`  | `?? ->          |                                                                              | `      | `const item = envelopeItem ?? topItem;`                                      | `E5`  |
@@ -115,10 +109,10 @@
 | `verdict.ts:188`          | `?? ->          |                                                                              | `      | `const claims = opts.claims ?? extractClaims(text);`                         | `E5`  |
 | `verdict.ts:212`          | `> -> >=`       | `stale: lastSteerIndex(events) > reportIndex(events),`                       | `E7`   |
 
-合计：**41 条给了等价推导，21 条未证**。
+合计：**41 条给了等价推导，15 条未证**。
 
 ## 已有的守备
 
-- 1039 条测试（审计 167 条），其中 160 条是确定性语料的行为指纹
+- 1045 条测试（其中审计 173 条），160 条是确定性语料的行为指纹
 - 376 条破坏点全 killed（`pnpm check:breakpoints`）
 - 真机跨流门 `pnpm test:audit-cross`：codex / claude 同判词

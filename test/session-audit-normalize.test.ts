@@ -1376,3 +1376,104 @@ test("codex：只有 tool_use 没有文字时不产 message 事件", () => {
     [],
   );
 });
+
+test("claude：user 记录里的 Bash 调用不算（哪怕配了结果）", () => {
+  const result = normalizeClaude([
+    JSON.stringify({
+      type: "user",
+      message: {
+        content: [{ type: "tool_use", id: "u1", name: "Bash", input: { command: "ls" } }],
+      },
+    }),
+    JSON.stringify({
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "u1", content: "Exit code 0" }] },
+    }),
+  ]);
+  assert.deepEqual(bashOf(result.events), []);
+});
+
+test("claude：后台命令没有明确退出码时不当跑完", () => {
+  // 输出里没有 `Exit code N`、只有后台标志：四分区落到 else ⇒ 不是收据。
+  const result = normalizeClaude([
+    JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          {
+            type: "tool_use",
+            id: "b1",
+            name: "Bash",
+            input: { command: "pnpm test", run_in_background: true },
+          },
+        ],
+      },
+    }),
+    JSON.stringify({
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: "b1", content: "普通输出" }] },
+    }),
+  ]);
+  assert.deepEqual(bashOf(result.events), []);
+});
+
+test("claude：输出里有明确 `Exit code N` 时按它算，后台标志不覆盖", () => {
+  const result = normalizeClaude([
+    JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          {
+            type: "tool_use",
+            id: "b2",
+            name: "Bash",
+            input: { command: "pnpm test", run_in_background: true },
+          },
+        ],
+      },
+    }),
+    JSON.stringify({
+      type: "user",
+      message: {
+        content: [{ type: "tool_result", tool_use_id: "b2", content: "Exit code 0\n早返回" }],
+      },
+    }),
+  ]);
+  assert.equal(bashOf(result.events)[0]!.exitCode, 0);
+});
+
+test("claude：侧链里的正文不进报告、也不产 message 事件", () => {
+  const result = normalizeClaude([
+    JSON.stringify({
+      type: "assistant",
+      isSidechain: true,
+      message: { content: [{ type: "text", text: "旁支的结论" }] },
+    }),
+    JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "text", text: "主线的结论" }] },
+    }),
+  ]);
+  // 侧链消息仍进事件流（带 sidechain 标记），由判词层过滤——但报告不能取它。
+  assert.equal(result.report, "主线的结论");
+  assert.deepEqual(
+    result.events
+      .filter((e) => e.kind === "message")
+      .map((e) => (e.kind === "message" ? [e.text, e.sidechain === true] : [])),
+    [
+      ["旁支的结论", true],
+      ["主线的结论", false],
+    ],
+  );
+});
+
+test("codex：cwd 取第一条 session_meta，后面的不覆盖", () => {
+  const result = normalizeCodex([
+    JSON.stringify({ type: "session_meta", payload: { cwd: "file:///a" } }),
+    JSON.stringify({ type: "session_meta", payload: { cwd: "file:///b" } }),
+  ]);
+  assert.deepEqual(
+    result.events.find((e) => e.kind === "meta"),
+    { kind: "meta", cwd: "/a" },
+  );
+});
