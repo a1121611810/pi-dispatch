@@ -2,6 +2,23 @@
 import { createReadStream } from "node:fs";
 import { parseArgs } from "node:util";
 import { posix } from "node:path";
+// src/core/steer.ts
+/** 首行标记：整行必须正好是标记——正文/前后缀伪造不算。 */
+const STEER_MARKER_RE = /^\[pi-dispatch-steer #(\d+)\]$/;
+/** 从一段文本的首行取 seq；不是精确标记就 undefined。 */
+function steerSeqFromText(text) {
+	const firstLine = text.split("\n", 1)[0] ?? "";
+	const match = STEER_MARKER_RE.exec(firstLine);
+	if (!match) return void 0;
+	const seq = Number(match[1]);
+	return Number.isInteger(seq) && seq > 0 ? seq : void 0;
+}
+/** user/steering 的 content 可能是 string，也可能是 text block 数组；其余形状为空。 */
+function textOfContent(content) {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content.filter((part) => Boolean(part) && typeof part === "object" && part.type === "text" && typeof part.text === "string").map((part) => part.text).join("\n");
+}
 // src/core/child.ts
 /** 附加块：告诉子代理它是什么、交付物是什么。 */
 const SUBAGENT_CONTEXT_BLOCK = [
@@ -36,6 +53,413 @@ const REPORT_CONTRACT_BLOCK = [
 	"</pi-dispatch-worktree>"
 ].join("\n");
 [SUBAGENT_CONTEXT_BLOCK, REPORT_CONTRACT_BLOCK].join("\n");
+/**
+* 会改文件的工具（pi 内置只有这两个）。收据只认白名单——
+* 黑名单会把「任何带 path 参数的调用」都当改文件，`child_report` 多传个 path 就能伪造收据。
+*/
+const WRITE_TOOLS$1 = ["edit", "write"];
+/** 路径清单上限：父面只看前几条，超出部分不记。 */
+const MAX_PATHS = 20;
+/** 命令清单上限：留最近 N 条——对质关心的是交付前跑没跑。 */
+const MAX_COMMANDS = 20;
+/** 单条命令保留长度：超长截尾。匹配方向是「声称 ⊆ 观测」，截观测的尾不伤命中。 */
+const COMMAND_KEEP_CHARS = 500;
+function emptyStreamAcc() {
+	return {
+		text: "",
+		toolReport: null,
+		observedUsage: null,
+		usageTotal: null,
+		turns: [],
+		observedModel: null,
+		observedProvider: null,
+		tools: Object.create(null),
+		paths: [],
+		commands: [],
+		failedCommands: [],
+		lostPath: false,
+		lostCommand: false,
+		pathsTruncated: false,
+		commandsTruncated: false,
+		errors: 0,
+		malformed: 0,
+		declaredTools: [],
+		queuedSteers: [],
+		deliveredSteers: [],
+		seenSteers: [],
+		pendingSeen: [],
+		pendingWrites: /* @__PURE__ */ new Map()
+	};
+}
+function evidenceOf(acc) {
+	return {
+		queued: acc.queuedSteers,
+		delivered: acc.deliveredSteers,
+		seen: acc.seenSteers,
+		...acc.reportLine !== void 0 ? { reportLine: acc.reportLine } : {}
+	};
+}
+/**
+* pi 给孩子声明的工具名（system 消息的 sections.tools，形如 "- codemode: 跑脚本"）。
+* 这是父方观测到的事实：codemode 在不在声明里，看的是 pi 打的工具清单，
+* 不是孩子正文里复述的字符串。
+*/
+function declaredToolNames(sections) {
+	if (!sections || typeof sections !== "object" || !("tools" in sections)) return [];
+	const tools = sections.tools;
+	if (typeof tools !== "string") return [];
+	const names = [];
+	for (const line of tools.split("\n")) {
+		const match = /^\s*-\s+([A-Za-z0-9_.-]+)\s*:/.exec(line);
+		if (match && !names.includes(match[1])) names.push(match[1]);
+	}
+	return names;
+}
+/**
+* 这是一次写类工具调用要记的路径（读类工具与 bash 不给路径）。
+* 读类工具（read/grep/find/ls）不算——读过不等于改过，否则「自述改了 N 个文件」
+* 只要把那 N 个文件读一遍就能对上（实测可洗白）。
+*/
+function writablePath(toolName, args) {
+	if (!WRITE_TOOLS$1.includes(toolName)) return void 0;
+	const path = args?.path;
+	if (typeof path !== "string" || !path) return void 0;
+	return path;
+}
+/**
+* 记一条改过的路径。到上限就丢并置 truncated。
+* 只在工具调用**成功**后才调（见 takeToolEvent）：失败的不算碰过。
+*/
+function recordPath(path, acc) {
+	if (acc.paths.includes(path)) return;
+	if (acc.paths.length >= MAX_PATHS) {
+		acc.pathsTruncated = true;
+		return;
+	}
+	acc.paths.push(path);
+}
+/**
+* 这次调用要记的命令串（只有 bash——它的效果就是命令行，codemode 最终也走 bash 执行）。
+* 与 `writablePath` 对称：只回答「要记什么」，不落账（落账时机由 takeToolEvent 定）。
+*/
+function commandOf(toolName, args) {
+	if (toolName !== "bash") return void 0;
+	const command = args?.command;
+	if (typeof command !== "string" || !command) return void 0;
+	return command.length > COMMAND_KEEP_CHARS ? `${command.slice(0, COMMAND_KEEP_CHARS)}…` : command;
+}
+/**
+* 记一条跑过的命令。原样记串不解析；保最近 N 条（交付前的验证命令在尾部）。
+* 成功失败都记——跑过就是出勤。是不是「兑现」看 failedCommands（见 claimSatisfied）：
+* 声称 exitCode:0 的自述不能拿一条失败观测顶过去。
+*/
+function recordCommandText(command, acc) {
+	const at = acc.commands.indexOf(command);
+	if (at >= 0) acc.commands.splice(at, 1);
+	acc.commands.push(command);
+	if (acc.commands.length > MAX_COMMANDS) {
+		const dropped = acc.commands.shift();
+		if (dropped !== void 0) {
+			const i = acc.failedCommands.indexOf(dropped);
+			if (i >= 0) acc.failedCommands.splice(i, 1);
+		}
+		acc.commandsTruncated = true;
+	}
+}
+/** 记一条跑挂的命令。账本跟 commands 同一条：淘汰同步，不单独设窗口。 */
+function recordFailedCommand(command, acc) {
+	if (acc.failedCommands.includes(command)) return;
+	acc.failedCommands.push(command);
+}
+/**
+* 同一条命令后来跑通了 ⇒ 把失败记录撤掉（末次结局胜）。
+* 不撤的话「跑挂 → 改代码 → 再跑通过」这个最常见的动作会被判成谎报。
+* 掩码过的「成功」不算数：`pnpm test || true` 整条成功，测试未必过。
+*/
+function clearFailedCommand(command, acc) {
+	if (hasMaskingSeparator(command)) return;
+	const i = acc.failedCommands.indexOf(command);
+	if (i >= 0) acc.failedCommands.splice(i, 1);
+}
+/**
+* 工具轨迹：start 计次并把收据**暂存**，end 计错并决定去留。
+*
+* 为什么要等 end：`isError` 只在 end 上，start 时不知道这次调用成没成。
+* 之前 start 就落账，于是两条洗白通道（都实测可达）：
+*   - 5 次全失败的 edit 也算「碰过 5 个文件」⇒ 照着自述写一遍就换到「已核对」
+*   - 跑挂的 `pnpm test` 也算「跑过」⇒ 声称 `exitCode: 0` 照样「已核对」
+* 路径和命令都按同一套走：**成了才算兑现**。
+*/
+function takeToolEvent(event, acc) {
+	if (event.type === "tool_execution_start") {
+		const name = typeof event.toolName === "string" ? event.toolName : "unknown";
+		acc.tools[name] = (acc.tools[name] ?? 0) + 1;
+		const callId = typeof event.toolCallId === "string" ? event.toolCallId : void 0;
+		const path = writablePath(name, event.args);
+		const command = commandOf(name, event.args);
+		if (callId === void 0) {
+			if (path !== void 0) acc.lostPath = true;
+			if (command !== void 0) acc.lostCommand = true;
+		}
+		if (callId !== void 0 && (path !== void 0 || command !== void 0)) acc.pendingWrites.set(callId, {
+			...path !== void 0 ? { path } : {},
+			...command !== void 0 ? { command } : {}
+		});
+	} else if (event.type === "tool_execution_end") {
+		const failed = event.isError === true || event.result?.isError === true;
+		if (failed) acc.errors++;
+		const callId = typeof event.toolCallId === "string" ? event.toolCallId : void 0;
+		if (callId === void 0) return;
+		const pending = acc.pendingWrites.get(callId);
+		if (pending === void 0) return;
+		acc.pendingWrites.delete(callId);
+		if (pending.path !== void 0 && !failed) recordPath(pending.path, acc);
+		if (pending.command !== void 0) {
+			recordCommandText(pending.command, acc);
+			if (failed) recordFailedCommand(pending.command, acc);
+			else clearFailedCommand(pending.command, acc);
+		}
+	}
+}
+/** 用量：自报的 cacheRead/cacheWrite/cost 缺省就不出键。逐字段 finite——NaN 会污染账。 */
+function takeUsage(usage) {
+	const cost = typeof usage.cost === "number" ? usage.cost : usage.cost?.total;
+	return {
+		input: finiteNumber(usage.input),
+		output: finiteNumber(usage.output),
+		...usage.cacheRead !== void 0 ? { cacheRead: finiteNumber(usage.cacheRead) } : {},
+		...usage.cacheWrite !== void 0 ? { cacheWrite: finiteNumber(usage.cacheWrite) } : {},
+		...cost !== void 0 ? { cost: finiteNumber(cost) } : {}
+	};
+}
+/** ChildUsage → TurnUsage：缺席字段按 0（与 addUsage 的口径一致），promptTokens 当场钉死。 */
+function turnUsageOf(usage) {
+	const input = usage.input ?? 0;
+	const cacheRead = usage.cacheRead ?? 0;
+	const cacheWrite = usage.cacheWrite ?? 0;
+	return {
+		input,
+		output: usage.output ?? 0,
+		cacheRead,
+		cacheWrite,
+		promptTokens: input + cacheRead + cacheWrite
+	};
+}
+/** 有限数才留（NaN / Infinity 一律当没给）。 */
+function finiteNumber(value) {
+	return typeof value === "number" && Number.isFinite(value) ? value : void 0;
+}
+/** assistant 消息：正文「最后一段胜出」，顺带记模型与用量。 */
+function takeAssistant(message, acc) {
+	if (message.role !== "assistant") return;
+	if (typeof message.model === "string") acc.observedModel = message.model;
+	if (typeof message.provider === "string") acc.observedProvider = message.provider;
+	acc.text = (Array.isArray(message.content) ? message.content : []).filter((part) => Boolean(part) && typeof part === "object" && part.type === "text").map((part) => typeof part.text === "string" ? part.text : "").join("\n");
+	if (message.usage) {
+		const usage = takeUsage(message.usage);
+		acc.observedUsage = usage;
+		acc.turns.push(turnUsageOf(usage));
+		acc.usageTotal = addUsage(acc.usageTotal, usage);
+	}
+}
+/** 用量累加：逐轮相加（每轮 usage 是单次请求量，不是累计值）。 */
+function addUsage(total, next) {
+	const sum = (a, b) => (a ?? 0) + (b ?? 0);
+	return {
+		input: sum(total?.input, next.input),
+		output: sum(total?.output, next.output),
+		cacheRead: sum(total?.cacheRead, next.cacheRead),
+		cacheWrite: sum(total?.cacheWrite, next.cacheWrite),
+		cost: sum(total?.cost, next.cost)
+	};
+}
+/** queue_update / steering 元素：字符串或 {text}；其余形状忽略。 */
+function steerText(value) {
+	if (typeof value === "string") return value;
+	if (value && typeof value === "object" && typeof value.text === "string") return value.text;
+	return textOfContent(value);
+}
+/** queue_update：只记带标记的 seq；空队列不清已有证据。 */
+function takeQueueUpdate(event, acc, line) {
+	const items = Array.isArray(event.steering) ? event.steering : [];
+	for (const item of items) {
+		const seq = steerSeqFromText(steerText(item));
+		if (seq === void 0) continue;
+		if (!acc.queuedSteers.some((entry) => entry.seq === seq)) acc.queuedSteers.push({
+			seq,
+			line
+		});
+	}
+}
+/** user 回显：首行精确标记 + 该 seq 已进过 steering 队列才算送达（初始 prompt 伪造不算）。 */
+function takeUserSteer(message, acc, line) {
+	const seq = steerSeqFromText(textOfContent(message.content));
+	if (seq === void 0) return;
+	if (!acc.queuedSteers.some((entry) => entry.seq === seq)) return;
+	if (!acc.deliveredSteers.some((entry) => entry.seq === seq)) {
+		acc.deliveredSteers.push({
+			seq,
+			line
+		});
+		acc.pendingSeen.push(seq);
+	}
+}
+/** assistant 回合：回显后的第一条 assistant 记 seen；再后面的不重复记。 */
+function takeAssistantSeen(acc, line) {
+	for (const seq of acc.pendingSeen) if (!acc.seenSteers.some((entry) => entry.seq === seq)) acc.seenSteers.push({
+		seq,
+		line
+	});
+	acc.pendingSeen = [];
+}
+/** 工具通道的报告：structuredContent > details.report > details 本体。 */
+function takeToolReport(message, acc, line) {
+	if (message.role !== "toolResult" || message.toolName !== "child_report") return;
+	const candidate = message.structuredContent ?? message.details?.report ?? message.details;
+	if (candidate && typeof candidate.summary === "string") {
+		acc.toolReport = normalizeReport(candidate);
+		acc.reportLine = line;
+	}
+}
+/** 只处理转向证据；返回是否已消费该事件。 */
+function takeSteerEvent(event, acc, line) {
+	if (event.type === "queue_update") {
+		takeQueueUpdate(event, acc, line);
+		return true;
+	}
+	if (event.type !== "message_end" || !event.message) return false;
+	if (event.message.role === "user") {
+		takeUserSteer(event.message, acc, line);
+		return true;
+	}
+	if (event.message.role === "assistant") {
+		takeAssistantSeen(acc, line);
+		return true;
+	}
+	return false;
+}
+/**
+* 一行 JSON 变成一个事件；畸形行返回 undefined（不许毒化整次解析）。
+* `type` 必须是字符串：`{"type":5}` 不是事件，是坏数据。
+*/
+function parseLine(line) {
+	const trimmed = line.trim();
+	if (!trimmed.startsWith("{")) return void 0;
+	try {
+		const parsed = JSON.parse(trimmed);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return void 0;
+		const event = parsed;
+		if (event.type !== void 0 && typeof event.type !== "string") return void 0;
+		return event;
+	} catch {
+		return;
+	}
+}
+/**
+* 解析 pi --mode json 的事件流（JSONL，一行一个 JSON 对象）。
+* 单个畸形事件不许毒化整次解析——content 形状随 pi 版本变。
+*/
+function parseChildStream(stdout) {
+	const acc = emptyStreamAcc();
+	for (const [index, line] of stdout.split("\n").entries()) {
+		const event = parseLine(line);
+		if (!event) {
+			if (line.trim() !== "") acc.malformed += 1;
+			continue;
+		}
+		const lineNo = index + 1;
+		if (event.type === "queue_update") {
+			takeSteerEvent(event, acc, lineNo);
+			continue;
+		}
+		if (event.type?.startsWith("tool_execution_")) {
+			takeToolEvent(event, acc);
+			continue;
+		}
+		if (event.type !== "message_end" || !event.message) continue;
+		if (event.message.role === "system") {
+			for (const name of declaredToolNames(event.message.sections)) if (!acc.declaredTools.includes(name)) acc.declaredTools.push(name);
+			continue;
+		}
+		if (event.message.role === "user") {
+			takeSteerEvent(event, acc, lineNo);
+			continue;
+		}
+		if (event.message.role === "assistant") {
+			takeAssistant(event.message, acc);
+			takeSteerEvent(event, acc, lineNo);
+		}
+		takeToolReport(event.message, acc, lineNo);
+	}
+	let danglingPath = false;
+	let danglingCommand = false;
+	for (const pending of acc.pendingWrites.values()) {
+		if (pending.path !== void 0) danglingPath = true;
+		if (pending.command !== void 0) danglingCommand = true;
+	}
+	return {
+		text: acc.text,
+		toolReport: acc.toolReport,
+		observedUsage: acc.observedUsage,
+		observedUsageTotal: acc.usageTotal,
+		observedTurns: acc.turns,
+		observedModel: acc.observedModel,
+		observedProvider: acc.observedProvider,
+		delivery: {
+			tools: acc.tools,
+			paths: acc.paths,
+			commands: acc.commands,
+			...acc.failedCommands.length > 0 ? { failedCommands: [...acc.failedCommands] } : {},
+			errors: acc.errors,
+			textChars: acc.text.length,
+			...acc.malformed > 0 ? { malformed: acc.malformed } : {},
+			...acc.pathsTruncated || danglingPath || acc.lostPath ? { pathsTruncated: true } : {},
+			...acc.commandsTruncated || danglingCommand || acc.lostCommand ? { commandsTruncated: true } : {}
+		},
+		declaredTools: acc.declaredTools,
+		steerEvidence: evidenceOf(acc)
+	};
+}
+/** 报告散文段的上限：summary/why/assessment 各 2KB——report 本身是限字摘要，这是「有回执优先」档的前提。 */
+const REPORT_PROSE_MAX_CHARS = 2048;
+/** 自称命令的保留长度：声称要短，截尾只伤奇葩不构成误报。 */
+const VERIFIED_COMMAND_MAX_CHARS = 200;
+function clipReportProse(text) {
+	return text.length > REPORT_PROSE_MAX_CHARS ? `${text.slice(0, REPORT_PROSE_MAX_CHARS)}…` : text;
+}
+function normalizeReport(parsed) {
+	return {
+		summary: clipReportProse(parsed.summary),
+		why: typeof parsed.why === "string" ? clipReportProse(parsed.why) : "",
+		assessment: typeof parsed.assessment === "string" ? clipReportProse(parsed.assessment) : "",
+		findings: Array.isArray(parsed.findings) ? parsed.findings.filter((f) => typeof f?.what === "string").slice(0, MAX_REPORT_ITEMS) : void 0,
+		files_touched: Array.isArray(parsed.files_touched) ? parsed.files_touched.filter((f) => typeof f === "string").slice(0, MAX_REPORT_ITEMS) : void 0,
+		verified: Array.isArray(parsed.verified) ? parsed.verified.filter((v) => typeof v?.command === "string").slice(0, MAX_REPORT_ITEMS).map((v) => ({
+			command: v.command.length > VERIFIED_COMMAND_MAX_CHARS ? `${v.command.slice(0, VERIFIED_COMMAND_MAX_CHARS)}…` : v.command,
+			...typeof v.exitCode === "number" && Number.isInteger(v.exitCode) && v.exitCode >= 0 && v.exitCode <= 255 ? { exitCode: v.exitCode } : {}
+		})) : void 0,
+		usage: normalizeUsage(parsed.usage)
+	};
+}
+/** 报告里清单类字段的条数上限：孩子自报一万条也不许撑爆父方的内存与列表。 */
+const MAX_REPORT_ITEMS = 50;
+/** 自报用量逐字段必须是有限数：NaN / Infinity 会污染账。 */
+function normalizeUsage(usage) {
+	if (!usage || typeof usage !== "object") return void 0;
+	const out = {};
+	for (const field of [
+		"input",
+		"output",
+		"cost",
+		"turns",
+		"cacheRead",
+		"cacheWrite"
+	]) {
+		const value = usage[field];
+		if (typeof value === "number" && Number.isFinite(value)) out[field] = value;
+	}
+	return Object.keys(out).length > 0 ? out : void 0;
+}
 /**
 * 交付核对：自述的路径和收据里的路径是不是同一个文件。
 * 两边写法常不同（相对 vs 绝对），所以比结尾；但按分隔符对齐，
@@ -191,6 +615,13 @@ function scanCommand(command, splitNewlines) {
 		tokens,
 		known: known[index] === true
 	}));
+}
+/**
+* 这条命令的成败有没有被掩码（`;` `|` `||` 后台 `&` 未加引号的换行）。
+* 直接复用扫描器的结论——两处各写一遍扫描器是上一轮漂移的根因。
+*/
+function hasMaskingSeparator(command) {
+	return scanCommand(command, false).some((seg) => !seg.known);
 }
 /**
 * 两个 token 是否同一个。观测侧可能被截断（带 …），那时按前缀认；
@@ -920,9 +1351,41 @@ function normalizeClaude(lines) {
 		malformed
 	};
 }
+// src/audit/normalize-pi.ts
+function normalizePi(lines) {
+	const parsed = parseChildStream([...lines].join("\n"));
+	const events = [];
+	for (const path of parsed.delivery.paths) events.push({
+		kind: "tool",
+		name: "write",
+		input: { path }
+	});
+	const failed = new Set(parsed.delivery.failedCommands);
+	for (const command of parsed.delivery.commands) events.push({
+		kind: "tool",
+		name: "bash",
+		input: { command },
+		exitCode: failed.has(command) ? 1 : 0
+	});
+	const text = parsed.text.trim();
+	if (text !== "") events.push({
+		kind: "message",
+		role: "assistant",
+		text
+	});
+	return {
+		events,
+		report: text === "" ? null : text,
+		malformed: 0
+	};
+}
 // src/bin/session-audit.ts
-const FORMATS = ["codex", "claude"];
-const USAGE = `用法：session-audit <file.jsonl> --format codex|claude [--cwd DIR] [--json] [--strict]
+const FORMATS = [
+	"codex",
+	"claude",
+	"pi"
+];
+const USAGE = `用法：session-audit <file.jsonl> --format codex|claude|pi [--cwd DIR] [--json] [--strict]
 
   0  verified（或 unclaimed；--strict 时 unclaimed 算 1）
   1  partial / unverified / absent
@@ -1005,7 +1468,7 @@ async function main(argv) {
 		console.error(`读不了 ${file}`);
 		return 2;
 	}
-	const normalized = format === "codex" ? normalizeCodex(lines) : normalizeClaude(lines);
+	const normalized = format === "codex" ? normalizeCodex(lines) : format === "claude" ? normalizeClaude(lines) : normalizePi(lines);
 	const events = normalized.events;
 	if (events.length === 0) {
 		console.error(`这份文件一条事件都没认出来（${format}）：${file}`);

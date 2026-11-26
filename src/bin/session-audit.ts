@@ -6,13 +6,13 @@
 //   2  解析不了这份文件（不可读 / 一条事件都没认出来 / --format 不认识）
 import { createReadStream } from "node:fs";
 import { parseArgs } from "node:util";
-import { audit, normalizeClaude, normalizeCodex } from "../audit/index.ts";
+import { audit, normalizeClaude, normalizeCodex, normalizePi } from "../audit/index.ts";
 import type { AuditResult, SessionEvent } from "../audit/index.ts";
 
-const FORMATS = ["codex", "claude"] as const;
+const FORMATS = ["codex", "claude", "pi"] as const;
 type Format = (typeof FORMATS)[number];
 
-const USAGE = `用法：session-audit <file.jsonl> --format codex|claude [--cwd DIR] [--json] [--strict]
+const USAGE = `用法：session-audit <file.jsonl> --format codex|claude|pi [--cwd DIR] [--json] [--strict]
 
   0  verified（或 unclaimed；--strict 时 unclaimed 算 1）
   1  partial / unverified / absent
@@ -104,7 +104,11 @@ async function main(argv: string[]): Promise<number> {
   }
 
   const normalized =
-    format === ("codex" satisfies Format) ? normalizeCodex(lines) : normalizeClaude(lines);
+    format === ("codex" satisfies Format)
+      ? normalizeCodex(lines)
+      : format === ("claude" satisfies Format)
+        ? normalizeClaude(lines)
+        : normalizePi(lines);
   const events: SessionEvent[] = normalized.events;
   if (events.length === 0) {
     console.error(`这份文件一条事件都没认出来（${format}）：${file}`);

@@ -3,7 +3,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { audit, normalizeClaude, normalizeCodex, unwrapShell } from "../src/audit/index.ts";
+import {
+  audit,
+  normalizeClaude,
+  normalizeCodex,
+  normalizePi,
+  unwrapShell,
+} from "../src/audit/index.ts";
 import type { SessionEvent } from "../src/audit/index.ts";
 
 const fixture = (name: string): string[] =>
@@ -766,4 +772,187 @@ test("类型闸：content 是 null 的 tool_result 不崩", () => {
   assert.equal(result.malformed, 0);
   // 空输出按成功算：marker 没有、is_error 没有、也没后台标记。
   assert.equal(bashOf(result.events).length, 1);
+});
+
+// ── 逐字段 deepEqual：一条用例钉死整个形状 ────────────────────────────────
+// 计数只说明「数量对」，形状错（字段缺省、顺序、类型）照样漏。这两条把整份输出
+// 一次比完——归一化层的任何字段级变异都跑不掉。
+
+test("形状：codex 一条完整会话归一化后逐字段相等", () => {
+  const lines = [
+    JSON.stringify({ type: "session_meta", payload: { cwd: "file:///repo" } }),
+    JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "exec_command",
+        call_id: "c1",
+        arguments: '{"cmd":"ls"}',
+      },
+    }),
+    JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: {
+          type: "CommandExecution",
+          id: "c1",
+          command: ["/bin/zsh", "-lc", "rtk ls"],
+          exit_code: 0,
+        },
+      },
+    }),
+    JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: { type: "FileChange", changes: { "/repo/a.ts": { type: "add" } } },
+      },
+    }),
+    JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "done" }],
+      },
+    }),
+  ];
+  assert.deepEqual(normalizeCodex(lines), {
+    events: [
+      { kind: "meta", cwd: "/repo" },
+      { kind: "tool", name: "bash", input: { command: "ls" }, exitCode: 0 },
+      { kind: "tool", name: "write", input: { path: "/repo/a.ts" }, cwd: "/repo" },
+      { kind: "message", role: "assistant", text: "done" },
+    ],
+    report: "done",
+    malformed: 0,
+  });
+});
+
+test("形状：claude 一次会话归一化后逐字段相等", () => {
+  const lines = [
+    claudeLine("assistant", [
+      { type: "tool_use", id: "t1", name: "Edit", input: { file_path: "/repo/a.ts" } },
+      { type: "tool_use", id: "t2", name: "Bash", input: { command: "pnpm test" } },
+      { type: "text", text: "做完了" },
+    ]),
+    claudeLine("user", [
+      { type: "tool_result", tool_use_id: "t1", content: "ok" },
+      { type: "tool_result", tool_use_id: "t2", content: "Exit code 0\nok" },
+    ]),
+  ];
+  assert.deepEqual(normalizeClaude(lines), {
+    events: [
+      { kind: "tool", name: "write", input: { path: "/repo/a.ts" } },
+      { kind: "tool", name: "bash", input: { command: "pnpm test" }, exitCode: 0 },
+      { kind: "message", role: "assistant", text: "做完了" },
+    ],
+    report: "做完了",
+    malformed: 0,
+  });
+});
+
+// ── pi：同一件事的第三种形状 ────────────────────────────────────────────
+
+test("形状：pi 一条会话归一化后逐字段相等", () => {
+  const lines = [
+    JSON.stringify({
+      type: "tool_execution_start",
+      toolName: "edit",
+      toolCallId: "1",
+      args: { path: "/repo/a.ts" },
+    }),
+    JSON.stringify({ type: "tool_execution_end", toolCallId: "1", isError: false }),
+    JSON.stringify({
+      type: "tool_execution_start",
+      toolName: "bash",
+      toolCallId: "2",
+      args: { command: "pnpm test" },
+    }),
+    JSON.stringify({ type: "tool_execution_end", toolCallId: "2", isError: false }),
+    JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "改了 `src/a.ts`，`pnpm test` 跑通了。" }],
+      },
+    }),
+  ];
+  assert.deepEqual(normalizePi(lines), {
+    events: [
+      { kind: "tool", name: "write", input: { path: "/repo/a.ts" } },
+      { kind: "tool", name: "bash", input: { command: "pnpm test" }, exitCode: 0 },
+      { kind: "message", role: "assistant", text: "改了 `src/a.ts`，`pnpm test` 跑通了。" },
+    ],
+    report: "改了 `src/a.ts`，`pnpm test` 跑通了。",
+    malformed: 0,
+  });
+});
+
+test("pi：跑挂的命令记 exitCode 1，判词跟着降", () => {
+  const lines = [
+    JSON.stringify({
+      type: "tool_execution_start",
+      toolName: "bash",
+      toolCallId: "2",
+      args: { command: "pnpm test" },
+    }),
+    JSON.stringify({ type: "tool_execution_end", toolCallId: "2", isError: true }),
+    JSON.stringify({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "`pnpm test` 跑通了。" }] },
+    }),
+  ];
+  const normalized = normalizePi(lines);
+  assert.equal(bashOf(normalized.events)[0]!.exitCode, 1);
+  assert.equal(audit(normalized.events, normalized.report).deliverable, "unverified");
+});
+
+test("跨流（三家）：同一个任务三种形状判词相同", () => {
+  const text = "改了 `src/a.ts`，`pnpm test` 跑通了。";
+  const codex = normalizeCodex([
+    JSON.stringify({
+      type: "item.completed",
+      item: { type: "file_change", changes: [{ path: "/repo/src/a.ts" }] },
+    }),
+    JSON.stringify({
+      type: "item.completed",
+      item: { type: "command_execution", command: "pnpm test", exit_code: 0 },
+    }),
+    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text } }),
+  ]);
+  const claude = normalizeClaude([
+    claudeLine("assistant", [
+      { type: "tool_use", id: "t1", name: "Edit", input: { file_path: "/repo/src/a.ts" } },
+      { type: "tool_use", id: "t2", name: "Bash", input: { command: "pnpm test" } },
+    ]),
+    claudeLine("user", [
+      { type: "tool_result", tool_use_id: "t1", content: "ok" },
+      { type: "tool_result", tool_use_id: "t2", content: "Exit code 0" },
+    ]),
+    claudeLine("assistant", [{ type: "text", text }]),
+  ]);
+  const pi = normalizePi([
+    JSON.stringify({
+      type: "tool_execution_start",
+      toolName: "edit",
+      toolCallId: "1",
+      args: { path: "/repo/src/a.ts" },
+    }),
+    JSON.stringify({ type: "tool_execution_end", toolCallId: "1", isError: false }),
+    JSON.stringify({
+      type: "tool_execution_start",
+      toolName: "bash",
+      toolCallId: "2",
+      args: { command: "pnpm test" },
+    }),
+    JSON.stringify({ type: "tool_execution_end", toolCallId: "2", isError: false }),
+    JSON.stringify({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text }] },
+    }),
+  ]);
+  const verdicts = [codex, claude, pi].map((r) => audit(r.events, r.report).deliverable);
+  assert.deepEqual(verdicts, ["verified", "verified", "verified"]);
 });

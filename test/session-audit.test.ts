@@ -2,7 +2,7 @@
 // 每条用例都写明「实现写错时它凭什么红」——判词链是这一层的全部价值。
 //
 // ── 变异测试（`mutator --no-coverage --mutate-all src/audit`）───────────
-// 当前：345 个位点，杀掉 241，**幸存 104**，0 超时。**不是零幸存**——这是明账。
+// 当前：350 个位点，杀掉 250，**幸存 100**，0 超时。**不是零幸存**——这是明账。
 // 按类：`?? -> ||` 22、`&& -> ||` 17、`0 -> 1` 15、`=== -> !==` 7、`>= -> >` 6、`true -> false` 6。
 //
 // 能证死的等价类：`?? -> ||` 的前提是左值只可能是 `string | undefined`（`str()`
@@ -472,4 +472,27 @@ test("审计：maxReceipts 传 0 就是一条都不留（不是回落到默认 2
   const result = audit([bash("a", 0)], null, { maxReceipts: 0 });
   assert.equal(result.receipts.commands.length, 0);
   assert.equal(result.truncated, true);
+});
+
+test("形状：一次完整审计的结果逐字段相等", () => {
+  // 判词层最容易漏的不是「判词对不对」，而是 claims / receipts / mismatch / notes
+  // 这些输出的字段级差异。整份 deepEqual 一次钉死。
+  const result = audit(
+    [write("src/a.ts"), bash("pnpm lint", 0), bash("pnpm test", 1)],
+    "改了 `src/a.ts`，`pnpm test` 跑通了。",
+  );
+  assert.deepEqual(result, {
+    deliverable: "partial",
+    claims: { paths: ["src/a.ts"], commands: ["pnpm test"] },
+    receipts: {
+      paths: ["src/a.ts"],
+      commands: [
+        { command: "pnpm lint", exitCode: 0, trusted: true },
+        { command: "pnpm test", exitCode: 1, trusted: true },
+      ],
+    },
+    mismatch: { paths: [], commands: ["pnpm test"] },
+    truncated: false,
+    notes: [],
+  });
 });

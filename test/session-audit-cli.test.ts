@@ -64,9 +64,30 @@ test("CLI：解析不了 ⇒ 退出 2（一条事件都没认出来）", () => {
   });
 });
 
-test("CLI：`--format` 不认识 ⇒ 退出 2（含 pi，v1 不做）", () => {
+test("CLI：`--format` 不认识 ⇒ 退出 2", () => {
   withFixture(["{}"], (path) => {
-    assert.equal(run([path, "--format", "pi"]).status, 2);
+    assert.equal(run([path, "--format", "nope"]).status, 2);
+  });
+});
+
+test("CLI：`--format pi` 能读 pi 的事件流", () => {
+  const lines = [
+    JSON.stringify({
+      type: "tool_execution_start",
+      toolName: "bash",
+      toolCallId: "2",
+      args: { command: "pnpm test" },
+    }),
+    JSON.stringify({ type: "tool_execution_end", toolCallId: "2", isError: false }),
+    JSON.stringify({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "`pnpm test` 跑通了。" }] },
+    }),
+  ];
+  withFixture(lines, (path) => {
+    const result = run([path, "--format", "pi", "--json"]);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /"deliverable": "verified"/);
   });
 });
 

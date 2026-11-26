@@ -3,6 +3,7 @@ export { audit, claimHit, collectReceipts, verdictOf } from "./verdict.ts";
 export { extractClaims, normalizePath } from "./claims.ts";
 export { normalizeCodex, unwrapShell } from "./normalize-codex.ts";
 export { normalizeClaude } from "./normalize-claude.ts";
+export { normalizePi } from "./normalize-pi.ts";
 export type {
   AuditOptions,
   AuditResult,

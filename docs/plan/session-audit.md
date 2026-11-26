@@ -13,7 +13,8 @@
 
 ## 1. 范围
 
-- 本仓加第二个入口 + 一个 `bin`；**不新建 npm 包**、**不接 pi**、**不做全库索引**、**不 spawn**、**不联网**、**不写盘**。
+- 本仓加第二个入口 + 一个 `bin`；**不新建 npm 包**、**不做全库索引**、**不 spawn**、**不联网**、**不写盘**。
+- pi 来源在实现阶段接上了（`--format pi` 复用 `parseChildStream`，与另两家同一套判词）——原计划是 v1 不做，实际多花 1 个文件、60 行。
 - 新代码：`src/audit/{types,claims,normalize-codex,normalize-claude,verdict,index}.ts` + `src/bin/session-audit.ts`（每个 ≤600 行）。
 - `src/core/child.ts` 只加 3 个 `export`（`scanCommand` / `segmentsMatch` / `CommandSegment`）。**不导出、也不用 `claimSatisfied`**——它内部有一条无条件的整串快路（`child.ts:1166-1170`，在任何 `known` 检查之前），且 `wantOk` 是从 `claim.exitCode` 推出来的（`:1158`），两条都表达不了本裁决的策略。匹配逻辑放在 `verdictOf` 里，只复用 `scanCommand` 与 `segmentsMatch`。
 - **提交顺序**：① 第 6 条的 `||` 修复（只改 `known`，带测试与破坏点，可单独 revert）→ ② 导出 → ③ audit 模块。
@@ -178,7 +179,7 @@ visit(node, trusted):
 | --- | --------------------------------------------------------------------- |
 | 0   | `verified`；或 `unclaimed`（默认）                                    |
 | 1   | `partial` / `unverified` / `absent`；`--strict` 时 `unclaimed` 也归此 |
-| 2   | 解析失败：文件不可读 / 0 条可解析事件 / 未知 `--format`（含 `pi`）    |
+| 2   | 解析失败：文件不可读 / 0 条可解析事件 / 未知 `--format`               |
 
 ## 11. 测试与破坏点
 
@@ -219,7 +220,7 @@ visit(node, trusted):
 9. 退出码表补 `--strict`。
 10. 删掉「自评空转」。
 11. 补「零自述但有路径收据 ⇒ `unverified`」。
-12. CLI 签名加 `--strict`；`--format` 去掉 `pi`（或写明退 2）。
+12. CLI 签名加 `--strict`；`--format` 三家都支持（codex / claude / pi）。
 13. 输入契约 `opts` 加 `claims?`。
 14. `unverified` 的「有正文但无 report」改成「无正文」。
 15. 交付形态改成「一个包、两个入口」。
