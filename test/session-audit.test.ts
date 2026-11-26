@@ -2,7 +2,7 @@
 // 每条用例都写明「实现写错时它凭什么红」——判词链是这一层的全部价值。
 //
 // ── 变异测试（`mutator --no-coverage --mutate-all src/audit`）───────────
-// 当前：350 个位点，杀掉 300，**幸存 50**（49 条给了等价推导，1 条未证；见 docs/audit-mutation.md）
+// 当前：350 个位点，杀掉 301，**幸存 49 条全部有等价推导**（E1–E19，见 docs/audit-mutation.md）
 // 按类：`?? -> ||` 22、`&& -> ||` 17、`0 -> 1` 15、`=== -> !==` 7、`>= -> >` 6、`true -> false` 6。
 //
 // 能证死的等价类（两条，都不是猜的）：
@@ -730,4 +730,11 @@ test("失败类自述不看收据段的信任标记", () => {
   // 但它确实是跑过且失败的那条，失败自述照样算兑现。
   const result = audit([bash("a || pnpm test", 1)], "`pnpm test` 失败了。");
   assert.equal(result.deliverable, "verified");
+});
+
+test("自述里的省略号不当前缀通配（claimTruncated=false）", () => {
+  // tokensEquivalent 只有在 claimTruncated 时才把 `…` 当截断标记；
+  // 自述写 `pnpm test…` 不能被 `pnpm test` 兑现。
+  const result = audit([bash("pnpm test", 0)], "`pnpm test…` 跑通了。");
+  assert.equal(result.deliverable, "unverified");
 });
