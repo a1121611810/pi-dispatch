@@ -45,6 +45,13 @@ export const REPLACEMENTS: readonly { from: RegExp; to: string; why: string }[] 
     to: "2026-01-01T00:00:00.000Z",
     why: "绝对时刻",
   },
+  {
+    // claude 的会话链字段：sessionId / uuid / parentUuid，以及 codex 的 session_id / thread_id。
+    // 只按 `"id"` 一条规则盖不住它们，而会话 id 本身也是家目录之外的第二条身份线索。
+    from: /"(sessionId|uuid|parentUuid|session_id|thread_id)":\s*"[0-9a-fA-F-]{8,}"/g,
+    to: '"$1":"00000000-0000-4000-8000-000000000000"',
+    why: "会话 / 消息 / 工具 id",
+  },
 ];
 
 /**
@@ -93,6 +100,40 @@ export function sanitizeJsonl(text: string): string {
 }
 
 /** 递归改字段：路径、模型名、供应商名、uuid、时刻。 */
+/** 同一个原值 → 同一个占位值。脱敏不能打断配对（tool_use.id ↔ tool_use_id）。 */
+const uuidMap = new Map<string, string>();
+let uuidSeq = 0;
+function scrubUuid(value: string): string {
+  const hit = uuidMap.get(value);
+  if (hit !== undefined) return hit;
+  uuidSeq += 1;
+  const next = `00000000-0000-4000-8000-${String(uuidSeq).padStart(12, "0")}`;
+  uuidMap.set(value, next);
+  return next;
+}
+
+const callMap = new Map<string, string>();
+let callSeq = 0;
+function scrubCall(value: string): string {
+  const hit = callMap.get(value);
+  if (hit !== undefined) return hit;
+  callSeq += 1;
+  const next = `call_test${String(callSeq).padStart(12, "0")}`;
+  callMap.set(value, next);
+  return next;
+}
+
+const ID_KEYS = new Set([
+  "id",
+  "call_id",
+  "tool_use_id",
+  "sessionId",
+  "uuid",
+  "parentUuid",
+  "session_id",
+  "thread_id",
+]);
+
 function scrub(value: unknown): unknown {
   if (typeof value === "string") return scrubString(value);
   if (Array.isArray(value)) return value.map(scrub);
@@ -114,12 +155,32 @@ function scrub(value: unknown): unknown {
         out[key] = typeof item === "string" ? item.replace(/^[a-z]+$/, "test/provider") : item;
         continue;
       }
-      if (key === "id" && typeof item === "string" && /^[0-9a-f-]{36}$/.test(item)) {
-        out[key] = "00000000-0000-4000-8000-000000000000";
+      // 一切「标识符」字段都走**同一张映射表**：同一个原值永远换成同一个占位值。
+      // 否则会打断配对（tool_use.id ↔ tool_result.tool_use_id、codex id ↔ call_id），
+      // 收据凭空消失——那是脱敏脚本自己造的假绿。
+      if (typeof item === "string" && ID_KEYS.has(key)) {
+        if (item.startsWith("call_")) {
+          out[key] = scrubCall(item);
+          continue;
+        }
+        if (/^[0-9a-f-]{8,}$/i.test(item)) {
+          out[key] = scrubUuid(item);
+          continue;
+        }
+      }
+      // 正文同理：样本只用来验「抽不抽得出自述」，不需要几百 KB 的散文。
+      if ((key === "text" || key === "content") && typeof item === "string" && item.length > 2000) {
+        out[key] = `${item.slice(0, 2000)}…`;
         continue;
       }
-      if (key === "id" && typeof item === "string" && item.startsWith("call_")) {
-        out[key] = "call_test000000000000";
+      // 工具输出是样本里最大的一块，而审计只数「有没有这条命令 / 退出码是多少」，
+      // 不看正文。截断它能把样本从几百 KB 压到几十 KB，不影响任何一条断言。
+      if (
+        (key === "aggregated_output" || key === "output") &&
+        typeof item === "string" &&
+        item.length > 120
+      ) {
+        out[key] = `${item.slice(0, 120)}…`;
         continue;
       }
       if (key === "timestamp" && typeof item === "number" && item > 1_000_000_000_000) {

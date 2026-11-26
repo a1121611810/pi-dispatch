@@ -1517,7 +1517,11 @@ function tokensEquivalent(claimTok: string, obsTok: string, claimTruncated: bool
  * 否则 `npm --prefix test install` 能满足声称的 `npm test`）。
  * 观测比自述多出来的尾巴（--coverage 之类）放行。
  */
-function segmentsMatch(claim: string[], observed: string[], claimTruncated: boolean): boolean {
+export function segmentsMatch(
+  claim: string[],
+  observed: string[],
+  claimTruncated: boolean,
+): boolean {
   if (claim.length === 0) return false;
   let j = 0;
   let afterFlag = false;

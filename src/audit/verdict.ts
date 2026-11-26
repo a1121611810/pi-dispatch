@@ -1,0 +1,235 @@
+// 判词。只做判断，不读磁盘、不看时钟——所有输入都是调用方给的事件数组。
+//
+// 与 core 的 `deliverableOf` 有四处**已知分歧**（这边按 spec 的顺序，core 保持原样）：
+//   1. `stale + partial`：core 给 partial，这里给 unverified；
+//   2. 整维零命中（如路径 1/1 命中、命令 0/1）：core 给 unverified，这里按全局并集给 partial；
+//   3. `receiptGap` 在 core 里排在 partial 之后，这里排在 partial 之前；
+//   4. 零自述但有路径收据 / 报告有完成词：core 给 unclaimed，这里给 unverified。
+// 不复用 `deliverableOf` 的判词链，也不复用 `claimSatisfied`（内部有整串快路，且 wantOk
+// 是从 exitCode 推的）——只复用 `scanCommand` / `segmentsMatch` 两个原语。
+import { pathMatches, scanCommand, segmentsMatch } from "../core/child.ts";
+import type { Deliverable } from "../core/types.ts";
+import { extractClaims, normalizePath } from "./claims.ts";
+import type {
+  AuditOptions,
+  AuditResult,
+  ClaimSet,
+  CommandClaim,
+  CommandReceipt,
+  ExtractedClaims,
+  Receipts,
+  SessionEvent,
+} from "./types.ts";
+
+const DEFAULT_MAX = 20;
+
+const squash = (text: string): string => text.replace(/\s+/g, " ").trim();
+
+/** 命令自述有没有被某条收据兑现。 */
+export function claimHit(claim: CommandClaim, receipts: CommandReceipt[]): boolean {
+  const segs = scanCommand(claim.command, true).filter((seg) => seg.tokens.length > 0);
+  if (segs.length === 0) return false;
+  const usable = receipts.filter((r) =>
+    claim.wantOk ? r.exitCode === 0 : typeof r.exitCode === "number",
+  );
+  if (usable.length === 0) return false;
+
+  // 整串快路只在自述不含任何分隔符时启用：含分隔符的自述必须逐段校验。
+  if (!/[|;&\n]/.test(claim.command)) {
+    const target = squash(claim.command);
+    if (usable.some((r) => squash(r.command) === target)) return true;
+  }
+
+  return segs.every((seg) =>
+    usable.some((r) =>
+      scanCommand(r.command, false).some(
+        (os) => (claim.wantOk ? os.known : true) && segmentsMatch(seg.tokens, os.tokens, false),
+      ),
+    ),
+  );
+}
+
+/** 从事件里收收据。路径保最先 N 条、命令保最近 N 条——与 core 一致。 */
+export function collectReceipts(
+  events: readonly SessionEvent[],
+  max = DEFAULT_MAX,
+): { receipts: Receipts; pathsTruncated: boolean; commandsTruncated: boolean } {
+  const paths: string[] = [];
+  const commands: CommandReceipt[] = [];
+  let pathsTruncated = false;
+  let commandsTruncated = false;
+
+  for (const event of events) {
+    if (event.kind !== "tool") continue;
+    if (event.name === "write") {
+      const raw = event.input.path;
+      if (typeof raw !== "string" || raw === "") continue;
+      const path = normalizePath(raw, event.cwd);
+      if (paths.includes(path)) continue;
+      if (paths.length >= max) {
+        pathsTruncated = true;
+        continue;
+      }
+      paths.push(path);
+      continue;
+    }
+    if (event.name === "bash") {
+      const command = event.input.command;
+      if (typeof command !== "string" || command.trim() === "") continue;
+      commands.push({
+        command,
+        ...(typeof event.exitCode === "number" ? { exitCode: event.exitCode } : {}),
+        trusted: typeof event.exitCode === "number",
+      });
+      if (commands.length > max) {
+        commands.shift();
+        commandsTruncated = true;
+      }
+    }
+  }
+
+  return { receipts: { paths, commands }, pathsTruncated, commandsTruncated };
+}
+
+export interface VerdictFacts {
+  hasBody: boolean;
+  pathsTruncated: boolean;
+  truncated: boolean;
+  stale: boolean;
+  total: number;
+  hits: number;
+  /** 完成词绑到一条「没命中 / 跑过但失败」的命令 */
+  vagueBoundMissed: boolean;
+  /** 完成词绑不到任何命令 */
+  vagueUnbound: boolean;
+  /** 只在零自述时算数：有路径收据 */
+  hasPathReceipts: boolean;
+  notes: string[];
+}
+
+/**
+ * 九条判定链，顺序即优先级，每条 return。
+ * `notes` 是副作用：`stale` 与 `vague` 各自往里写一句。
+ */
+export function verdictOf(facts: VerdictFacts): Deliverable {
+  if (!facts.hasBody && !facts.hasPathReceipts && !facts.pathsTruncated) return "absent";
+  if (!facts.hasBody) return "unverified";
+  if (facts.stale) {
+    facts.notes.push("report predates last steer");
+    return "unverified";
+  }
+  if (facts.vagueBoundMissed) {
+    facts.notes.push("vague success claim");
+    return "unverified";
+  }
+  if (facts.total === 0 && (facts.hasPathReceipts || facts.vagueUnbound)) {
+    if (facts.vagueUnbound) facts.notes.push("vague success claim");
+    return "unverified";
+  }
+  if (facts.total > 0 && facts.hits === 0) return "unverified";
+  if (facts.truncated && facts.hits < facts.total) return "unverified";
+  if (facts.hits > 0 && facts.hits < facts.total) return "partial";
+  if (facts.total === 0) return "unclaimed";
+  if (facts.hits === facts.total && facts.total > 0) return "verified";
+  return "unverified";
+}
+
+/** 报告在流里的位置：最后一条主链 assistant 文本；没有就落到流末尾。 */
+function reportIndex(events: readonly SessionEvent[]): number {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]!;
+    if (e.kind === "message" && e.role === "assistant" && !e.sidechain && e.text.trim() !== "") {
+      return i;
+    }
+  }
+  return events.length;
+}
+
+function lastAssistantText(events: readonly SessionEvent[]): string | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]!;
+    if (e.kind === "message" && e.role === "assistant" && !e.sidechain) {
+      if (e.text.trim() !== "") return e.text;
+    }
+  }
+  return undefined;
+}
+
+function lastSteerIndex(events: readonly SessionEvent[]): number {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]!;
+    if (e.kind === "message" && e.role === "user" && e.steer === true) return i;
+  }
+  return -1;
+}
+
+const toClaimSet = (claims: ExtractedClaims): ClaimSet => ({
+  paths: [...claims.paths],
+  commands: claims.commands.map((c) => c.command),
+});
+
+/**
+ * 审一段会话。
+ *
+ * - `events`：按时间顺序的归一化事件；
+ * - `report`：agent 最后写给用户的那段话；`null` 时用流里最后一条主链 assistant 文本；
+ * - `opts.cwd`：解析 `..` 的基准；相对路径当 `/`。
+ */
+export function audit(
+  events: readonly SessionEvent[],
+  report: string | null,
+  opts: AuditOptions = {},
+): AuditResult {
+  const max = opts.maxReceipts ?? DEFAULT_MAX;
+  const { receipts, pathsTruncated, commandsTruncated } = collectReceipts(events, max);
+
+  const text = (report ?? lastAssistantText(events) ?? "").trim();
+  const hasBody = text !== "";
+  const claims = opts.claims ?? extractClaims(text);
+
+  const pathHits = claims.paths.filter((claim) =>
+    receipts.paths.some((path) => pathMatches(normalizePath(claim, opts.cwd), path)),
+  );
+  const commandHits = claims.commands.filter((claim) => claimHit(claim, receipts.commands));
+
+  const total = claims.paths.length + claims.commands.length;
+  const hits = pathHits.length + commandHits.length;
+
+  // 完成词只有在「绑到一条声称成功且命中的命令」时才不扣分；
+  // 绑到「跑过但失败」的命令，等于拿失败当交付。
+  const vagueBoundMissed = claims.vagueBindings.some((binding) => {
+    if (binding === null) return false;
+    const bound = claims.commands[binding]!;
+    return !bound.wantOk || !commandHits.includes(bound);
+  });
+  const vagueUnbound = claims.vagueBindings.some((binding) => binding === null);
+
+  const notes: string[] = [];
+  const deliverable = verdictOf({
+    hasBody,
+    pathsTruncated,
+    truncated: pathsTruncated || commandsTruncated,
+    stale: lastSteerIndex(events) > reportIndex(events),
+    total,
+    hits,
+    vagueBoundMissed,
+    vagueUnbound,
+    hasPathReceipts: receipts.paths.length > 0,
+    notes,
+  });
+
+  const matchedPaths = new Set(pathHits);
+  const matchedCommands = new Set(commandHits.map((c) => c.command));
+
+  return {
+    deliverable,
+    claims: toClaimSet(claims),
+    receipts,
+    mismatch: {
+      paths: claims.paths.filter((p) => !matchedPaths.has(p)),
+      commands: claims.commands.map((c) => c.command).filter((c) => !matchedCommands.has(c)),
+    },
+    truncated: pathsTruncated || commandsTruncated,
+    notes,
+  };
+}
