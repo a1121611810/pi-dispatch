@@ -1133,3 +1133,126 @@ test("claude 边界表", () => {
   ]);
   assert.deepEqual(orphan.events, []);
 });
+
+// ── 原始命令优先：function_call 里的 `cmd` 才是模型要跑的那条 ──────────────
+
+test("codex：按 call_id 找回原始命令，覆盖执行层的包装", () => {
+  const result = normalizeCodex([
+    JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        call_id: "c1",
+        name: "exec_command",
+        arguments: '{"cmd":"pnpm test"}',
+      },
+    }),
+    JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: {
+          type: "CommandExecution",
+          id: "c1",
+          command: ["/bin/zsh", "-lc", "rtk pnpm test"],
+          exit_code: 0,
+        },
+      },
+    }),
+  ]);
+  assert.deepEqual(bashOf(result.events)[0]!.input.command, "pnpm test");
+});
+
+test("codex：配对不上就剥执行层的壳", () => {
+  const result = normalizeCodex([
+    JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: {
+          type: "CommandExecution",
+          id: "c9",
+          command: ["/bin/zsh", "-lc", "rtk lint"],
+          exit_code: 0,
+        },
+      },
+    }),
+  ]);
+  assert.deepEqual(bashOf(result.events)[0]!.input.command, "rtk lint");
+});
+
+test("codex：arguments 不是合法 JSON 时退回执行层的命令", () => {
+  const result = normalizeCodex([
+    JSON.stringify({
+      type: "response_item",
+      payload: { type: "function_call", call_id: "c1", name: "exec_command", arguments: "{oops" },
+    }),
+    JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: { type: "CommandExecution", id: "c1", command: "raw cmd", exit_code: 0 },
+      },
+    }),
+  ]);
+  assert.deepEqual(bashOf(result.events)[0]!.input.command, "raw cmd");
+});
+
+test("codex：报告取标了 final_answer 的那条，不是最后一条", () => {
+  const result = normalizeCodex([
+    JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "中间" }],
+      },
+    }),
+    JSON.stringify({
+      type: "event_msg",
+      payload: {
+        type: "item_completed",
+        item: { type: "AgentMessage", text: "终稿", phase: "final_answer" },
+      },
+    }),
+  ]);
+  assert.equal(result.report, "终稿");
+  assert.deepEqual(
+    result.events
+      .filter((e) => e.kind === "message")
+      .map((e) => (e.kind === "message" ? e.text : "")),
+    ["中间", "终稿"],
+  );
+});
+
+test("claude：正文只拼 text 块，空块与 tool_use 不进报告", () => {
+  const result = normalizeClaude([
+    JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "text", text: "第一段" },
+          { type: "text", text: "" },
+          { type: "tool_use", id: "a", name: "Bash", input: { command: "ls" } },
+        ],
+      },
+    }),
+    JSON.stringify({
+      type: "user",
+      message: {
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "a",
+            content: [
+              { type: "text", text: "Exit code 0" },
+              { type: "text", text: "尾巴" },
+            ],
+          },
+        ],
+      },
+    }),
+  ]);
+  assert.equal(result.report, "第一段");
+  assert.equal(bashOf(result.events)[0]!.exitCode, 0);
+});

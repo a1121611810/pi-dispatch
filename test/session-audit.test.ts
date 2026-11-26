@@ -2,7 +2,7 @@
 // 每条用例都写明「实现写错时它凭什么红」——判词链是这一层的全部价值。
 //
 // ── 变异测试（`mutator --no-coverage --mutate-all src/audit`）───────────
-// 当前：350 个位点，杀掉 266，**幸存 84**，0 超时。**不是零幸存**——这是明账。
+// 当前：350 个位点，杀掉 269~270，**幸存 80~81**，0 超时。**不是零幸存**——这是明账。
 // 按类：`?? -> ||` 22、`&& -> ||` 17、`0 -> 1` 15、`=== -> !==` 7、`>= -> >` 6、`true -> false` 6。
 //
 // 能证死的等价类（两条，都不是猜的）：
@@ -533,4 +533,59 @@ test("抽取：点开头没有扩展名的隐藏文件不算路径", () => {
 test("抽取：末段没有扩展名的不算路径", () => {
   assert.deepEqual(extractClaims("改了 /repo/a/env").paths, []);
   assert.deepEqual(extractClaims("改了 /repo/a/env.ts").paths, ["/repo/a/env.ts"]);
+});
+
+test("判词：截断了但全命中 ⇒ verified（不能因为截断就降档）", () => {
+  const result = audit([bash("pnpm test", 0), bash("pnpm test", 0)], "`pnpm test` 跑通了。", {
+    maxReceipts: 1,
+  });
+  assert.equal(result.truncated, true);
+  assert.equal(result.deliverable, "verified");
+});
+
+test("判词：报告回退只看「非空、非侧链」的 assistant 文本", () => {
+  const events = [
+    bash("pnpm test", 0),
+    { kind: "message" as const, role: "assistant" as const, text: "`pnpm test` 跑通了。" },
+    { kind: "message" as const, role: "assistant" as const, text: "" },
+    { kind: "message" as const, role: "assistant" as const, text: "旁支", sidechain: true },
+  ];
+  const result = audit(events, null);
+  assert.equal(result.claims.commands.length, 1);
+  assert.equal(result.deliverable, "verified");
+});
+
+test("判词：steer 在报告之后才算过期", () => {
+  const before = [
+    bash("pnpm test", 0),
+    { kind: "message" as const, role: "assistant" as const, text: "`pnpm test` 跑通了。" },
+  ];
+  assert.equal(audit(before, null).deliverable, "verified");
+  assert.deepEqual(audit(before, null).notes, []);
+
+  const after = [
+    ...before,
+    { kind: "message" as const, role: "user" as const, text: "再改一下", steer: true as const },
+  ];
+  const staleResult = audit(after, null);
+  assert.equal(staleResult.deliverable, "unverified");
+  assert.deepEqual(staleResult.notes, ["report predates last steer"]);
+});
+
+test("判词：没正文但有路径收据 ⇒ unverified，不是 absent", () => {
+  const result = audit([{ kind: "tool", name: "write", input: { path: "a.ts" } }], null);
+  assert.equal(result.deliverable, "unverified");
+});
+
+test("判词：没正文 + 路径收据被截断 ⇒ unverified（不能当 absent）", () => {
+  const result = audit(
+    [
+      { kind: "tool", name: "write", input: { path: "a.ts" } },
+      { kind: "tool", name: "write", input: { path: "b.ts" } },
+    ],
+    null,
+    { maxReceipts: 1 },
+  );
+  assert.equal(result.truncated, true);
+  assert.equal(result.deliverable, "unverified");
 });
