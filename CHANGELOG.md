@@ -5,6 +5,13 @@
 格式按 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号按
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.1] - 2026-11-27
+
+修 `--help` 里的退出码说明。0.2.0 的文案还写着「unclaimed 一律退 0」，实际实现是「unclaimed 且有路径收据退 1」。
+
+- `session-audit --help` 的三行退出码说明改成与实现一致。
+- 补一条 CLI 用例钉住这段文案。
+
 ## [0.2.0] - 2026-11-27
 
 新增离线审计：读一份 codex / claude / pi 的会话日志，把智能体自述做过的事和它自己动作留下的收据对一遍。

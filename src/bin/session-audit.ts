@@ -14,8 +14,8 @@ type Format = (typeof FORMATS)[number];
 
 const USAGE = `用法：session-audit <file.jsonl> --format codex|claude|pi [--cwd DIR] [--max N] [--json] [--strict]
 
-  0  verified（或 unclaimed；--strict 时 unclaimed 算 1）
-  1  partial / unverified / absent
+  0  verified；或 unclaimed 且没有任何收据
+  1  partial / unverified / absent；或 unclaimed 但动过手（有路径收据）；--strict 时任何 unclaimed
   2  解析不了这份文件`;
 
 /** 读一份日志的每一行。流式：214MB 的历史目录也吃得下。 */

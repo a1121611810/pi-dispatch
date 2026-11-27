@@ -150,3 +150,9 @@ test("CLI：零自述 + 没有收据 ⇒ 退 0", () => {
     assert.equal(run([path, "--format", "codex"]).status, 0);
   });
 });
+
+test("CLI：--help 的退出码说明与实现一致", () => {
+  const help = run(["--help"]);
+  assert.match(help.stdout, /unclaimed 但动过手/);
+  assert.doesNotMatch(help.stdout, /--strict 时 unclaimed 算 1/);
+});
