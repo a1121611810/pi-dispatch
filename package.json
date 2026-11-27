@@ -1,6 +1,6 @@
 {
   "name": "@goodali/pi-dispatch",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Programmable subagent dispatch for pi: queue, spawn, watch, stop, and account for child agents",
   "keywords": [
     "agent",

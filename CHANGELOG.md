@@ -5,6 +5,41 @@
 格式按 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号按
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0] - 2026-11-27
+
+新增离线审计：读一份 codex / claude / pi 的会话日志，把智能体自述做过的事和它自己动作留下的收据对一遍。
+
+### 新增
+
+- `session-audit` 命令行（`bin`）：`--format codex|claude|pi`、`--cwd DIR`、`--max N`、`--json`、`--strict`。
+  退出码 `0` = `verified`，或什么都没观测到的 `unclaimed`；`1` = 其余，含动过手却没给可核对自述的 `unclaimed`；`2` = 日志解析不了。
+- `@goodali/pi-dispatch/audit` 导出：`audit(events, report, opts)`。纯函数，不读盘、不看时钟。
+- 三家日志的归一化：codex（历史与实时两种信封、按 `call_id` 找回原始命令）、claude（写工具白名单、`tool_use` 配对、退出码四分区）、pi（复用 `parseChildStream`）。
+- 判词附带的 note：`self-reported failure`、`no auditable claim`、`vague success claim`、`report predates last steer`。
+- `pnpm mutate:audit`：把变异测试收缩到 `src/audit`。
+
+### 变更
+
+- 失败自述改按「失败可推位」判定。`a && b` 退 1 时不断言某一条失败；`a ; b` 和 `a || b` 的右侧可推；命令串里出现 `pipefail` 时整条不可推。
+- 收据默认不截断（上限改为无穷），`--max N` 才是显式上限。此前模块内默认留 20 条。
+- 零自述改判 `unclaimed`：有路径收据时附 note `no auditable claim`，CLI 退 1。此前判 `unverified`。
+- shell 重定向（`>`、`>>`、`tee`）的目标记入路径收据；反引号里带扩展名的裸文件名也算路径。
+
+### 修复
+
+- 否定式自述被判成成功：`没有跑通：\`pnpm --version\` 报错`配退出码 0，此前给`verified`。
+- Bash 调用缺命令文本时不再产出空收据。
+
+### 已知限制
+
+- 路径收据只来自写盘工具和 shell 重定向。用 `vim`、IDE 或子代理改的文件没有收据，报告再诚实也可能落在 `unverified`。
+- `--strict` 只是把 `unclaimed` 当红，不扩大收据覆盖。
+
+### 文档
+
+- README 改成「派 / 查」两件事并列：`## Audit` 从第五节前移到 `## Dispatch` 之后，开头三句各说一件事。
+- `docs/audit-mutation.md`：变异账，逐条列幸存者与等价推导。
+
 ## [0.1.2] - 2026-11-26
 
 无功能变化。补齐 npm 搜索关键词，并给包目录加预览图。
