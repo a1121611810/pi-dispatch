@@ -6,30 +6,25 @@
 
 [![pi-dispatch: subagent dispatch with receipts](https://raw.githubusercontent.com/a1121611810/pi-dispatch/main/assets/social-preview.png)](https://pi.dev/packages/@goodali/pi-dispatch)
 
-Subagent dispatch for [pi](https://pi.dev): queue children against a memory budget, watch them
-for stalls, stop them, steer them mid-run, and check what they claim against what they actually did.
+Two jobs for [pi](https://pi.dev): run child agents, and check what they say they did.
 
-> Pi ships with powerful defaults but skips features like sub-agents and plan mode. Ask Pi to
-> build what you want, or install a package that does it your way.
-> — [pi's own README](https://github.com/earendil-works/pi)
-
-**A dispatch returns two independent answers: how the process exited, and whether what the child
-claimed matches what it actually did.** Those are recorded separately and never merged.
+- **Dispatch** sizes seats from a memory budget, queues when they run out, and can stop or steer a
+  running child. It runs inside pi.
+- **Audit** reads any session log — pi, Codex, Claude Code — and matches each claim against the
+  receipts the agent's own actions left behind. No model call, and it works on logs pi never wrote.
 
 ```
-parent session
-  │
-  ├─ dispatch_task  ──▶ seat pool ──▶ child pi ──▶ tool calls
-  │                     (memory budget)
-  │                     └─ no seat free? queue, FIFO, never reject
-  │
-  ├─ dispatch_steer ──▶ mailbox ──▶ child reads at next turn boundary
-  ├─ dispatch_stop  ──▶ SIGTERM ──▶ SIGKILL
-  │
-  └─ dispatch_list  ◀── ledger ◀── receipts
-                        └─ ~/.pi/dispatch/<project bucket>/
-                           status      = exit code
-                           deliverable = claims vs receipts
+Dispatch (live, inside pi)
+  dispatch_task ──▶ seat pool ──▶ child pi ──▶ tool calls
+                    (memory budget; no seat free? queue, FIFO, never reject)
+  dispatch_steer ──▶ mailbox ──▶ child reads at next turn boundary
+  dispatch_stop  ──▶ SIGTERM ──▶ SIGKILL
+  dispatch_list  ◀── ledger ──▶ status      = exit code
+                     ~/.pi/…      deliverable = claims vs receipts
+
+Audit (after the fact, anywhere)
+  codex / claude / pi .jsonl ──▶ claims vs receipts ──▶ verdict
+  CLI: session-audit          library: @goodali/pi-dispatch/audit
 ```
 
 ## Install
@@ -43,6 +38,9 @@ pi install npm:@goodali/pi-dispatch
 ```bash
 pi install git:github.com/a1121611810/pi-dispatch
 ```
+
+Auditing needs neither: `npx @goodali/pi-dispatch session-audit ./session.jsonl --format codex`
+runs straight from the package.
 
 The git form tracks `main`; append `@v0.1.1` to pin. The npm form takes `@0.1.1`.
 
@@ -66,7 +64,7 @@ appears in the tool list — a missing entry point is the failure this check is 
   wait for the terminal state, because a one-shot host process exits before a background child
   could deliver anything.
 
-## What it does
+## Dispatch
 
 **Queue.** Seats come from a memory pool: available memory, minus a reserve of 10% of total memory.
 Each seat is 512 MiB or 2% of total, whichever is larger. In a long-lived host, tasks wait in FIFO
@@ -86,43 +84,7 @@ tool calls are not interrupted. Up to 4096 characters per message, 16 messages p
 with atomic writes, compressed archives, and restore on restart. A dispatch rejected before it is
 assigned an id — by a gate, or by the one-shot capacity check — leaves no record.
 
-**Check the delivery.** The report can arrive by tool call, by a JSON block in the prompt, or not
-at all. Paths the child says it wrote are matched against the receipts taken from its `edit` and
-`write` tool calls; commands it says it ran are matched against observed command receipts. See
-[Receipts, not self-reports](#receipts-not-self-reports).
-
-## Where it fits
-
-pi ships `examples/extensions/subagent` as a copyable reference: a single agent, up to eight parallel
-tasks with four running at once, or a chain. It is an example, not a maintained package. If that
-shape fits, copy it.
-
-The ecosystem already has mature packages. Each line is what that package is best at, from its own
-documentation:
-
-- [`pi-subagents`](https://github.com/nicobailon/pi-subagents) — scripted multi-agent workflows, missions, configurable acceptance gates.
-- [`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents) — Claude Code-style named agents, with a queue and a live fleet view.
-- [`@quintinshaw/pi-dynamic-workflows`](https://github.com/QuintinShaw/pi-dynamic-workflows) — JavaScript fan-out with journaled resume.
-- [`pi-better-subagents`](https://github.com/1aboveio/pi-better-harness/tree/main/packages/pi-better-subagents) — detached runs in an OS sandbox.
-
-Two design choices separate this package, and both are about defaults rather than features:
-
-|                         | pi-dispatch                                            | A configured concurrency cap       |
-| ----------------------- | ------------------------------------------------------ | ---------------------------------- |
-| When a child waits      | seats sized from available memory, minus a 10% reserve | the number you wrote down          |
-| What a dispatch returns | exit code **plus** a verdict checked against receipts  | exit code plus the child's summary |
-
-The packages above check work too: by running a command you configure, or by asking other models to
-vote. This one reads the `edit`, `write`, and command receipts the parent already observed, so there
-is nothing to configure. That is a different mechanism, not a stronger one.
-
-Where they are ahead: OS sandboxing, journaled resume, workflow and persona systems, and a live UI.
-If you need those, use them.
-
-_Package descriptions were checked against upstream documentation on 2026-11-26. Upstreams move
-quickly; verify before relying on any claim here._
-
-## Receipts, not self-reports
+## Audit
 
 The final report a child writes is a claim. The receipts are what pi observed it do. A dispatch
 ends with two values that are computed separately:
@@ -151,7 +113,7 @@ The exact matching rules — suffix matching for paths, per-segment trust for co
 [`docs/spec/core-spec.html`](./docs/spec/core-spec.html). Inside pi, the receipt window is capped at 20
 entries; the CLI below keeps every one unless you ask for a cap.
 
-## Auditing a session after the fact
+### Checking a log that pi did not produce
 
 `dispatch_list` can only audit children pi itself started. The same check also runs offline against a
 raw session log, for runs that happened elsewhere:
@@ -188,7 +150,42 @@ still come back `unverified`. That is stated, not hidden.
 import { audit } from "@goodali/pi-dispatch/audit";
 ```
 
-## Tools
+## Where it fits
+
+> Pi ships with powerful defaults but skips features like sub-agents and plan mode. Ask Pi to
+> build what you want, or install a package that does it your way.
+> — [pi's own README](https://github.com/earendil-works/pi)
+
+pi ships `examples/extensions/subagent` as a copyable reference: a single agent, up to eight parallel
+tasks with four running at once, or a chain. It is an example, not a maintained package. If that
+shape fits, copy it.
+
+The ecosystem already has mature packages. Each line is what that package is best at, from its own
+documentation:
+
+- [`pi-subagents`](https://github.com/nicobailon/pi-subagents) — scripted multi-agent workflows, missions, configurable acceptance gates.
+- [`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents) — Claude Code-style named agents, with a queue and a live fleet view.
+- [`@quintinshaw/pi-dynamic-workflows`](https://github.com/QuintinShaw/pi-dynamic-workflows) — JavaScript fan-out with journaled resume.
+- [`pi-better-subagents`](https://github.com/1aboveio/pi-better-harness/tree/main/packages/pi-better-subagents) — detached runs in an OS sandbox.
+
+Two design choices separate this package, and both are about defaults rather than features:
+
+|                         | pi-dispatch                                            | A configured concurrency cap       |
+| ----------------------- | ------------------------------------------------------ | ---------------------------------- |
+| When a child waits      | seats sized from available memory, minus a 10% reserve | the number you wrote down          |
+| What a dispatch returns | exit code **plus** a verdict checked against receipts  | exit code plus the child's summary |
+
+The packages above check work too: by running a command you configure, or by asking other models to
+vote. This one reads the `edit`, `write`, and command receipts the parent already observed, so there
+is nothing to configure. That is a different mechanism, not a stronger one.
+
+Where they are ahead: OS sandboxing, journaled resume, workflow and persona systems, and a live UI.
+If you need those, use them.
+
+_Package descriptions were checked against upstream documentation on 2026-11-26. Upstreams move
+quickly; verify before relying on any claim here._
+
+## Dispatch tools
 
 | Tool                  | What it does                                                                  |
 | --------------------- | ----------------------------------------------------------------------------- |
@@ -222,7 +219,7 @@ leads, not facts. The author stamp is a tool contract, not a security boundary. 
 children can still read and write the board. With a single child there is nothing to exchange, so
 the board is just noise.
 
-## Limits
+## Dispatch limits
 
 - **Steering lands at a turn boundary.** A long tool call in progress is not interrupted; the
   message enters the child's context after the current tool batch finishes. `sent` only means the

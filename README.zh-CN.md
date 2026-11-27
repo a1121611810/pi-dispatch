@@ -8,30 +8,24 @@
 
 [![pi-dispatch：带收据的子代理派发](https://raw.githubusercontent.com/a1121611810/pi-dispatch/main/assets/social-preview.png)](https://pi.dev/packages/@goodali/pi-dispatch)
 
-pi 的子代理派发扩展：按内存预算给子代理分席位、排队、盯卡死、能停、能在跑的时候改方向，
-并且把子代理自述的和它实际做的对一遍。
+给 [pi](https://pi.dev) 做两件事：跑子代理，以及核对子代理说的话。
 
-> Pi ships with powerful defaults but skips features like sub-agents and plan mode. Ask Pi to
-> build what you want, or install a package that does it your way.
-> — [pi 官方 README](https://github.com/earendil-works/pi)
-
-**一次派发回来两个独立的结论：进程是怎么退出的，子代理声称的事和它实际做的是否对得上。**
-这两笔账分开记，不合并。
+- **派**——按内存预算分席位，用完排队；在跑的子代理能停、能中途改方向。跑在 pi 里。
+- **查**——读任何一份会话日志（pi、Codex、Claude Code），把每条自述和它自己动作留下的收据对上。
+  不调模型，pi 没写过的日志也能查。
 
 ```
-parent session
-  │
-  ├─ dispatch_task  ──▶ seat pool ──▶ child pi ──▶ tool calls
-  │                     (memory budget)
-  │                     └─ no seat free? queue, FIFO, never reject
-  │
-  ├─ dispatch_steer ──▶ mailbox ──▶ child reads at next turn boundary
-  ├─ dispatch_stop  ──▶ SIGTERM ──▶ SIGKILL
-  │
-  └─ dispatch_list  ◀── ledger ◀── receipts
-                        └─ ~/.pi/dispatch/<project bucket>/
-                           status      = exit code
-                           deliverable = claims vs receipts
+派（跑在 pi 里，实时）
+  dispatch_task ──▶ 席位池 ──▶ 子代理 ──▶ 工具调用
+                   （内存预算；没空位就排队，FIFO，不拒绝）
+  dispatch_steer ──▶ 信箱 ──▶ 子代理在下一个回合边界读到
+  dispatch_stop  ──▶ SIGTERM ──▶ SIGKILL
+  dispatch_list  ◀── 账本 ──▶ status      = 退出码
+                     ~/.pi/…    deliverable = 自述 vs 收据
+
+查（事后，任何地方）
+  codex / claude / pi 的 .jsonl ──▶ 自述 vs 收据 ──▶ 判词
+  命令：session-audit          库：@goodali/pi-dispatch/audit
 ```
 
 ## 安装
@@ -45,6 +39,9 @@ pi install npm:@goodali/pi-dispatch
 ```bash
 pi install git:github.com/a1121611810/pi-dispatch
 ```
+
+只查日志的话不用装扩展：`npx @goodali/pi-dispatch session-audit ./session.jsonl --format codex`
+直接跑。
 
 git 装法跟 `main` 走，末尾加 `@v0.1.1` 就钉住版本。npm 装法加 `@0.1.1`。
 
@@ -66,7 +63,7 @@ pi -p "派一个任务，把它的 taskId 给我"
 - 宿主模式：`rpc` 和 `tui` 异步派发，跑完再通知；`print` 和 `json` 一路等到终态，因为一次性
   宿主进程会先退出，后台跑的子代理就没法把交付物交回来。
 
-## 它做什么
+## 派
 
 **排队。** 席位从内存池里切：可用内存先扣掉总内存 10% 的预留，每席取 512 MiB 和总内存 2% 里
 大的那个。长驻宿主里席位用完就按 FIFO 等；一次性宿主腾不出席位，直接返回
@@ -83,37 +80,7 @@ pi -p "派一个任务，把它的 taskId 给我"
 **留痕。** 每次被接受的派发在 `~/.pi/dispatch/<项目桶>/` 落一条记录，原子写、压缩归档、重启
 恢复。被闸挡下、或被一次性宿主容量检查退回的派发，在拿到编号之前就返回了，不留记录。
 
-**核对交付。** 报告可能从工具通道来、从 prompt 里的 JSON 块来，也可能没有。它自述写了哪些文件，
-拿 `edit` / `write` 的收据逐条对；自述跑过哪些命令，拿观测到的命令收据对。
-见[核对：自述与收据](#核对自述与收据)。
-
-## 它适合谁
-
-pi 自带 `examples/extensions/subagent`，是一份可以拷走改的参考实现：单个子代理、最多 8 个并行
-任务（同时跑 4 个），或者一条链。它是示例，不是维护中的包。形状对得上，拷它就行。
-
-这个生态里已经有成熟的包。下面每行写的是那个包最强的一件事，都出自它自己的文档：
-
-- [`pi-subagents`](https://github.com/nicobailon/pi-subagents) —— 脚本化的多智能体工作流、missions、可配的 acceptance gate。
-- [`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents) —— Claude Code 风格的命名智能体，带队列和实时面板。
-- [`@quintinshaw/pi-dynamic-workflows`](https://github.com/QuintinShaw/pi-dynamic-workflows) —— JavaScript 扇出，带 journaled resume。
-- [`pi-better-subagents`](https://github.com/1aboveio/pi-better-harness/tree/main/packages/pi-better-subagents) —— 在 OS 沙箱里跑独立进程。
-
-这个包跟它们的区别是两个设计选择，都在**默认值**这一层，不是功能多少：
-
-|                  | pi-dispatch                     | 一个写死的并发上限       |
-| ---------------- | ------------------------------- | ------------------------ |
-| 什么时候等       | 席位按可用内存算，扣掉 10% 预留 | 你写下的那个数字         |
-| 一次派发回来什么 | 退出码**加上**拿收据核过的判词  | 退出码加上孩子自己的总结 |
-
-上面这些包也核对交付：跑一条你配的命令，或者叫别的模型投票。这个包读的是父方已经观测到的
-`edit`、`write` 和命令收据，所以没有要配的东西。是另一种机制，不是更强。
-
-它们比这个包强的地方：OS 沙箱、journaled resume、工作流与人格系统、实时界面。需要那些就用它们。
-
-_包描述是 2026-11-26 对着上游文档核的。上游动得快，用之前自己再确认一遍。_
-
-## 核对：自述与收据
+## 查
 
 子代理最后写的报告是一种自述，收据是 pi 实际观测到它做的事。一次派发结束时有两个分开算的值：
 
@@ -138,7 +105,7 @@ _包描述是 2026-11-26 对着上游文档核的。上游动得快，用之前�
 [`docs/spec/core-spec.html`](./docs/spec/core-spec.html)。在 pi 内部，收据窗口是 20 条；
 下面的 CLI 默认**全都留着**，除非你显式要上限。
 
-## 事后审计一份会话
+### 查 pi 没产出的日志
 
 `dispatch_list` 只能审 pi 自己派出去的孩子。同一套判定也能离线跑在原始日志上，审那些不是 pi 起的会话：
 
@@ -168,7 +135,37 @@ npx @goodali/pi-dispatch session-audit ./session.jsonl --format codex
 import { audit } from "@goodali/pi-dispatch/audit";
 ```
 
-## 工具
+## 它适合谁
+
+> Pi ships with powerful defaults but skips features like sub-agents and plan mode. Ask Pi to
+> build what you want, or install a package that does it your way.
+> — [pi 官方 README](https://github.com/earendil-works/pi)
+
+pi 自带 `examples/extensions/subagent`，是一份可以拷走改的参考实现：单个子代理、最多 8 个并行
+任务（同时跑 4 个），或者一条链。它是示例，不是维护中的包。形状对得上，拷它就行。
+
+这个生态里已经有成熟的包。下面每行写的是那个包最强的一件事，都出自它自己的文档：
+
+- [`pi-subagents`](https://github.com/nicobailon/pi-subagents) —— 脚本化的多智能体工作流、missions、可配的 acceptance gate。
+- [`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents) —— Claude Code 风格的命名智能体，带队列和实时面板。
+- [`@quintinshaw/pi-dynamic-workflows`](https://github.com/QuintinShaw/pi-dynamic-workflows) —— JavaScript 扇出，带 journaled resume。
+- [`pi-better-subagents`](https://github.com/1aboveio/pi-better-harness/tree/main/packages/pi-better-subagents) —— 在 OS 沙箱里跑独立进程。
+
+这个包跟它们的区别是两个设计选择，都在**默认值**这一层，不是功能多少：
+
+|                  | pi-dispatch                     | 一个写死的并发上限       |
+| ---------------- | ------------------------------- | ------------------------ |
+| 什么时候等       | 席位按可用内存算，扣掉 10% 预留 | 你写下的那个数字         |
+| 一次派发回来什么 | 退出码**加上**拿收据核过的判词  | 退出码加上孩子自己的总结 |
+
+上面这些包也核对交付：跑一条你配的命令，或者叫别的模型投票。这个包读的是父方已经观测到的
+`edit`、`write` 和命令收据，所以没有要配的东西。是另一种机制，不是更强。
+
+它们比这个包强的地方：OS 沙箱、journaled resume、工作流与人格系统、实时界面。需要那些就用它们。
+
+_包描述是 2026-11-26 对着上游文档核的。上游动得快，用之前自己再确认一遍。_
+
+## 派发的工具
 
 | 工具                  | 作用                                             |
 | --------------------- | ------------------------------------------------ |
@@ -195,7 +192,7 @@ review 完自己 `git merge --ff-only pi-dispatch/<taskId>`，然后移除 workt
 事实。作者戳是工具契约，不是安全边界。`readOnly: "strict"` 的孩子照样能读写这块板。只有一个
 孩子时没人交换，这块板只是噪音。
 
-## 已知边界
+## 派发的边界
 
 - **转向在回合边界送达。** 在跑的长工具不会被打断，消息要等当前工具批次跑完才进上下文。`sent`
   只表示写进了信箱。送达是另一个收据状态：`queued`、`delivered`、`seen`、`undelivered`。
