@@ -98,3 +98,29 @@ test("CLI：`--strict` 把 unclaimed 也当对不上", () => {
     assert.equal(run([path, "--format", "claude", "--strict"]).status, 1, "--strict 下算不可信");
   });
 });
+
+test("CLI：`--max` 能放宽收据上限（长会话默认只留 20 条）", () => {
+  const J = JSON.stringify;
+  const lines = [
+    J({
+      type: "item.completed",
+      item: { type: "command_execution", command: "pnpm test", exit_code: 0 },
+    }),
+    J({
+      type: "item.completed",
+      item: { type: "command_execution", command: "pnpm lint", exit_code: 0 },
+    }),
+  ];
+  withFixture(lines, (path) => {
+    const tight = run([path, "--format", "codex", "--max", "1", "--json"]);
+    assert.match(tight.stdout, /"truncated": true/);
+    const loose = run([path, "--format", "codex", "--max", "50", "--json"]);
+    assert.match(loose.stdout, /"truncated": false/);
+  });
+});
+
+test("CLI：`--max` 非正整数 ⇒ 退出 2", () => {
+  withFixture(["{}"], (path) => {
+    assert.equal(run([path, "--format", "codex", "--max", "0"]).status, 2);
+  });
+});

@@ -1418,7 +1418,7 @@ const FORMATS = [
 	"claude",
 	"pi"
 ];
-const USAGE = `用法：session-audit <file.jsonl> --format codex|claude|pi [--cwd DIR] [--json] [--strict]
+const USAGE = `用法：session-audit <file.jsonl> --format codex|claude|pi [--cwd DIR] [--max N] [--json] [--strict]
 
   0  verified（或 unclaimed；--strict 时 unclaimed 算 1）
   1  partial / unverified / absent
@@ -1465,6 +1465,7 @@ async function main(argv) {
 			options: {
 				format: { type: "string" },
 				cwd: { type: "string" },
+				max: { type: "string" },
 				json: {
 					type: "boolean",
 					default: false
@@ -1508,6 +1509,14 @@ async function main(argv) {
 		return 2;
 	}
 	const options = parsed.values.cwd !== void 0 ? { cwd: parsed.values.cwd } : {};
+	if (parsed.values.max !== void 0) {
+		const max = Number(parsed.values.max);
+		if (!Number.isInteger(max) || max <= 0) {
+			console.error(`--max 需要正整数：${parsed.values.max}`);
+			return 2;
+		}
+		options.maxReceipts = max;
+	}
 	const result = audit(events, normalized.report, options);
 	if (parsed.values.json === true) console.log(JSON.stringify(result, null, 2));
 	else console.log(render(result));
