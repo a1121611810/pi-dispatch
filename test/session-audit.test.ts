@@ -748,3 +748,31 @@ test("「已创建 X」算改动自述（真实日志里最常见的写法）", 
   assert.deepEqual(extractClaims("Created `a/b.ts`.").paths, ["a/b.ts"]);
   assert.deepEqual(extractClaims("新建了 `src/c.ts`。").paths, ["src/c.ts"]);
 });
+
+// ── shell 重定向也算写盘收据 ──────────────────────────────────────────────
+
+test("重定向写文件算路径收据", () => {
+  const result = audit([bash("printf happy > secret.txt", 0)], "已写入 `secret.txt`。");
+  assert.deepEqual(result.receipts.paths, ["secret.txt"]);
+  assert.equal(result.deliverable, "verified");
+});
+
+test("追加写 / 绝对路径 / tee 都算", () => {
+  const amp = audit([bash("echo a >> /tmp/a.log", 0)], "已写入 `/tmp/a.log`。");
+  assert.deepEqual(amp.receipts.paths, ["/tmp/a.log"]);
+  const tee = audit([bash("cat x | tee out.ts", 0)], "已写入 `out.ts`。");
+  assert.deepEqual(tee.receipts.paths, ["out.ts"]);
+});
+
+test("被丢弃的输出不算写文件", () => {
+  for (const command of ["make 2>/dev/null", "make 2>&1", 'echo "a > b"', "echo 'x > y'"]) {
+    const result = audit([bash(command, 0)], "已写入 `b`。");
+    assert.deepEqual(result.receipts.paths, [], `${command} 不该产路径收据`);
+  }
+});
+
+test("跑挂的命令即便有重定向也不算写成功", () => {
+  const result = audit([bash("printf x > out.txt", 2)], "已写入 `out.txt`。");
+  assert.deepEqual(result.receipts.paths, []);
+  assert.notEqual(result.deliverable, "verified");
+});

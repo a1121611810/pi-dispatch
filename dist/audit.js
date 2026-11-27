@@ -914,6 +914,24 @@ function claimHit(claim, receipts) {
 	return segs.every((seg) => usable.some((r) => scanCommand(r.command, false).some((os) => (claim.wantOk ? os.known : true) && segmentsMatch(seg.tokens, os.tokens, false))));
 }
 /** 从事件里收收据。路径保最先 N 条、命令保最近 N 条——与 core 一致。 */
+/** 这条 shell 命令把内容写进了哪些文件（`>` / `>>` / `tee`）。 */
+function redirectTargets(command) {
+	const bare = command.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, "\"\"");
+	const out = [];
+	const push = (target) => {
+		if (target.startsWith("&") || target.startsWith("/dev/") || target === "") return;
+		if (!looksLikeWrittenFile(target)) return;
+		if (!out.includes(target)) out.push(target);
+	};
+	for (const m of bare.matchAll(/(?:^|[\s;&|(])\d?>>?\s*([^\s;&|)<]+)/g)) push(m[1]);
+	for (const m of bare.matchAll(/(?:^|[\s;&|(])tee\s+(?:-a\s+)?([^\s;&|)]+)/g)) push(m[1]);
+	return out;
+}
+/** 只认「像文件」的目标：带目录，或带字母扩展名（`out.txt`）。 */
+function looksLikeWrittenFile(target) {
+	if (target.includes("/")) return true;
+	return /^[^\s/]+\.[A-Za-z][\w-]{0,9}$/.test(target);
+}
 function collectReceipts(events, max = DEFAULT_MAX) {
 	const paths = [];
 	const commands = [];
@@ -936,6 +954,15 @@ function collectReceipts(events, max = DEFAULT_MAX) {
 		if (event.name === "bash") {
 			const command = event.input.command;
 			if (typeof command !== "string" || command.trim() === "") continue;
+			if (typeof event.exitCode !== "number" || event.exitCode === 0) for (const target of redirectTargets(command)) {
+				const path = normalizePath(target, event.cwd);
+				if (paths.includes(path)) continue;
+				if (paths.length >= max) {
+					pathsTruncated = true;
+					continue;
+				}
+				paths.push(path);
+			}
 			commands.push({
 				command,
 				...typeof event.exitCode === "number" ? { exitCode: event.exitCode } : {},
