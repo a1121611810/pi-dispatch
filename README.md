@@ -147,8 +147,46 @@ evidence**, not proof of lying. A file changed through `bash` or
 be resolved against the working directory before it can be matched, so an honest child can be marked
 `unverified`. The record states what was observed; it does not conclude that the child lied.
 
-The exact matching rules — suffix matching for paths, per-segment trust for compound commands, the
-20-entry receipt cap — are in [`docs/spec/core-spec.html`](./docs/spec/core-spec.html).
+The exact matching rules — suffix matching for paths, per-segment trust for compound commands — are in
+[`docs/spec/core-spec.html`](./docs/spec/core-spec.html). Inside pi, the receipt window is capped at 20
+entries; the CLI below keeps every one unless you ask for a cap.
+
+## Auditing a session after the fact
+
+`dispatch_list` can only audit children pi itself started. The same check also runs offline against a
+raw session log, for runs that happened elsewhere:
+
+```bash
+npx @goodali/pi-dispatch session-audit ./session.jsonl --format codex --json
+# {"deliverable":"verified","claims":{"paths":["src/a.ts"],"commands":["pnpm test"]},
+#  "receipts":{...},"mismatch":{"paths":[],"commands":[]},"truncated":false,"notes":[]}
+```
+
+The plain-text render prints in Chinese (`判词 verified  自述 2 路径 / 1 命令`); `--json` is the
+language-neutral form.
+
+- `--format codex|claude|pi` — which log shape to read.
+- `--cwd DIR` — base for relative paths in claims.
+- `--max N` — keep only the last N command / first N path receipts (default: keep all).
+- `--json` — the full record; `--strict` — treat `unclaimed` as a failure.
+
+Exit codes: `0` for `verified`, and for `unclaimed` with nothing observed; `1` for the rest, including
+`unclaimed` after files were touched; `2` when the log cannot be parsed.
+
+It runs no model and opens no socket — it is regex matching over the log you already have. On 50 real
+session logs that measured ~100 ms per run (CPU only), against ~13 s and ~19k tokens for asking a model
+the same question.
+
+Notes ride along with the verdict: `self-reported failure`, `no auditable claim`,
+`vague success claim`, `report predates last steer`.
+
+Known blind spots: a path receipt only comes from a write tool or a shell redirect (`>`, `>>`, `tee`).
+Edit files through `vim`, an IDE, or a subagent, and no receipt exists — the report can be honest and
+still come back `unverified`. That is stated, not hidden.
+
+```ts
+import { audit } from "@goodali/pi-dispatch/audit";
+```
 
 ## Tools
 

@@ -134,8 +134,39 @@ _包描述是 2026-11-26 对着上游文档核的。上游动得快，用之前�
 进不了路径收据（命令本身能进），写成 `..` 的路径要先按工作目录解析才能匹配，所以一个老实的
 子代理也可能被标成 `unverified`。记录只陈述观测到什么，不是判定它撒谎。
 
-精确的匹配规则——路径后缀匹配、复合命令按段判定、收据 20 条上限——写在
-[`docs/spec/core-spec.html`](./docs/spec/core-spec.html)。
+精确的匹配规则——路径后缀匹配、复合命令按段判定——写在
+[`docs/spec/core-spec.html`](./docs/spec/core-spec.html)。在 pi 内部，收据窗口是 20 条；
+下面的 CLI 默认**全都留着**，除非你显式要上限。
+
+## 事后审计一份会话
+
+`dispatch_list` 只能审 pi 自己派出去的孩子。同一套判定也能离线跑在原始日志上，审那些不是 pi 起的会话：
+
+```bash
+npx @goodali/pi-dispatch session-audit ./session.jsonl --format codex
+# 判词 verified    自述 2 路径 / 1 命令   收据 2 路径 / 3 命令
+```
+
+- `--format codex|claude|pi` —— 读哪种日志；
+- `--cwd DIR` —— 解析自述里相对路径的基准；
+- `--max N` —— 只留最近 N 条命令、最先 N 条路径收据（默认全留）；
+- `--json` —— 完整记录；`--strict` —— 把 `unclaimed` 也当失败。
+
+退出码：`0` = `verified`，以及什么都没观测到的 `unclaimed`；`1` = 其余，包括"动过手却没给可核对自述"的
+`unclaimed`；`2` = 日志解析不了。
+
+它不调模型、不开网络，就是对你已有的日志做正则匹配。50 份真实会话实测：每次约 100 ms（纯 CPU），
+同样的问题丢给模型是约 13 秒、1.9 万 token。
+
+判词会带 note：`self-reported failure`、`no auditable claim`、`vague success claim`、
+`report predates last steer`。
+
+已知盲区：路径收据只来自写盘工具或 shell 重定向（`>`、`>>`、`tee`）。用 `vim`、IDE 或子代理改的文件
+没有收据——报告再诚实也会落在 `unverified`。这条写在明面上，不藏。
+
+```ts
+import { audit } from "@goodali/pi-dispatch/audit";
+```
 
 ## 工具
 
