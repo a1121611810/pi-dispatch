@@ -11,6 +11,9 @@ export interface NormalizedPi {
   events: SessionEvent[];
   report: string | null;
   malformed: number;
+  /** 上游（core 的 delivery 窗口）已经截断过：判词层要当证据不全处理。 */
+  pathsTruncated: boolean;
+  commandsTruncated: boolean;
 }
 
 export function normalizePi(lines: Iterable<string>): NormalizedPi {
@@ -34,5 +37,13 @@ export function normalizePi(lines: Iterable<string>): NormalizedPi {
   const text = parsed.text.trim();
   if (text !== "") events.push({ kind: "message", role: "assistant", text });
 
-  return { events, report: text === "" ? null : text, malformed: 0 };
+  return {
+    events,
+    report: text === "" ? null : text,
+    malformed: 0,
+    pathsTruncated:
+      parsed.delivery.pathsTruncated === true ||
+      (parsed.delivery as { lostPath?: boolean }).lostPath === true,
+    commandsTruncated: parsed.delivery.commandsTruncated === true,
+  };
 }

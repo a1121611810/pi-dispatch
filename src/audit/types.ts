@@ -73,8 +73,11 @@ export type SessionEvent =
 export interface AuditOptions {
   /** 解析相对路径的基准；必须绝对，否则当 `/`。 */
   cwd?: string;
-  /** 每一维各留多少条（默认 20）。 */
+  /** 每一维各留多少条（默认不限）。 */
   maxReceipts?: number;
+  /** 上游（如 pi 的 delivery）已经截断过：与本地收据的截断状态取或。 */
+  pathsTruncated?: boolean;
+  commandsTruncated?: boolean;
   /** 结构化自述：给了就不跑散文抽取。 */
   claims?: ExtractedClaims;
 }

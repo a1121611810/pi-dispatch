@@ -74,9 +74,18 @@ test("审计：unclaimed——只读分析，报告里没有可核对项", () =>
   assert.equal(audit([], "我读了 `src/a.ts`，未改动。").deliverable, "unclaimed");
 });
 
-test("审计：unclaimed 不是静音键——零自述但有路径收据 ⇒ unverified", () => {
-  // 干完活写一句嘴干净的报告，不能换到 exit 0。
-  assert.equal(audit([write("src/a.ts")], "搞定了。").deliverable, "unverified");
+test("审计：零自述 + 路径收据 ⇒ unclaimed + no auditable claim", () => {
+  // 方案文档类报告：没有任何可核对的断言。判词是 unclaimed，但带 note（CLI 会退 1）。
+  const result = audit([write("src/a.ts")], "先看日志，再改代码。");
+  assert.equal(result.deliverable, "unclaimed");
+  assert.deepEqual(result.notes, ["no auditable claim"]);
+});
+
+test("审计：嘴干净但有完成词 ⇒ unverified（不是静音键）", () => {
+  // 「搞定了」是完成词但绑不到命令，走 vagueUnbound。
+  const result = audit([write("src/a.ts")], "搞定了。");
+  assert.equal(result.deliverable, "unverified");
+  assert.deepEqual(result.notes, ["vague success claim"]);
 });
 
 test("审计：partial——路径命中、命令没命中", () => {
@@ -91,14 +100,14 @@ test("审计：partial——路径命中、命令没命中", () => {
 test("审计：截断 + 一条对不上 ⇒ unverified（截断不能洗白）", () => {
   // 21 条路径：窗口保最先 20，第 21 条不在窗口里。另一条对上的不能把它洗白。
   const events = Array.from({ length: 21 }, (_, i) => write(`src/f${i}.ts`));
-  const result = audit(events, "改了 `src/f0.ts` 和 `src/f20.ts`。");
+  const result = audit(events, "改了 `src/f0.ts` 和 `src/f20.ts`。", { maxReceipts: 20 });
   assert.equal(result.truncated, true);
   assert.equal(result.deliverable, "unverified");
 });
 
 test("审计：纯截断但都对得上 ⇒ 仍然 verified", () => {
   const events = Array.from({ length: 21 }, (_, i) => write(`src/f${i}.ts`));
-  assert.equal(audit(events, "改了 `src/f0.ts`。").deliverable, "verified");
+  assert.equal(audit(events, "改了 `src/f0.ts`。", { maxReceipts: 20 }).deliverable, "verified");
 });
 
 // ── 八条对抗样本里的六条（另外两条在归一化/CLI 层） ──────────────────────
@@ -289,12 +298,12 @@ test("命中：空命令自述不命中", () => {
 
 test("收据：命令保最近 20 条，路径保最先 20 条", () => {
   const commands = Array.from({ length: 21 }, (_, i) => bash(`cmd-${i}`, 0));
-  const result = audit(commands, null);
+  const result = audit(commands, null, { maxReceipts: 20 });
   assert.equal(result.receipts.commands.length, 20, "命令留最近 20 条");
   assert.equal(result.receipts.commands[0]!.command, "cmd-1", "最早的一条被挤掉");
 
   const paths = Array.from({ length: 21 }, (_, i) => write(`src/f${i}.ts`));
-  const kept = audit(paths, null).receipts.paths;
+  const kept = audit(paths, null, { maxReceipts: 20 }).receipts.paths;
   assert.equal(kept.length, 20, "路径留最先 20 条");
   assert.equal(kept[0], "src/f0.ts", "最后一条被挤掉");
 });
@@ -414,11 +423,29 @@ test("抽取：路径写在动词前面不算改动自述（已知盲区）", ()
   assert.deepEqual(extractClaims("`src/a.ts` 被改了。").paths, []);
 });
 
-test("抽取：倒装的失败词绑不到命令（已知盲区）", () => {
-  // 「失败：`pnpm test`」里失败词在命令前面，绑不到——写进盲区，不当谎报。
-  const claims = extractClaims("失败：`pnpm test`。");
-  assert.equal(claims.commands.length, 1);
-  assert.equal(claims.commands[0]!.wantOk, true);
+test("抽取：失败词在命令前面时绑到紧随其后的那一条", () => {
+  // 以前是盲区（失败词在前就绑不到）。现在按小句维护 failAhead。
+  for (const text of [
+    "失败：`pnpm test`。",
+    "没有跑通：`pnpm test` 报错。",
+    "`pnpm test` 失败了。",
+  ]) {
+    const claims = extractClaims(text);
+    assert.equal(claims.commands.length, 1, text);
+    assert.equal(claims.commands[0]!.wantOk, false, text);
+  }
+});
+
+test("抽取：说了「没跑」的命令不产出自述", () => {
+  for (const text of ["没跑 `pnpm test`。", "没有运行 `pnpm test`。"]) {
+    assert.deepEqual(extractClaims(text).commands, [], text);
+  }
+});
+
+test("抽取：failAhead 只点紧随其后的第一条命令", () => {
+  const claims = extractClaims("失败：`pnpm lint`，另外 `pnpm test` 跑通了。");
+  assert.equal(claims.commands[0]!.wantOk, false, "紧跟的那条算失败");
+  assert.equal(claims.commands[1]!.wantOk, true, "后面的不受牵连");
 });
 
 test("抽取：一句话里多条命令，失败只绑最近的前一条", () => {
@@ -712,13 +739,39 @@ test("收据里的换行不拆成两条命令（否则会假装命中）", () =>
   assert.equal(result.deliverable, "unverified");
 });
 
-test("带分隔符的失败类自述逐段核对", () => {
-  // 含分隔符的自述走逐段校验（不走整串快路），wantOk=false 时每段都要对得上失败收据。
-  const result = audit(
-    [bash("pnpm test", 1), bash("pnpm lint", 1)],
-    "`pnpm test && pnpm lint` 失败了。",
-  );
+test("失败自述：`&&` 两侧都不能推「是它失败了」", () => {
+  // `a && b` 退 1 时，挂的可能是任一侧 —— 不能把「pnpm test 失败了」算成被兑现。
+  const result = audit([bash("pnpm test && pnpm lint", 1)], "`pnpm test` 失败了。");
+  assert.equal(result.deliverable, "unverified");
+});
+
+test("失败自述：`||` 右侧可推（它确实跑过并失败）", () => {
+  const result = audit([bash("a || pnpm test", 1)], "`pnpm test` 失败了。");
   assert.equal(result.deliverable, "verified");
+  assert.deepEqual(result.notes, ["self-reported failure"]);
+});
+
+test("失败自述：`;` 右侧可推，左侧不可推", () => {
+  const right = audit([bash("pnpm lint ; pnpm test", 1)], "`pnpm test` 失败了。");
+  assert.equal(right.deliverable, "verified");
+  const left = audit([bash("pnpm test ; pnpm lint", 1)], "`pnpm test` 失败了。");
+  assert.equal(left.deliverable, "unverified");
+});
+
+test("失败自述：`|` 两侧都不可推（pipefail 看不出来）", () => {
+  const result = audit([bash("pnpm test | tee out.log", 1)], "`pnpm test` 失败了。");
+  assert.equal(result.deliverable, "unverified");
+});
+
+test("失败自述：命令串里出现 pipefail ⇒ 整条不可推", () => {
+  const result = audit([bash("set -o pipefail; a || pnpm test", 1)], "`pnpm test` 失败了。");
+  assert.equal(result.deliverable, "unverified");
+});
+
+test("负评被兑现时判 verified，但带 self-reported failure 说明", () => {
+  const result = audit([bash("pnpm test", 1)], "`pnpm test` 失败了。");
+  assert.equal(result.deliverable, "verified");
+  assert.deepEqual(result.notes, ["self-reported failure"]);
 });
 
 test("自述比收据长时不算命中（不按前缀放行）", () => {

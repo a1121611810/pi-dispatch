@@ -4,7 +4,8 @@
 //   1. `stale + partial`：core 给 partial，这里给 unverified；
 //   2. 整维零命中（如路径 1/1 命中、命令 0/1）：core 给 unverified，这里按全局并集给 partial；
 //   3. `receiptGap` 在 core 里排在 partial 之后，这里排在 partial 之前；
-//   4. 零自述但有路径收据 / 报告有完成词：core 给 unclaimed，这里给 unverified。
+//   4. 只有「报告里出现完成词」这一条还分歧：core 不看完成词，这里判 `unverified`。
+//      （零自述 + 路径收据已统一成 `unclaimed` + note `no auditable claim`。）
 // 不复用 `deliverableOf` 的判词链，也不复用 `claimSatisfied`（内部有整串快路，且 wantOk
 // 是从 exitCode 推的）——只复用 `scanCommand` / `segmentsMatch` 两个原语。
 import { pathMatches, scanCommand, segmentsMatch } from "../core/child.ts";
@@ -21,30 +22,39 @@ import type {
   SessionEvent,
 } from "./types.ts";
 
-const DEFAULT_MAX = 20;
+const DEFAULT_MAX = Number.POSITIVE_INFINITY;
 
 const squash = (text: string): string => text.replace(/\s+/g, " ").trim();
 
 /** 命令自述有没有被某条收据兑现。 */
 export function claimHit(claim: CommandClaim, receipts: CommandReceipt[]): boolean {
+  return receipts.some((receipt) => claimHitIn(claim, receipt));
+}
+
+/**
+ * 一条自述能不能被**这一条**收据兑现。
+ *
+ * - 声称跑通（wantOk）：要 exitCode 0，且命中段的 `known` 为真；
+ * - 声称失败（wantOk=false）：要 exitCode 非零，且命中段的 `failed` 为真
+ *   （`a && b` 退 1 时两边都不可推，不能把「b 失败了」算成兑现）。
+ */
+export function claimHitIn(claim: CommandClaim, receipt: CommandReceipt): boolean {
   const segs = scanCommand(claim.command, true).filter((seg) => seg.tokens.length > 0);
   if (segs.length === 0) return false;
-  const usable = receipts.filter((r) =>
-    claim.wantOk ? r.exitCode === 0 : typeof r.exitCode === "number",
-  );
-  if (usable.length === 0) return false;
+  const usable = claim.wantOk
+    ? receipt.exitCode === 0
+    : typeof receipt.exitCode === "number" && receipt.exitCode !== 0;
+  if (!usable) return false;
 
   // 整串快路只在自述不含任何分隔符时启用：含分隔符的自述必须逐段校验。
   if (!/[|;&\n]/.test(claim.command)) {
     const target = squash(claim.command);
-    if (usable.some((r) => squash(r.command) === target)) return true;
+    if (squash(receipt.command) === target) return true;
   }
 
   return segs.every((seg) =>
-    usable.some((r) =>
-      scanCommand(r.command, false).some(
-        (os) => (claim.wantOk ? os.known : true) && segmentsMatch(seg.tokens, os.tokens, false),
-      ),
+    scanCommand(receipt.command, false).some(
+      (os) => (claim.wantOk ? os.known : os.failed) && segmentsMatch(seg.tokens, os.tokens, false),
     ),
   );
 }
@@ -155,14 +165,18 @@ export function verdictOf(facts: VerdictFacts): Deliverable {
     facts.notes.push("vague success claim");
     return "unverified";
   }
-  if (facts.total === 0 && (facts.hasPathReceipts || facts.vagueUnbound)) {
-    if (facts.vagueUnbound) facts.notes.push("vague success claim");
+  if (facts.total === 0 && facts.vagueUnbound) {
+    facts.notes.push("vague success claim");
     return "unverified";
+  }
+  if (facts.total === 0) {
+    // 零自述就是没有可核对的东西。有收据只说明「动过手」，不说明「声称过」。
+    if (facts.hasPathReceipts) facts.notes.push("no auditable claim");
+    return "unclaimed";
   }
   if (facts.total > 0 && facts.hits === 0) return "unverified";
   if (facts.truncated && facts.hits < facts.total) return "unverified";
   if (facts.hits > 0 && facts.hits < facts.total) return "partial";
-  if (facts.total === 0) return "unclaimed";
   if (facts.hits === facts.total && facts.total > 0) return "verified";
   return "unverified";
 }
@@ -214,7 +228,11 @@ export function audit(
   opts: AuditOptions = {},
 ): AuditResult {
   const max = opts.maxReceipts ?? DEFAULT_MAX;
-  const { receipts, pathsTruncated, commandsTruncated } = collectReceipts(events, max);
+  const collected = collectReceipts(events, max);
+  const { receipts } = collected;
+  // 上游截断与本地截断取「或」：任何一处丢过证据都算截断，不能被另一处洗白。
+  const pathsTruncated = collected.pathsTruncated || opts.pathsTruncated === true;
+  const commandsTruncated = collected.commandsTruncated || opts.commandsTruncated === true;
 
   const text = (report ?? lastAssistantText(events) ?? "").trim();
   const hasBody = text !== "";
@@ -250,6 +268,19 @@ export function audit(
     hasPathReceipts: receipts.paths.length > 0,
     notes,
   });
+
+  // 诚实的负评也要能被认出来：判词是 verified，但它兑现的是「失败」。
+  if (deliverable === "verified") {
+    const negative = claims.commands.filter(
+      (claim) => !claim.wantOk && commandHits.includes(claim),
+    );
+    const lastRight = negative.some((claim) => {
+      const matched = receipts.commands.filter((receipt) => claimHitIn(claim, receipt));
+      const last = matched.at(-1);
+      return last !== undefined && typeof last.exitCode === "number" && last.exitCode !== 0;
+    });
+    if (lastRight) notes.push("self-reported failure");
+  }
 
   const matchedPaths = new Set(pathHits);
   const matchedCommands = new Set(commandHits.map((c) => c.command));

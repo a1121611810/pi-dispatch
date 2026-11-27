@@ -887,6 +887,8 @@ test("形状：pi 一条会话归一化后逐字段相等", () => {
     ],
     report: "改了 `src/a.ts`，`pnpm test` 跑通了。",
     malformed: 0,
+    pathsTruncated: false,
+    commandsTruncated: false,
   });
 });
 
@@ -1539,4 +1541,31 @@ test("claude：缺 id 的 tool_use 不参与配对", () => {
     }),
   ]);
   assert.deepEqual(result.events, []);
+});
+
+test("pi：上游截断旗要带出来（core 的 20 条窗口）", () => {
+  const lines: string[] = [];
+  for (let i = 0; i < 25; i++) {
+    lines.push(
+      JSON.stringify({
+        type: "tool_execution_start",
+        toolName: "bash",
+        toolCallId: `t${i}`,
+        args: { command: `cmd-${i}` },
+      }),
+    );
+    lines.push(JSON.stringify({ type: "tool_execution_end", toolCallId: `t${i}`, isError: false }));
+  }
+  lines.push(
+    JSON.stringify({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "`cmd-24` 跑通了。" }] },
+    }),
+  );
+  const normalized = normalizePi(lines);
+  assert.equal(normalized.commandsTruncated, true, "25 条命令超过 core 的 20 条窗口");
+  const result = audit(normalized.events, normalized.report, {
+    commandsTruncated: normalized.commandsTruncated,
+  });
+  assert.equal(result.truncated, true, "上游截断要并进判词");
 });

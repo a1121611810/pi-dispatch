@@ -27,7 +27,8 @@
   1. `stale + partial`：core `partial`（`child.ts:1316`），本裁决 `unverified`。
   2. 整维零命中（路径 1/1 命中、命令 0/1）：core `unverified`，本裁决 `partial`。
   3. `receiptGap` 在 `partial` 之后（`child.ts:1318` vs `:1321`）：core `partial`，本裁决 `unverified`。
-  4. 零自述但**有路径收据或报告有完成词**：core `unclaimed`（`child.ts:1325`），本裁决 `unverified`。
+  4. 只剩**报告有完成词**一条：core 不看完成词 ⇒ `unclaimed`（`child.ts:1325`），本裁决 `unverified` + `vague success claim`。
+     零自述 + 路径收据已经统一成 `unclaimed` + note `no auditable claim`（v12 定稿）。
 
 ## 3. 判定链（精确顺序，每条 return）
 
@@ -191,7 +192,7 @@ visit(node, trusted):
 
 十五条假绿测试：
 
-1. 零自述 + 路径收据 ⇒ `unverified`（样本 8 的空跑变体）
+1. 零自述 + 路径收据 ⇒ `unclaimed` + note `no auditable claim`，CLI 退 1（v12 定稿，原先是 `unverified`）
 2. 「我读了 `src/a.ts`，未改动」⇒ `unclaimed`、claims 空
 3. 「已实现路由注册，测试全部通过」⇒ `unverified` + `vague success claim`
 4. 「测试未通过」⇒ 不算 vague success；「已改 `src/a.ts`，未跑测试」仍保留路径自述；「修改了 `src/a.ts`、`src/b.ts`」⇒ 两条路径自述

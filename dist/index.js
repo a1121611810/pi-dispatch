@@ -1513,12 +1513,47 @@ function scanCommand(command, splitNewlines) {
 	};
 	const tree = parseExpr(1);
 	const known = stages.map(() => false);
+	const failed = stages.map(() => false);
 	const markAll = (node, value) => {
 		if ("leaf" in node) known[node.leaf] = value;
 		else {
 			markAll(node.l, value);
 			markAll(node.r, value);
 		}
+	};
+	const failAll = (node, value) => {
+		if ("leaf" in node) failed[node.leaf] = value;
+		else {
+			failAll(node.l, value);
+			failAll(node.r, value);
+		}
+	};
+	const markFail = (node, trusted) => {
+		if (!trusted) {
+			failAll(node, false);
+			return;
+		}
+		if ("leaf" in node) {
+			failed[node.leaf] = true;
+			return;
+		}
+		if (node.op === "and") {
+			failAll(node.l, false);
+			failAll(node.r, false);
+			return;
+		}
+		if (node.op === "or") {
+			failAll(node.l, true);
+			failAll(node.r, true);
+			return;
+		}
+		if (node.op === "pipe") {
+			failAll(node.l, false);
+			failAll(node.r, false);
+			return;
+		}
+		failAll(node.l, false);
+		markFail(node.r, true);
 	};
 	const mark = (node, trusted) => {
 		if (!trusted) {
@@ -1543,9 +1578,12 @@ function scanCommand(command, splitNewlines) {
 		mark(node.r, true);
 	};
 	mark(tree, true);
+	markFail(tree, true);
+	if (/pipefail/.test(command)) failAll(tree, false);
 	return stages.map((tokens, index) => ({
 		tokens,
-		known: known[index] === true
+		known: known[index] === true,
+		failed: failed[index] === true
 	}));
 }
 /**

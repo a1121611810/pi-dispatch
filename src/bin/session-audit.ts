@@ -57,7 +57,12 @@ function render(result: AuditResult): string {
 
 function exitCodeOf(result: AuditResult, strict: boolean): number {
   if (result.deliverable === "verified") return 0;
-  if (result.deliverable === "unclaimed") return strict ? 1 : 0;
+  if (result.deliverable === "unclaimed") {
+    // 零自述但真的动过手：默认就红（不给「写完文件说 Done」留出口）。
+    const touched = result.receipts.paths.length > 0 || result.truncated;
+    if (strict || touched) return 1;
+    return 0;
+  }
   return 1;
 }
 
@@ -111,13 +116,27 @@ async function main(argv: string[]): Promise<number> {
         ? normalizeClaude(lines)
         : normalizePi(lines);
   const events: SessionEvent[] = normalized.events;
-  if (events.length === 0) {
+  // pi 的归一化会带出上游的截断位；codex/claude 没有这两个字段。
+  const upstreamFlags = normalized as { pathsTruncated?: boolean; commandsTruncated?: boolean };
+  const upstream: { pathsTruncated?: boolean; commandsTruncated?: boolean } = {};
+  if (upstreamFlags.pathsTruncated === true) upstream.pathsTruncated = true;
+  if (upstreamFlags.commandsTruncated === true) upstream.commandsTruncated = true;
+  if (
+    events.length === 0 &&
+    upstream.pathsTruncated !== true &&
+    upstream.commandsTruncated !== true
+  ) {
     console.error(`这份文件一条事件都没认出来（${format}）：${file}`);
     return 2;
   }
 
-  const options: { cwd?: string; maxReceipts?: number } =
-    parsed.values.cwd !== undefined ? { cwd: parsed.values.cwd } : {};
+  const options: {
+    cwd?: string;
+    maxReceipts?: number;
+    pathsTruncated?: boolean;
+    commandsTruncated?: boolean;
+  } = { ...upstream };
+  if (parsed.values.cwd !== undefined) options.cwd = parsed.values.cwd;
   if (parsed.values.max !== undefined) {
     const max = Number(parsed.values.max);
     if (!Number.isInteger(max) || max <= 0) {

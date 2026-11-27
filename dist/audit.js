@@ -578,12 +578,47 @@ function scanCommand(command, splitNewlines) {
 	};
 	const tree = parseExpr(1);
 	const known = stages.map(() => false);
+	const failed = stages.map(() => false);
 	const markAll = (node, value) => {
 		if ("leaf" in node) known[node.leaf] = value;
 		else {
 			markAll(node.l, value);
 			markAll(node.r, value);
 		}
+	};
+	const failAll = (node, value) => {
+		if ("leaf" in node) failed[node.leaf] = value;
+		else {
+			failAll(node.l, value);
+			failAll(node.r, value);
+		}
+	};
+	const markFail = (node, trusted) => {
+		if (!trusted) {
+			failAll(node, false);
+			return;
+		}
+		if ("leaf" in node) {
+			failed[node.leaf] = true;
+			return;
+		}
+		if (node.op === "and") {
+			failAll(node.l, false);
+			failAll(node.r, false);
+			return;
+		}
+		if (node.op === "or") {
+			failAll(node.l, true);
+			failAll(node.r, true);
+			return;
+		}
+		if (node.op === "pipe") {
+			failAll(node.l, false);
+			failAll(node.r, false);
+			return;
+		}
+		failAll(node.l, false);
+		markFail(node.r, true);
 	};
 	const mark = (node, trusted) => {
 		if (!trusted) {
@@ -608,9 +643,12 @@ function scanCommand(command, splitNewlines) {
 		mark(node.r, true);
 	};
 	mark(tree, true);
+	markFail(tree, true);
+	if (/pipefail/.test(command)) failAll(tree, false);
 	return stages.map((tokens, index) => ({
 		tokens,
-		known: known[index] === true
+		known: known[index] === true,
+		failed: failed[index] === true
 	}));
 }
 /**
@@ -680,9 +718,9 @@ const RUNNERS = /* @__PURE__ */ new Set([
 const CHANGE_VERB = /改|修改|新增|新建|创建|删除|写入|implemented|changed|added|created|wrote|updated|fixed/gi;
 const READ_VERB = /读|看了|查看|检查|搜索|grep|read|inspected|checked|reviewed|scanned/gi;
 /** 失败词。裸「红」不算（「红利 / 红灯」会误伤）。 */
-const FAIL_WORD = /失败|报错|挂了|failed|error|failing|not ok|未通过|没通过|没有通过/gi;
+const FAIL_WORD = /失败|报错|挂了|没跑通|没有跑通|未跑通|跑不通|failed|error|failing|not ok|未通过|没通过|没有通过/gi;
 /** 完成词。`完成` 单独不算，除非同句有 实现 / 修复 / 改动。 */
-const DONE_WORD = /已实现|已修复|已通过|全部通过|测试通过|全绿|fixed|implemented|passed|all tests pass/gi;
+const DONE_WORD = /已实现|已修复|已通过|全部通过|测试通过|全绿|搞定|fixed|implemented|passed|all tests pass/gi;
 const DONE_LOOSE = /完成/;
 const DONE_NEEDS = /实现|修复|改动/;
 /** 否定词。`no` / `not` 带词边界，否则 `node` 里的 `no` 会误伤；裸 `0`/`零` 不收。 */
@@ -692,10 +730,14 @@ const FAIL_PHRASES = [
 	"未通过",
 	"没通过",
 	"没有通过",
+	"没跑通",
+	"没有跑通",
+	"未跑通",
+	"跑不通",
 	"not ok"
 ];
 /** 说「这条没跑」的说法：它不能当完成词的绑定目标。 */
-const NOT_RUN = /(?:没跑|未跑|未执行|没有运行|didn't run)\s*$/i;
+const NOT_RUN = /(?:没跑|未跑|没执行|未执行|没有运行|没有跑|didn't run)[:：\s]*$/i;
 const EXT = /^[\w-]{1,10}$/;
 /** 句子分隔：句号/问号/叹号/换行/分号，以及「句点+空白」。反引号与围栏内部不切。 */
 function splitSentences(text) {
@@ -858,29 +900,38 @@ function extractClaims(report) {
 		let lastVerb = null;
 		let lastCmd = null;
 		const doneToks = [];
-		for (const clause of splitClauses(sentence)) for (const tok of tokensOf(clause)) {
-			const notRun = tok.t === "cmd" && NOT_RUN.test(clause.slice(0, tok.at));
-			switch (tok.t) {
-				case "verb-change":
-					if (!isNegated(clause, tok.at)) lastVerb = "change";
-					break;
-				case "verb-read":
-					if (!isNegated(clause, tok.at)) lastVerb = "read";
-					break;
-				case "cmd":
-					commands.push({
-						command: tok.v,
-						wantOk: true
-					});
-					if (!notRun) lastCmd = commands.length - 1;
-					break;
-				case "path":
-					if (lastVerb === "change" && !isNegated(clause, tok.at)) paths.push(tok.v);
-					break;
-				case "fail":
-					if (lastCmd !== null && !isNegated(clause, tok.at)) commands[lastCmd].wantOk = false;
-					break;
-				case "done": if (!isNegated(clause, tok.at)) doneToks.push(tok);
+		for (const clause of splitClauses(sentence)) {
+			let failAhead = false;
+			let sawCmd = false;
+			for (const tok of tokensOf(clause)) {
+				const notRun = tok.t === "cmd" && NOT_RUN.test(clause.slice(0, tok.at));
+				switch (tok.t) {
+					case "verb-change":
+						if (!isNegated(clause, tok.at)) lastVerb = "change";
+						break;
+					case "verb-read":
+						if (!isNegated(clause, tok.at)) lastVerb = "read";
+						break;
+					case "cmd":
+						if (notRun) break;
+						commands.push({
+							command: tok.v,
+							wantOk: !failAhead
+						});
+						lastCmd = commands.length - 1;
+						sawCmd = true;
+						failAhead = false;
+						break;
+					case "path":
+						if (lastVerb === "change" && !isNegated(clause, tok.at)) paths.push(tok.v);
+						break;
+					case "fail":
+						if (isNegated(clause, tok.at)) break;
+						if (sawCmd && lastCmd !== null) commands[lastCmd].wantOk = false;
+						else failAhead = true;
+						break;
+					case "done": if (!isNegated(clause, tok.at)) doneToks.push(tok);
+				}
 			}
 		}
 		for (const _ of doneToks) vagueBindings.push(lastCmd ?? prevSentenceLastCmd);
@@ -899,19 +950,28 @@ function extractClaims(report) {
 	};
 }
 // src/audit/verdict.ts
-const DEFAULT_MAX = 20;
+const DEFAULT_MAX = Number.POSITIVE_INFINITY;
 const squash = (text) => text.replace(/\s+/g, " ").trim();
 /** 命令自述有没有被某条收据兑现。 */
 function claimHit(claim, receipts) {
+	return receipts.some((receipt) => claimHitIn(claim, receipt));
+}
+/**
+* 一条自述能不能被**这一条**收据兑现。
+*
+* - 声称跑通（wantOk）：要 exitCode 0，且命中段的 `known` 为真；
+* - 声称失败（wantOk=false）：要 exitCode 非零，且命中段的 `failed` 为真
+*   （`a && b` 退 1 时两边都不可推，不能把「b 失败了」算成兑现）。
+*/
+function claimHitIn(claim, receipt) {
 	const segs = scanCommand(claim.command, true).filter((seg) => seg.tokens.length > 0);
 	if (segs.length === 0) return false;
-	const usable = receipts.filter((r) => claim.wantOk ? r.exitCode === 0 : typeof r.exitCode === "number");
-	if (usable.length === 0) return false;
+	if (!(claim.wantOk ? receipt.exitCode === 0 : typeof receipt.exitCode === "number" && receipt.exitCode !== 0)) return false;
 	if (!/[|;&\n]/.test(claim.command)) {
 		const target = squash(claim.command);
-		if (usable.some((r) => squash(r.command) === target)) return true;
+		if (squash(receipt.command) === target) return true;
 	}
-	return segs.every((seg) => usable.some((r) => scanCommand(r.command, false).some((os) => (claim.wantOk ? os.known : true) && segmentsMatch(seg.tokens, os.tokens, false))));
+	return segs.every((seg) => scanCommand(receipt.command, false).some((os) => (claim.wantOk ? os.known : os.failed) && segmentsMatch(seg.tokens, os.tokens, false)));
 }
 /** 从事件里收收据。路径保最先 N 条、命令保最近 N 条——与 core 一致。 */
 /** 这条 shell 命令把内容写进了哪些文件（`>` / `>>` / `tee`）。 */
@@ -998,14 +1058,17 @@ function verdictOf(facts) {
 		facts.notes.push("vague success claim");
 		return "unverified";
 	}
-	if (facts.total === 0 && (facts.hasPathReceipts || facts.vagueUnbound)) {
-		if (facts.vagueUnbound) facts.notes.push("vague success claim");
+	if (facts.total === 0 && facts.vagueUnbound) {
+		facts.notes.push("vague success claim");
 		return "unverified";
+	}
+	if (facts.total === 0) {
+		if (facts.hasPathReceipts) facts.notes.push("no auditable claim");
+		return "unclaimed";
 	}
 	if (facts.total > 0 && facts.hits === 0) return "unverified";
 	if (facts.truncated && facts.hits < facts.total) return "unverified";
 	if (facts.hits > 0 && facts.hits < facts.total) return "partial";
-	if (facts.total === 0) return "unclaimed";
 	if (facts.hits === facts.total && facts.total > 0) return "verified";
 	return "unverified";
 }
@@ -1044,7 +1107,10 @@ const toClaimSet = (claims) => ({
 * - `opts.cwd`：解析 `..` 的基准；相对路径当 `/`。
 */
 function audit(events, report, opts = {}) {
-	const { receipts, pathsTruncated, commandsTruncated } = collectReceipts(events, opts.maxReceipts ?? DEFAULT_MAX);
+	const collected = collectReceipts(events, opts.maxReceipts ?? DEFAULT_MAX);
+	const { receipts } = collected;
+	const pathsTruncated = collected.pathsTruncated || opts.pathsTruncated === true;
+	const commandsTruncated = collected.commandsTruncated || opts.commandsTruncated === true;
 	const text = (report ?? lastAssistantText(events) ?? "").trim();
 	const hasBody = text !== "";
 	const claims = opts.claims ?? extractClaims(text);
@@ -1071,6 +1137,12 @@ function audit(events, report, opts = {}) {
 		hasPathReceipts: receipts.paths.length > 0,
 		notes
 	});
+	if (deliverable === "verified") {
+		if (claims.commands.filter((claim) => !claim.wantOk && commandHits.includes(claim)).some((claim) => {
+			const last = receipts.commands.filter((receipt) => claimHitIn(claim, receipt)).at(-1);
+			return last !== void 0 && typeof last.exitCode === "number" && last.exitCode !== 0;
+		})) notes.push("self-reported failure");
+	}
 	const matchedPaths = new Set(pathHits);
 	const matchedCommands = new Set(commandHits.map((c) => c.command));
 	return {
@@ -1406,7 +1478,9 @@ function normalizePi(lines) {
 	return {
 		events,
 		report: text === "" ? null : text,
-		malformed: 0
+		malformed: 0,
+		pathsTruncated: parsed.delivery.pathsTruncated === true || parsed.delivery.lostPath === true,
+		commandsTruncated: parsed.delivery.commandsTruncated === true
 	};
 }
 export { audit, claimHit, collectReceipts, extractClaims, normalizeClaude, normalizeCodex, normalizePath, normalizePi, unwrapShell, verdictOf };

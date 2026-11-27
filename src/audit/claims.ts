@@ -25,19 +25,29 @@ const CHANGE_VERB =
   /改|修改|新增|新建|创建|删除|写入|implemented|changed|added|created|wrote|updated|fixed/gi;
 const READ_VERB = /读|看了|查看|检查|搜索|grep|read|inspected|checked|reviewed|scanned/gi;
 /** 失败词。裸「红」不算（「红利 / 红灯」会误伤）。 */
-const FAIL_WORD = /失败|报错|挂了|failed|error|failing|not ok|未通过|没通过|没有通过/gi;
+const FAIL_WORD =
+  /失败|报错|挂了|没跑通|没有跑通|未跑通|跑不通|failed|error|failing|not ok|未通过|没通过|没有通过/gi;
 /** 完成词。`完成` 单独不算，除非同句有 实现 / 修复 / 改动。 */
 const DONE_WORD =
-  /已实现|已修复|已通过|全部通过|测试通过|全绿|fixed|implemented|passed|all tests pass/gi;
+  /已实现|已修复|已通过|全部通过|测试通过|全绿|搞定|fixed|implemented|passed|all tests pass/gi;
 const DONE_LOOSE = /完成/;
 const DONE_NEEDS = /实现|修复|改动/;
 /** 否定词。`no` / `not` 带词边界，否则 `node` 里的 `no` 会误伤；裸 `0`/`零` 不收。 */
 const NEG =
   /没有|没|未(?!来|知|必|免)|无|不是|并非|不算|\bnot\b|\bno\b|\bnever\b|\bdidn't\b|\bwithout\b/gi;
 /** 自己就是失败短语，不能被自己的「未 / not」当成否定。 */
-const FAIL_PHRASES = ["未通过", "没通过", "没有通过", "not ok"];
+const FAIL_PHRASES = [
+  "未通过",
+  "没通过",
+  "没有通过",
+  "没跑通",
+  "没有跑通",
+  "未跑通",
+  "跑不通",
+  "not ok",
+];
 /** 说「这条没跑」的说法：它不能当完成词的绑定目标。 */
-const NOT_RUN = /(?:没跑|未跑|未执行|没有运行|didn't run)\s*$/i;
+const NOT_RUN = /(?:没跑|未跑|没执行|未执行|没有运行|没有跑|didn't run)[:：\s]*$/i;
 
 const EXT = /^[\w-]{1,10}$/;
 
@@ -198,8 +208,11 @@ export function extractClaims(report: string): ExtractedClaims {
     const doneToks: Tok[] = [];
 
     for (const clause of splitClauses(sentence)) {
+      // 失败词出现在命令**之前**：它点的是紧随其后的那一条（`没有跑通：\`X\``）。
+      let failAhead = false;
+      let sawCmd = false;
       for (const tok of tokensOf(clause)) {
-        // 说「这条没跑」的命令不当绑定目标（完成词用它会把诚实报告判成谎报）。
+        // 说「这条没跑」的命令既不当绑定目标，也不产出自述。
         const notRun = tok.t === "cmd" && NOT_RUN.test(clause.slice(0, tok.at));
         switch (tok.t) {
           case "verb-change":
@@ -209,15 +222,20 @@ export function extractClaims(report: string): ExtractedClaims {
             if (!isNegated(clause, tok.at)) lastVerb = "read";
             break;
           case "cmd":
-            commands.push({ command: tok.v!, wantOk: true });
-            if (!notRun) lastCmd = commands.length - 1;
+            if (notRun) break;
+            commands.push({ command: tok.v!, wantOk: !failAhead });
+            lastCmd = commands.length - 1;
+            sawCmd = true;
+            failAhead = false;
             break;
           case "path":
             if (lastVerb === "change" && !isNegated(clause, tok.at)) paths.push(tok.v!);
             break;
           case "fail":
             // 「没失败」「0 报错」不算失败。
-            if (lastCmd !== null && !isNegated(clause, tok.at)) commands[lastCmd]!.wantOk = false;
+            if (isNegated(clause, tok.at)) break;
+            if (sawCmd && lastCmd !== null) commands[lastCmd]!.wantOk = false;
+            else failAhead = true;
             break;
           case "done":
             if (!isNegated(clause, tok.at)) doneToks.push(tok);

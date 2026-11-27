@@ -1333,7 +1333,14 @@ export function deliverableOf(record: DeliverableInput): Deliverable {
  */
 export interface CommandSegment {
   tokens: string[];
+  /** 成败可信（退出码能代表这一段）。 */
   known: boolean;
+  /**
+   * 这一段的失败可推：整条退出码非零时，能断定「就是这一段失败了」。
+   * `known` 回答「它跑通了吗」，`failed` 回答「是它挂的吗」——两个问题不一样：
+   * `a && b` 退 1 时两边都不 known 也不可推（不知谁挂），`a ; b` 退 1 时 b 可推。
+   */
+  failed: boolean;
 }
 
 /**
@@ -1457,12 +1464,52 @@ export function scanCommand(command: string, splitNewlines: boolean): CommandSeg
   const tree = parseExpr(1);
 
   const known = stages.map(() => false);
+  const failed = stages.map(() => false);
   const markAll = (node: Node, value: boolean): void => {
     if ("leaf" in node) known[node.leaf] = value;
     else {
       markAll(node.l, value);
       markAll(node.r, value);
     }
+  };
+  const failAll = (node: Node, value: boolean): void => {
+    if ("leaf" in node) failed[node.leaf] = value;
+    else {
+      failAll(node.l, value);
+      failAll(node.r, value);
+    }
+  };
+  // 失败可推位：只有「退出码必然来自这一段」才为真。
+  const markFail = (node: Node, trusted: boolean): void => {
+    if (!trusted) {
+      failAll(node, false);
+      return;
+    }
+    if ("leaf" in node) {
+      failed[node.leaf] = true;
+      return;
+    }
+    if (node.op === "and") {
+      // 失败可能出在任一侧，不能指向某一条。
+      failAll(node.l, false);
+      failAll(node.r, false);
+      return;
+    }
+    if (node.op === "or") {
+      // 无论哪侧失败，被点到的那条确实跑过并失败。
+      failAll(node.l, true);
+      failAll(node.r, true);
+      return;
+    }
+    if (node.op === "pipe") {
+      // 有没有 `set -o pipefail` 看不出来：退出码可能来自左侧。
+      failAll(node.l, false);
+      failAll(node.r, false);
+      return;
+    }
+    // seq：退出码来自最后一条，右边可推。
+    failAll(node.l, false);
+    markFail(node.r, true);
   };
   const mark = (node: Node, trusted: boolean): void => {
     if (!trusted) {
@@ -1488,8 +1535,15 @@ export function scanCommand(command: string, splitNewlines: boolean): CommandSeg
     mark(node.r, true);
   };
   mark(tree, true);
+  markFail(tree, true);
+  // `pipefail` 会让管道的退出码归属整体不可知——整条降级。
+  if (/pipefail/.test(command)) failAll(tree, false);
 
-  return stages.map((tokens, index) => ({ tokens, known: known[index] === true }));
+  return stages.map((tokens, index) => ({
+    tokens,
+    known: known[index] === true,
+    failed: failed[index] === true,
+  }));
 }
 /**
  * 这条命令的成败有没有被掩码（`;` `|` `||` 后台 `&` 未加引号的换行）。

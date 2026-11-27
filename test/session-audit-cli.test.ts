@@ -124,3 +124,29 @@ test("CLI：`--max` 非正整数 ⇒ 退出 2", () => {
     assert.equal(run([path, "--format", "codex", "--max", "0"]).status, 2);
   });
 });
+
+test("CLI：零自述 + 路径收据 ⇒ 退 1（默认就红，不靠 --strict）", () => {
+  const J = JSON.stringify;
+  const lines = [
+    J({
+      type: "item.completed",
+      item: { type: "file_change", changes: { "/repo/a.ts": { type: "add" } } },
+    }),
+    J({ type: "item.completed", item: { type: "agent_message", text: "先看日志，再改代码。" } }),
+  ];
+  withFixture(lines, (path) => {
+    const result = run([path, "--format", "codex"]);
+    assert.equal(result.status, 1, "动过手却没给可核对自述");
+    assert.match(result.stdout, /unclaimed/);
+  });
+});
+
+test("CLI：零自述 + 没有收据 ⇒ 退 0", () => {
+  const J = JSON.stringify;
+  const lines = [
+    J({ type: "item.completed", item: { type: "agent_message", text: "先看日志，再改代码。" } }),
+  ];
+  withFixture(lines, (path) => {
+    assert.equal(run([path, "--format", "codex"]).status, 0);
+  });
+});
