@@ -17,6 +17,8 @@ function run(args: string[]): { status: number | null; stdout: string; stderr: s
     {
       cwd: root,
       encoding: "utf8",
+      // 大输出用例（--json 截断）要越过 spawnSync 默认 1 MB 的 maxBuffer
+      maxBuffer: 16 * 1024 * 1024,
     },
   );
   return { status: child.status, stdout: child.stdout, stderr: child.stderr };
@@ -239,7 +241,8 @@ test("CLI：kimi 只有 append_message ⇒ 2 且点名原因", () => {
 test("CLI：--json 走管道不被截断（128 KiB 之后还在）", () => {
   const lines: string[] = [];
   const tail = "x".repeat(200);
-  for (let i = 0; i < 800; i++) {
+  // 4000 条收据 ≈ 900 KB：远超任何平台的管道缓冲，截断点落在哪里都一样
+  for (let i = 0; i < 4000; i++) {
     lines.push(
       JSON.stringify({
         type: "context.append_loop_event",
@@ -258,7 +261,7 @@ test("CLI：--json 走管道不被截断（128 KiB 之后还在）", () => {
       }),
     );
   }
-  // 给一句没人任何自述的正文：不然判词是 absent（退 1），测不到截断
+  // 给一句没有任何自述的正文：不然判词是 absent（退 1），测不到截断
   lines.push(
     JSON.stringify({
       type: "context.append_loop_event",
@@ -273,8 +276,14 @@ test("CLI：--json 走管道不被截断（128 KiB 之后还在）", () => {
   withFixture(lines, (path) => {
     const result = run([path, "--format", "kimi", "--json"]);
     assert.equal(result.status, 0);
-    assert.ok(result.stdout.length > 140_000, `管道里只有 ${result.stdout.length} 字节`);
-    const parsed = JSON.parse(result.stdout) as { receipts: { commands: unknown[] } };
-    assert.equal(parsed.receipts.commands.length, 800, "一条都不能丢");
+    assert.ok(result.stdout.length > 400_000, `管道里只有 ${result.stdout.length} 字节`);
+    // 解析失败要落成断言失败，不能靠 JSON.parse 抛异常——那会被判「红在无关异常上」
+    let parsed: { receipts: { commands: unknown[] } };
+    try {
+      parsed = JSON.parse(result.stdout) as { receipts: { commands: unknown[] } };
+    } catch {
+      assert.fail(`管道里的 JSON 不完整（${result.stdout.length} 字节），尾巴被 process.exit 丢了`);
+    }
+    assert.equal(parsed.receipts.commands.length, 4000, "一条都不能丢");
   });
 });
