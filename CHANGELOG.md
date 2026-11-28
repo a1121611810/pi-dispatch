@@ -5,6 +5,22 @@
 格式按 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号按
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] - 2026-11-28
+
+### 新增
+
+- `session-audit` 新增 `--format kimi`：读 Kimi Code 的 `wire.jsonl`（wire 1.3–1.5），入参可以是文件，也可以是
+  会话目录（自动取 `agents/main/wire.jsonl`，不并子代理侧链）。
+  - `isError` 缺省即成功（本机 708 份主线里 77.8% 的结果没有这个键）；失败退出码尾部优先、头部再用。
+  - 后台命令的启动不算收据，退出码在 `task.terminated` 里按 `parentToolCallId` 补；**报告之后才跑完的终态不给报告作证**。
+  - `Write` / `Edit` 的被拒调用不产路径收据（与 claude 有意分叉）。
+  - wire 1.0 与只有 `context.append_message` 的会话不做支持，退 `2` 并在文案里点名。
+- 真夹具 `test/fixtures/session-audit/kimi-{write,readonly}.jsonl`（来自真实会话，裁剪 + 脱敏）。
+- 修复：`--json` 走管道时在 128 KiB 处被截断（`process.exit` 丢弃了异步 stdout 的尾巴）。
+- 修复：用户敲斜杠触发的技能回合（`skill_activation` + `trigger: user-slash`）曾被当注入吞掉，
+  报告之后的人话因此标不出「早于最后一次转向」。
+- 破坏点 19 条（`scripts/breakpoints.ts`），`pnpm check:breakpoints` 395/395 全 killed。
+
 ## [0.2.1] - 2026-11-27
 
 修 `--help` 里的退出码说明。0.2.0 的文案还写着「unclaimed 一律退 0」，实际实现是「unclaimed 且有路径收据退 1」。
