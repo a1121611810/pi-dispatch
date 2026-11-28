@@ -138,6 +138,37 @@
 
 ## 已有的守备
 
-- 1073 条测试（其中审计 191 条），160 条是确定性语料的行为指纹
-- 376 条破坏点全 killed（`pnpm check:breakpoints`）
-- 真机跨流门 `pnpm test:audit-cross`：codex / claude 同判词
+- 1114 条测试，含 kimi 归一化 42 条（真夹具产量 + 边界 + 顺序 + 管道 + 跨流同判）
+- 395 条破坏点全 killed（`pnpm check:breakpoints`，含 kimi 19 条）
+- 真机跨流门 `pnpm test:audit-cross`：codex / claude 同判词（kimi 跨流在同判词单测里，不花真模型钱）
+
+## kimi 适配器（`src/audit/normalize-kimi.ts`）
+
+`mutator --no-coverage --mutate-all normalize-kimi`：71 个位点，杀掉 55，幸存 16。
+16 条里 15 条是等价变异（K1–K7，行号按本轮快照），另 1 条（K7 原本那条 `|| -> &&`）
+已被一条用例杀掉——见下面「已杀的等价主张」。复核时发现旧写法把它当等价是错的：
+`verdict.ts:111` 对「退出码不是数字」的收据照样顺着 `>` 重定向收路径，
+所以 `exitCode: null` 的终态在变异下会多出一条 `/tmp/…log` 路径收据。
+
+- **K1** `(x ?? {})` → `|| {}`（`166 / 180 / 199 / 204 / 225 / 256` 等处）：
+  `x` 只可能是对象或缺失，对象恒真 ⇒ 兜底结果相同。JSON 里写成 `event: 0` 之类的假值时
+  两者确有差异，但随后 `event.type` 在 `0/""/false` 上取到 `undefined`，仍走同一条 `continue`。
+- **K2** `EXIT_TRAILING.exec(o) ?? EXIT_LEADING.exec(o)` → `||`（`82`）：
+  `RegExp.exec` 只返回 `match | null`，没有第三种假值。
+- **K3** `let seenUser = false` → `true`（`124`）：首条人话被标成转向。转向只有落在
+  **报告之后**才把判词翻成 `stale`（`lastSteerIndex > reportIndex`），而首条人话恒在报告之前 ⇒ 判词不变。
+- **K4** `${event.turnId ?? ""}` → `||`（`184` 两处）：`turnId === 0` 时前缀从 `""` 变成 `"0"`，
+  但同一步的两段 `part` 共享同一个 `turnId`，键仍相等 ⇒ 分组不变。
+- **K5** `id === undefined || name === undefined` → `&&`（`198`）：命中的只有「有 id、没 name」的调用，
+  它进 `pending` 后两个分支（Bash / 写工具）都不匹配，照样不产收据。
+- **K6** `str(display.path) ?? str(args.path)` → `||`（`207`）：两侧都是 `string | undefined`，
+  且 `str()` 已把 `""` 映射成 `undefined` ⇒ 无假值差异。
+- **K7** `str(b.type) === "text" && typeof b.text === "string"` → `||`（`67`）：命中
+  「`type=text` 但 `text` 不是字符串」的块，多塞一个数字进 join 结果；该文本唯一的消费者是
+  退出码标记，单独一个数字串满足不了任一形状 ⇒ 收据与判词都不变。
+
+### 已杀的等价主张
+
+`task.terminated` 那条 `command === undefined || typeof info.exitCode !== "number"` 原来记进 K7，
+复核时被 `verdict.ts:111` 推翻：非数字退出码的收据**会**顺着 `>` 重定向收路径。
+现在由用例「kimi：终态退出码不是数字就不产收据（连重定向路径也不算）」守着，不再是等价变异。

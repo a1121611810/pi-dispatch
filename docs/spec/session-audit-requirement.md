@@ -22,13 +22,14 @@ agent 跑完会写一段总结：「已实现路由注册，测试全部通过�
 
 ## 数据源（已实测，2026-11-26，macOS）
 
-| 来源        | 路径                                                     | 实测规模        | 关键字段                                                                                                                             |
-| ----------- | -------------------------------------------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| codex 历史  | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`           | 72 MB / 49 文件 | `response_item` → `payload.type = "function_call"`，`name="exec_command"`，`arguments` 是 JSON 字符串，含 `cmd`                      |
-| codex 实时  | `codex exec --json`                                      | —               | `item.completed` → `item.type="command_execution"`，带 `command` / `exit_code` / `aggregated_output`；另有 `agent_message` 带 `text` |
-| claude 历史 | `~/.claude/projects/<项目路径转义>/<session-uuid>.jsonl` | 214 MB          | `message.content[]` 里 `type="tool_use"`，`name` + `input`；`tool_result` 带输出                                                     |
-| claude 实时 | `claude -p --verbose --output-format stream-json`        | —               | 同上结构；**不加 `--verbose` 会直接报错**                                                                                            |
-| pi          | `~/.pi/dispatch/<项目桶>/`                               | —               | 自有账本格式                                                                                                                         |
+| 来源        | 路径                                                                | 实测规模                     | 关键字段                                                                                                                                                               |
+| ----------- | ------------------------------------------------------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| codex 历史  | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`                      | 72 MB / 49 文件              | `response_item` → `payload.type = "function_call"`，`name="exec_command"`，`arguments` 是 JSON 字符串，含 `cmd`                                                        |
+| codex 实时  | `codex exec --json`                                                 | —                            | `item.completed` → `item.type="command_execution"`，带 `command` / `exit_code` / `aggregated_output`；另有 `agent_message` 带 `text`                                   |
+| claude 历史 | `~/.claude/projects/<项目路径转义>/<session-uuid>.jsonl`            | 214 MB                       | `message.content[]` 里 `type="tool_use"`，`name` + `input`；`tool_result` 带输出                                                                                       |
+| claude 实时 | `claude -p --verbose --output-format stream-json`                   | —                            | 同上结构；**不加 `--verbose` 会直接报错**                                                                                                                              |
+| pi          | `~/.pi/dispatch/<项目桶>/`                                          | —                            | 自有账本格式                                                                                                                                                           |
+| kimi code   | `~/.kimi-code/sessions/<工作目录>/<会话 id>/agents/main/wire.jsonl` | 2015 文件 / 单文件最大 30 MB | `context.append_loop_event.event` 里的 `tool.call` / `tool.result` / `content.part`；退出码在 `result.output` 的**尾部**，后台命令的在 `task.terminated.info.exitCode` |
 
 ### 真实样例（codex）
 
@@ -140,11 +141,13 @@ type SessionEvent =
 | claude `tool_use`                       | `{kind:"tool", name, input}`                                 |
 | claude `tool_result`                    | `{kind:"tool_result", output}`                               |
 | pi 账本                                 | 直接映射                                                     |
+| kimi `tool.call` + `tool.result`        | `{kind:"tool", …}`（按 `toolCallId` 配对，唯一）             |
+| kimi `content.part`(`type=text`)        | `{kind:"message", role:"assistant"}`（按步聚合）             |
 
 ## CLI
 
 ```
-session-audit <file.jsonl> --format codex|claude|pi [--cwd DIR] [--json]
+session-audit <file.jsonl> --format codex|claude|pi|kimi [--cwd DIR] [--json]
 ```
 
 退出码：
@@ -180,23 +183,28 @@ session-audit <file.jsonl> --format codex|claude|pi [--cwd DIR] [--json]
 ## 验收标准
 
 1. 八条对抗样本全过
-2. 三家真流各有 ≥2 条 fixture（必须来自真实会话，不能手写）
-3. **同一个任务**在 codex 与 claude 两条流上跑出**同样的判词**
+2. 四家真流各有 ≥2 条 fixture（必须来自真实会话，不能手写）
+3. **同一个任务**在不同格式的两条流上跑出**同样的判词**（codex ↔ claude ↔ kimi）
 4. 纯函数：无 I/O，无 `Date.now()` 依赖（时间从事件里读）
 5. 单文件 ≤ 600 行（含类型）
 
 ## 已踩过的坑（必须处理）
 
-| 坑                      | 具体                                                               | 处理                                  |
-| ----------------------- | ------------------------------------------------------------------ | ------------------------------------- |
-| codex 命令有外壳        | `/bin/zsh -lc "a; b"`                                              | 先剥外壳，再按段切                    |
-| codex 退出码位置        | `item.started` 里 `exit_code` 是 `null`、`status` 是 `in_progress` | 只取 `item.completed`                 |
-| claude 需要 `--verbose` | 不加直接报错退出 1                                                 | 命令里带上                            |
-| claude 事件噪声         | 一次运行 169 条 `system` 事件                                      | 只挑 `assistant` / `user` / `result`  |
-| claude 的 `Read` 不是写 | 会误当路径收据                                                     | 白名单里排除                          |
-| codex 索引不可信        | `~/.codex/session_index.jsonl` 只有 8 条，正文在别处               | 扫 `sessions/` 目录                   |
-| 大文件                  | 单会话 1.3 MB / 404 行                                             | 流式读，别整个 `readFileSync`         |
-| 全库扫描慢              | 939 MB                                                             | 建索引：会话 → 时间 / 项目 / 涉及文件 |
+| 坑                              | 具体                                                                                 | 处理                                   |
+| ------------------------------- | ------------------------------------------------------------------------------------ | -------------------------------------- |
+| codex 命令有外壳                | `/bin/zsh -lc "a; b"`                                                                | 先剥外壳，再按段切                     |
+| codex 退出码位置                | `item.started` 里 `exit_code` 是 `null`、`status` 是 `in_progress`                   | 只取 `item.completed`                  |
+| claude 需要 `--verbose`         | 不加直接报错退出 1                                                                   | 命令里带上                             |
+| claude 事件噪声                 | 一次运行 169 条 `system` 事件                                                        | 只挑 `assistant` / `user` / `result`   |
+| claude 的 `Read` 不是写         | 会误当路径收据                                                                       | 白名单里排除                           |
+| codex 索引不可信                | `~/.codex/session_index.jsonl` 只有 8 条，正文在别处                                 | 扫 `sessions/` 目录                    |
+| 大文件                          | 单会话 1.3 MB / 404 行                                                               | 流式读，别整个 `readFileSync`          |
+| 全库扫描慢                      | 939 MB                                                                               | 建索引：会话 → 时间 / 项目 / 涉及文件  |
+| kimi 的 `isError` 缺省          | 本机 61% 的 `tool.result` 没有这个键；写成 `=== false` 会让每条命令都拿不到退出码    | 缺省 = 成功，只有 `=== true` 算失败    |
+| kimi 退出码在尾部               | `Command failed with exit code: N` 出现在输出**末尾**，头部只有少数                  | 尾部优先，头部再用；两者都读           |
+| kimi 后台命令                   | 启动那次没有退出码，真码在 `task.terminated.info.exitCode`，按 `parentToolCallId` 认 | 启动不算收据，终态才补                 |
+| kimi 写工具的双义 `isError`     | `Write`/`Edit` 的 `isError` 是「被策略拒了」，文件没动                               | 不产路径收据（**与 claude 有意分叉**） |
+| kimi 只有 append_message 的会话 | wire 1.0（kimi-cli 导入）与少数 1.5 会话没有 loop 事件                               | 退 2，文案点名；不做第二套解析器       |
 
 ## 交付形态（建议）
 

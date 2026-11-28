@@ -1,4 +1,5 @@
 // 归一化层：真夹具的**产量断言** + 两家的坑。
+// kimi 适配器的等价变异（K1–K8）见 docs/audit-mutation.md 末节。
 // 产量断言比判词断言值钱：适配器「什么都没认出来」时，判词测试照样全绿。
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -7,6 +8,7 @@ import {
   audit,
   normalizeClaude,
   normalizeCodex,
+  normalizeKimi,
   normalizePi,
   unwrapShell,
 } from "../src/audit/index.ts";
@@ -1568,4 +1570,595 @@ test("pi：上游截断旗要带出来（core 的 20 条窗口）", () => {
     commandsTruncated: normalized.commandsTruncated,
   });
   assert.equal(result.truncated, true, "上游截断要并进判词");
+});
+
+// ── kimi：wire 1.3–1.5 ─────────────────────────────────────────────────────
+// 夹具裁剪规则（`kimi-{write,readonly}.jsonl`，来自真会话）：只留 metadata / profile.bind /
+// loop event / turn.prompt / turn.steer / prompt.steered / task.*；工具输出掐头留尾
+// （尾部才有退出码标记），正文截 260 字。裁剪前后判词与收据条数逐项相等（已核）。
+
+const K = {
+  event: (event: unknown): string => JSON.stringify({ type: "context.append_loop_event", event }),
+  call: (id: string, name: string, args: unknown, display?: unknown): string =>
+    JSON.stringify({
+      type: "context.append_loop_event",
+      event: {
+        type: "tool.call",
+        toolCallId: id,
+        name,
+        args,
+        ...(display === undefined ? {} : { display }),
+      },
+    }),
+  result: (id: string, output: unknown, isError?: boolean): string =>
+    JSON.stringify({
+      type: "context.append_loop_event",
+      event: {
+        type: "tool.result",
+        toolCallId: id,
+        result: { output, ...(isError === undefined ? {} : { isError }) },
+      },
+    }),
+  bash: (id: string, command: string): string =>
+    JSON.stringify({
+      type: "context.append_loop_event",
+      event: { type: "tool.call", toolCallId: id, name: "Bash", args: { command } },
+    }),
+  text: (text: string, turnId = 0, step = 1): string =>
+    JSON.stringify({
+      type: "context.append_loop_event",
+      event: { type: "content.part", turnId, step, part: { type: "text", text } },
+    }),
+  think: (think: string, turnId = 0, step = 1): string =>
+    JSON.stringify({
+      type: "context.append_loop_event",
+      event: { type: "content.part", turnId, step, part: { type: "think", think } },
+    }),
+  prompt: (text: string): string =>
+    JSON.stringify({
+      type: "turn.prompt",
+      origin: { kind: "user" },
+      input: [{ type: "text", text }],
+    }),
+  steer: (text: string): string =>
+    JSON.stringify({
+      type: "turn.steer",
+      origin: { kind: "user" },
+      input: [{ type: "text", text }],
+    }),
+  injected: (text: string, kind: string): string =>
+    JSON.stringify({
+      type: "context.append_message",
+      message: { role: "user", origin: { kind }, content: [{ type: "text", text }] },
+    }),
+};
+
+test("kimi 真夹具（写会话）：5 命令 / 1 路径 / verified", () => {
+  const result = normalizeKimi(fixture("kimi-write.jsonl"));
+  assert.equal(bashOf(result.events).length, 5, "命令条数");
+  assert.equal(writeOf(result.events).length, 1, "路径收据");
+  assert.equal(bashOf(result.events).filter((e) => typeof e.exitCode === "number").length, 5);
+  assert.equal(result.malformed, 0);
+  assert.ok((result.report ?? "").includes("mcp.json"), "报告要抽得出来");
+  assert.equal(audit(result.events, result.report).deliverable, "verified");
+});
+
+test("kimi 真夹具（只读会话）：2 命令 / 0 路径 / unclaimed", () => {
+  const result = normalizeKimi(fixture("kimi-readonly.jsonl"));
+  assert.equal(bashOf(result.events).length, 2);
+  assert.equal(writeOf(result.events).length, 0, "只读会话不该有路径收据");
+  assert.equal(result.malformed, 0);
+  assert.equal(audit(result.events, result.report).deliverable, "unclaimed");
+});
+
+test("kimi：isError 缺省就是成功（本机 61% 的结果没有这个键）", () => {
+  const result = normalizeKimi([
+    K.bash("t1", "pnpm test"),
+    K.result("t1", "all green"),
+    K.text("`pnpm test` 跑通了。"),
+  ]);
+  assert.deepEqual(
+    bashOf(result.events).map((e) => e.exitCode),
+    [0],
+  );
+  assert.equal(audit(result.events, result.report).deliverable, "verified");
+});
+
+test("kimi：失败退出码在输出尾部", () => {
+  const result = normalizeKimi([
+    K.bash("t1", "pnpm test"),
+    K.result("t1", "FAIL src/a.test.ts\nCommand failed with exit code: 3.", true),
+    K.text("`pnpm test` 失败了，正在修。"),
+  ]);
+  assert.deepEqual(
+    bashOf(result.events).map((e) => e.exitCode),
+    [3],
+  );
+  assert.equal(audit(result.events, result.report).deliverable, "verified", "诚实的负评要能兑现");
+});
+
+test("kimi：失败退出码也可能在开头", () => {
+  const result = normalizeKimi([
+    K.bash("t1", "exit 3"),
+    K.result("t1", "Process exited with code 3\nCommand failed with exit code: 3.", true),
+  ]);
+  assert.deepEqual(
+    bashOf(result.events).map((e) => e.exitCode),
+    [3],
+  );
+});
+
+test("kimi：isError 但无标记 ⇒ 记 1（真跑挂了，只是没有数字码）", () => {
+  const result = normalizeKimi([
+    K.bash("t1", "node broken.js"),
+    K.result("t1", "TypeError: x is not a function", true),
+    K.text("`node broken.js` 挂了。"),
+  ]);
+  assert.deepEqual(
+    bashOf(result.events).map((e) => e.exitCode),
+    [1],
+  );
+  assert.equal(audit(result.events, result.report).deliverable, "verified");
+});
+
+test("kimi：成功输出里引用别人的退出码标记不读", () => {
+  const result = normalizeKimi([
+    K.bash("t1", "pnpm test"),
+    K.result("t1", "previous run:\nCommand failed with exit code: 3."),
+    K.text("`pnpm test` 跑通了。"),
+  ]);
+  assert.deepEqual(
+    bashOf(result.events).map((e) => e.exitCode),
+    [0],
+    "成功命令不能被别人的标记伪造失败",
+  );
+  assert.equal(audit(result.events, result.report).deliverable, "verified");
+});
+
+test("kimi：没跑的命令不算收据（被拦下的不能兑现负评）", () => {
+  const result = normalizeKimi([
+    K.bash("t1", "pnpm test"),
+    K.result("t1", "Aborted before command started", true),
+    K.bash("t2", "pnpm test"),
+    K.result("t2", 'Invalid args for tool "Bash": must NOT have additional property', true),
+    K.text("`pnpm test` 失败了。"),
+  ]);
+  assert.deepEqual(bashOf(result.events), [], "两条都没执行");
+  assert.equal(audit(result.events, result.report).deliverable, "unverified");
+});
+
+test("kimi：后台启动不产收据，退出码从 task.terminated 补", () => {
+  const lines = [
+    K.call("t1", "Bash", { command: "pnpm build", run_in_background: true }),
+    K.result("t1", "started; output goes to /tmp/build.log"),
+    K.text("构建在后台跑着。"),
+    JSON.stringify({
+      type: "task.terminated",
+      info: { kind: "process", command: "pnpm build", exitCode: 2, parentToolCallId: "t1" },
+    }),
+    K.text("`pnpm build` 失败了。"),
+  ];
+  const normalized = normalizeKimi(lines);
+  const bash = bashOf(normalized.events);
+  const audited = audit(normalized.events, normalized.report);
+  assert.equal(bash.length, 1, "启动那次不算，terminated 那次算");
+  assert.equal(bash[0]!.exitCode, 2, "拿到的必须是终态退出码，不是启动时的 0");
+  assert.equal(audited.deliverable, "verified");
+});
+
+test("kimi：没有旗标的后台启动也不算收据（自动转后台只回 task_id）", () => {
+  const lines = [
+    K.bash("t1", "pnpm build"),
+    K.result("t1", "task_id: bash-1\npid: 42\ndescription: build\nstatus: running"),
+    K.text("构建在后台跑着。"),
+    JSON.stringify({
+      type: "task.terminated",
+      info: { kind: "process", command: "pnpm build", exitCode: 2, parentToolCallId: "t1" },
+    }),
+    K.text("`pnpm build` 失败了。"),
+  ];
+  const normalized = normalizeKimi(lines);
+  const bash = bashOf(normalized.events);
+  assert.equal(bash.length, 1, "启动那次不算，终态那次算");
+  assert.equal(bash[0]!.exitCode, 2, "启动回执不能被当成 exit 0");
+  assert.equal(audit(normalized.events, normalized.report).deliverable, "verified");
+});
+
+test("kimi：不是本会话启动的任务不算收据", () => {
+  const result = normalizeKimi([
+    JSON.stringify({
+      type: "task.terminated",
+      info: { kind: "process", command: "pnpm test", exitCode: 0, parentToolCallId: "elsewhere" },
+    }),
+    K.text("`pnpm test` 跑通了。"),
+  ]);
+  assert.deepEqual(bashOf(result.events), []);
+});
+
+test("kimi：Read / Grep 不是写", () => {
+  const result = normalizeKimi([
+    K.call(
+      "t1",
+      "Read",
+      { path: "/repo/src/a.ts" },
+      { kind: "file_io", operation: "read", path: "/repo/src/a.ts" },
+    ),
+    K.result("t1", "file body"),
+    K.call("t2", "Grep", { pattern: "x" }, { kind: "file_io", operation: "grep" }),
+    K.result("t2", "1 match"),
+    K.text("改了 `src/a.ts`。"),
+  ]);
+  assert.deepEqual(writeOf(result.events), [], "只读一遍不等于改过");
+  assert.equal(audit(result.events, result.report).deliverable, "unverified");
+});
+
+test("kimi：被策略拒的写不算路径收据", () => {
+  const result = normalizeKimi([
+    K.call("t1", "Write", { path: "src/a.ts", content: "x" }),
+    K.result("t1", "Plan mode is active. You may only write to the current plan file.", true),
+    K.text("已写入 `src/a.ts`。"),
+  ]);
+  assert.deepEqual(writeOf(result.events), []);
+  assert.equal(audit(result.events, result.report).deliverable, "unverified");
+});
+
+test("kimi：Edit 没有 display 时退回 args.path", () => {
+  const result = normalizeKimi([
+    K.call("t1", "Edit", { path: "src/a.ts", old_string: "a", new_string: "b" }),
+    K.result("t1", "ok"),
+    K.text("改了 `src/a.ts`。"),
+  ]);
+  assert.deepEqual(
+    writeOf(result.events).map((e) => e.input.path),
+    ["src/a.ts"],
+  );
+  assert.equal(audit(result.events, result.report).deliverable, "verified");
+});
+
+test("kimi：同一步的多段 text 合成一条正文", () => {
+  const result = normalizeKimi([K.text("前半段", 0, 1), K.text("后半段", 0, 1)]);
+  const messages = messageOf(result.events);
+  assert.equal(messages.length, 1, "一步一条");
+  assert.equal(result.report, "前半段\n后半段");
+});
+
+test("kimi：think 段不进正文（旧协议把 <think> 裹在 text 里）", () => {
+  const result = normalizeKimi([
+    K.think("我要跑 pnpm test 然后说跑通了"),
+    K.text("<think>我要跑 pnpm test</think>改完了。"),
+  ]);
+  assert.equal(result.report, "改完了。");
+  assert.doesNotMatch(result.report ?? "", /<think>/);
+});
+
+test("kimi：注入 / skill 加载 / 后台通知都不是转向", () => {
+  const lines = [
+    K.prompt("改一下 src/a.ts"),
+    K.injected("hook 注入", "injection"),
+    // turn.prompt / turn.steer 也有非人话的 origin，别只防 append_message
+    JSON.stringify({
+      type: "turn.prompt",
+      origin: { kind: "skill_activation" },
+      input: [
+        { type: "text", text: "User activated the skill. Follow the loaded skill instructions." },
+      ],
+    }),
+    JSON.stringify({
+      type: "turn.steer",
+      origin: { kind: "background_task" },
+      input: [{ type: "text", text: "<notification>bash-1 completed</notification>" }],
+    }),
+    JSON.stringify({
+      type: "prompt.steered",
+      messageId: "msg_1",
+      content: [{ type: "text", text: "Skill tool loaded instructions for this request." }],
+    }),
+    JSON.stringify({
+      type: "prompt.steered",
+      messageId: "task:bash-1:completed",
+      content: [{ type: "text", text: "<notification>done</notification>" }],
+    }),
+    K.call("t1", "Write", { path: "src/a.ts", content: "x" }),
+    K.result("t1", "ok"),
+    K.text("改了 `src/a.ts`。"),
+  ];
+  const result = normalizeKimi(lines);
+  assert.equal(
+    messageOf(result.events).filter((e) => e.role === "user").length,
+    1,
+    "只有那一句人话",
+  );
+  assert.equal(audit(result.events, result.report).deliverable, "verified");
+});
+
+test("kimi：运行中插进来的第二句人话是转向", () => {
+  const lines = [
+    K.prompt("跑测试"),
+    K.bash("t1", "pnpm test"),
+    K.result("t1", "green"),
+    K.text("`pnpm test` 跑通了。"),
+    K.steer("顺便把 lint 也跑了"),
+  ];
+  const result = normalizeKimi(lines);
+  const audited = audit(result.events, result.report);
+  assert.equal(audited.deliverable, "unverified");
+  assert.ok(audited.notes.includes("report predates last steer"));
+});
+
+test("kimi：没有正文 ⇒ report 为 null", () => {
+  const result = normalizeKimi([K.bash("t1", "ls"), K.result("t1", "a.ts")]);
+  assert.equal(result.report, null);
+  assert.equal(audit(result.events, result.report).deliverable, "absent");
+});
+
+test("kimi：坏行计入 malformed，好行照收", () => {
+  const result = normalizeKimi([
+    "not json",
+    K.call("t1", "Write", { path: "src/a.ts", content: "x" }),
+    K.result("t1", "ok"),
+  ]);
+  assert.equal(result.malformed, 1);
+  assert.equal(writeOf(result.events).length, 1);
+});
+
+test("跨流：同一份任务在 kimi 与 claude 两条流上判词相同", () => {
+  const text = "改了 `src/a.ts`，`pnpm test` 跑通了。";
+  const write = (id: string, path: string): string => K.call(id, "Write", { path });
+  const edit = (id: string, path: string): string => K.call(id, "Edit", { path });
+  const kimi = normalizeKimi([
+    write("t1", "/repo/src/a.ts"),
+    K.result("t1", "ok"),
+    K.bash("t2", "pnpm test"),
+    K.result("t2", "ok"),
+    K.text(text),
+  ]);
+  const claude = normalizeClaude([
+    JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "tool_use", id: "t1", name: "Write", input: { file_path: "/repo/src/a.ts" } },
+          { type: "tool_use", id: "t2", name: "Bash", input: { command: "pnpm test" } },
+        ],
+      },
+    }),
+    JSON.stringify({
+      type: "user",
+      message: {
+        content: [
+          { type: "tool_result", tool_use_id: "t1", content: "ok" },
+          { type: "tool_result", tool_use_id: "t2", content: "Exit code 0" },
+        ],
+      },
+    }),
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text }] } }),
+  ]);
+  assert.equal(audit(kimi.events, kimi.report).deliverable, "verified");
+  assert.equal(audit(claude.events, claude.report).deliverable, "verified");
+  void edit;
+});
+
+test("kimi：字段塞错类型不产收据、也不崩", () => {
+  const result = normalizeKimi([
+    // 数字 id：`str()` 若把非字符串原样放出来，就会拿它去配对
+    JSON.stringify({
+      type: "context.append_loop_event",
+      event: { type: "tool.call", toolCallId: 123, name: "Write", args: { path: "src/a.ts" } },
+    }),
+    JSON.stringify({
+      type: "context.append_loop_event",
+      event: { type: "tool.result", toolCallId: 123, result: { output: "ok" } },
+    }),
+    // 数组里夹 null：走不通就崩的实现会在这里炸
+    K.bash("t2", "ls"),
+    K.result("t2", [null, { type: "text", text: "a.ts" }]),
+    // 文本块里的 text 不是字符串
+    JSON.stringify({
+      type: "context.append_loop_event",
+      event: { type: "content.part", turnId: 0, step: 1, part: { type: "text", text: 123 } },
+    }),
+  ]);
+  assert.deepEqual(writeOf(result.events), [], "数字 id 不配对");
+  assert.deepEqual(
+    bashOf(result.events).map((e) => e.exitCode),
+    [0],
+    "null 块不影响正常结果",
+  );
+  assert.doesNotMatch(result.report ?? "", /123/);
+});
+
+test("kimi：第二个 turn.prompt 也是转向", () => {
+  const lines = [
+    K.prompt("跑测试"),
+    K.bash("t1", "pnpm test"),
+    K.result("t1", "green"),
+    K.text("`pnpm test` 跑通了。"),
+    K.prompt("顺便把 lint 也跑了"),
+  ];
+  const result = normalizeKimi(lines);
+  const audited = audit(result.events, result.report);
+  assert.equal(audited.deliverable, "unverified");
+  assert.ok(audited.notes.includes("report predates last steer"));
+});
+
+test("kimi：空的人话不造转向", () => {
+  const result = normalizeKimi([
+    K.prompt("跑测试"),
+    JSON.stringify({ type: "prompt.steered", messageId: "msg_1", content: [] }),
+    K.text("跑完了。"),
+  ]);
+  assert.equal(messageOf(result.events).filter((e) => e.role === "user").length, 1);
+});
+
+test("kimi：没有 messageId 的 prompt.steered 直接忽略", () => {
+  const result = normalizeKimi([
+    K.prompt("跑测试"),
+    JSON.stringify({ type: "prompt.steered", content: [{ type: "text", text: "没有 id" }] }),
+    K.text("跑完了。"),
+  ]);
+  assert.equal(messageOf(result.events).filter((e) => e.role === "user").length, 1);
+});
+
+test("kimi：跨步的正文分开，同一步才合并", () => {
+  const result = normalizeKimi([K.text("第一步", 0, 1), K.text("第二步", 0, 2)]);
+  assert.equal(messageOf(result.events).length, 2);
+  assert.equal(result.report, "第二步");
+});
+
+test("kimi：只有人话没有正文 ⇒ report 为 null", () => {
+  const result = normalizeKimi([K.prompt("跑测试"), K.steer("还没好？")]);
+  assert.equal(result.report, null);
+});
+
+test("kimi：同一条人话走两条通道只算一次转向", () => {
+  const result = normalizeKimi([
+    K.prompt("跑测试"),
+    // 真机里的相邻顺序是 prompt.steered → turn.steer，别按想当然的写
+    JSON.stringify({
+      type: "prompt.steered",
+      messageId: "msg_9",
+      content: [{ type: "text", text: "继续" }],
+    }),
+    K.steer("继续"),
+    K.text("跑完了。"),
+  ]);
+  assert.equal(
+    messageOf(result.events).filter((e) => e.role === "user").length,
+    2,
+    "任务 + 一条转向",
+  );
+});
+
+test("kimi：隔一段时间又说一次「继续」，后一次仍然是转向", () => {
+  const lines = [
+    K.prompt("跑测试"),
+    K.text("第一轮跑完了。"),
+    K.steer("继续"),
+    K.text("第二轮也跑完了。"),
+    K.steer("继续"),
+  ];
+  const result = normalizeKimi(lines);
+  const audited = audit(result.events, result.report);
+  assert.equal(
+    messageOf(result.events).filter((e) => e.role === "user").length,
+    3,
+    "两次「继续」都要在",
+  );
+  assert.equal(audited.deliverable, "unverified", "后一条转向之后没有新报告，旧结论不能盖章");
+  assert.ok(audited.notes.includes("report predates last steer"));
+});
+
+test("kimi：报告之后才跑完的后台任务不能给报告作证", () => {
+  const lines = [
+    K.call("t1", "Bash", { command: "pnpm build", run_in_background: true }),
+    K.result("t1", "task_id: bash-1\nstatus: running"),
+    K.text("`pnpm build` 跑通了。"),
+    JSON.stringify({
+      type: "task.terminated",
+      info: { kind: "process", command: "pnpm build", exitCode: 0, parentToolCallId: "t1" },
+    }),
+  ];
+  const normalized = normalizeKimi(lines);
+  const audited = audit(normalized.events, normalized.report);
+  assert.deepEqual(bashOf(normalized.events), [], "先交报告后跑完的，不能回头给报告补票");
+  assert.equal(audited.deliverable, "unverified", "「还在跑就说跑通了」不能判 verified");
+});
+
+test("kimi：先跑完再报告，终态收据照旧算数", () => {
+  const lines = [
+    K.call("t1", "Bash", { command: "pnpm build", run_in_background: true }),
+    K.result("t1", "task_id: bash-1\nstatus: running"),
+    JSON.stringify({
+      type: "task.terminated",
+      info: { kind: "process", command: "pnpm build", exitCode: 0, parentToolCallId: "t1" },
+    }),
+    K.text("`pnpm build` 跑通了。"),
+  ];
+  const normalized = normalizeKimi(lines);
+  assert.equal(bashOf(normalized.events).length, 1);
+  assert.equal(audit(normalized.events, normalized.report).deliverable, "verified");
+});
+
+test("kimi：用户敲斜杠技能也是人话，报告之后要算转向", () => {
+  const lines = [
+    K.prompt("跑测试"),
+    K.bash("t1", "pnpm test"),
+    K.result("t1", "green"),
+    K.text("`pnpm test` 跑通了。"),
+    JSON.stringify({
+      type: "turn.prompt",
+      origin: { kind: "skill_activation", trigger: "user-slash" },
+      input: [{ type: "text", text: 'User activated the skill "grill-with-docs".' }],
+    }),
+  ];
+  const normalized = normalizeKimi(lines);
+  const audited = audit(normalized.events, normalized.report);
+  assert.equal(audited.deliverable, "unverified", "人话在报告之后，旧结论不能盖章");
+  assert.ok(audited.notes.includes("report predates last steer"));
+});
+
+test("kimi：模型自己触发的技能加载不是人话", () => {
+  const result = normalizeKimi([
+    K.prompt("跑测试"),
+    JSON.stringify({
+      type: "turn.steer",
+      origin: { kind: "skill_activation", trigger: "model-tool" },
+      input: [{ type: "text", text: "Skill loaded by the model." }],
+    }),
+    K.text("跑完了。"),
+  ]);
+  assert.equal(messageOf(result.events).filter((e) => e.role === "user").length, 1);
+});
+
+test("kimi：终态退出码不是数字就不产收据（连重定向路径也不算）", () => {
+  const lines = [
+    K.call("t1", "Bash", { command: "pnpm build > /tmp/out.log 2>&1", run_in_background: true }),
+    K.result("t1", "task_id: bash-1\nstatus: running"),
+    JSON.stringify({
+      type: "task.terminated",
+      info: {
+        kind: "process",
+        command: "pnpm build > /tmp/out.log 2>&1",
+        exitCode: null,
+        parentToolCallId: "t1",
+      },
+    }),
+    K.text("`pnpm build` 跑通了。"),
+  ];
+  const normalized = normalizeKimi(lines);
+  const audited = audit(normalized.events, normalized.report);
+  assert.deepEqual(bashOf(normalized.events), [], "没有数字退出码就不是收据");
+  assert.deepEqual(audited.receipts.paths, [], "也不能顺着重定向变出路径收据");
+});
+
+test("kimi：多条终态交叠时，只有报告之前的那几条算数", () => {
+  const lines = [
+    K.call("b1", "Bash", { command: "pnpm build-a", run_in_background: true }),
+    K.result("b1", "task_id: bash-1\nstatus: running"),
+    K.call("b2", "Bash", { command: "pnpm build-b", run_in_background: true }),
+    K.result("b2", "task_id: bash-2\nstatus: running"),
+    JSON.stringify({
+      type: "task.terminated",
+      info: { command: "pnpm build-b", exitCode: 0, parentToolCallId: "b2" },
+    }),
+    JSON.stringify({
+      type: "task.terminated",
+      info: { command: "pnpm build-a", exitCode: 0, parentToolCallId: "b1" },
+    }),
+    K.text("`pnpm build-a` 和 `pnpm build-b` 都跑通了。"),
+    K.call("b3", "Bash", { command: "pnpm build-c", run_in_background: true }),
+    K.result("b3", "task_id: bash-3\nstatus: running"),
+    JSON.stringify({
+      type: "task.terminated",
+      info: { command: "pnpm build-c", exitCode: 0, parentToolCallId: "b3" },
+    }),
+  ];
+  const normalized = normalizeKimi(lines);
+  const bash = bashOf(normalized.events);
+  assert.deepEqual(
+    bash.map((e) => e.input.command),
+    ["pnpm build-b", "pnpm build-a"],
+    "两条都在报告之前，按终态到达顺序插回；第三条在报告之后，丢掉",
+  );
+  assert.equal(audit(normalized.events, normalized.report).deliverable, "verified");
 });

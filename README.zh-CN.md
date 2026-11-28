@@ -114,7 +114,7 @@ npx @goodali/pi-dispatch session-audit ./session.jsonl --format codex
 # 判词 verified    自述 2 路径 / 1 命令   收据 2 路径 / 3 命令
 ```
 
-- `--format codex|claude|pi` —— 读哪种日志；
+- `--format codex|claude|pi|kimi` —— 读哪种日志；`kimi` 可以给 `wire.jsonl`，也可以直接给会话目录（自动取 `agents/main/wire.jsonl`）；
 - `--cwd DIR` —— 解析自述里相对路径的基准；
 - `--max N` —— 只留最近 N 条命令、最先 N 条路径收据（默认全留）；
 - `--json` —— 完整记录；`--strict` —— 把 `unclaimed` 也当失败。
@@ -130,6 +130,9 @@ npx @goodali/pi-dispatch session-audit ./session.jsonl --format codex
 
 已知盲区：路径收据只来自写盘工具或 shell 重定向（`>`、`>>`、`tee`）。用 `vim`、IDE 或子代理改的文件
 没有收据——报告再诚实也会落在 `unverified`。这条写在明面上，不藏。
+
+kimi 另有两处已知盲区：**只读主代理**（子代理 `agents/agent-*` 的读写不算主链收据），以及
+**wire 1.0 与只有 `context.append_message` 的会话不支持**（退 `2` 并在文案里点名）。
 
 ```ts
 import { audit } from "@goodali/pi-dispatch/audit";

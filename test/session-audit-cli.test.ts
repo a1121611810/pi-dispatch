@@ -3,14 +3,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 
-function run(args: string[]): { status: number | null; stdout: string } {
+function run(args: string[]): { status: number | null; stdout: string; stderr: string } {
   const child = spawnSync(
     process.execPath,
     ["--experimental-strip-types", "src/bin/session-audit.ts", ...args],
@@ -19,7 +19,7 @@ function run(args: string[]): { status: number | null; stdout: string } {
       encoding: "utf8",
     },
   );
-  return { status: child.status, stdout: child.stdout };
+  return { status: child.status, stdout: child.stdout, stderr: child.stderr };
 }
 
 function withFixture(lines: string[], fn: (path: string) => void): void {
@@ -155,4 +155,126 @@ test("CLI：--help 的退出码说明与实现一致", () => {
   const help = run(["--help"]);
   assert.match(help.stdout, /unclaimed 但动过手/);
   assert.doesNotMatch(help.stdout, /--strict 时 unclaimed 算 1/);
+});
+
+// kimi：入参可以是 wire.jsonl，也可以是会话目录四层下面的那一条。
+const kimiLines = (): string[] => [
+  JSON.stringify({
+    type: "context.append_loop_event",
+    event: { type: "tool.call", toolCallId: "t1", name: "Write", args: { path: "src/a.ts" } },
+  }),
+  JSON.stringify({
+    type: "context.append_loop_event",
+    event: { type: "tool.result", toolCallId: "t1", result: { output: "ok" } },
+  }),
+  JSON.stringify({
+    type: "context.append_loop_event",
+    event: {
+      type: "content.part",
+      turnId: 0,
+      step: 1,
+      part: { type: "text", text: "改了 `src/a.ts`。" },
+    },
+  }),
+];
+
+function withKimiDir(build: (dir: string) => void, fn: (dir: string) => void): void {
+  const dir = mkdtempSync(join(tmpdir(), "session-audit-kimi-"));
+  try {
+    build(dir);
+    fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("CLI：`--format kimi` 能读 wire.jsonl", () => {
+  withFixture(kimiLines(), (path) => {
+    const result = run([path, "--format", "kimi", "--json"]);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /"deliverable": "verified"/);
+  });
+});
+
+test("CLI：`--format kimi` 收会话目录，解析 agents/main/wire.jsonl", () => {
+  withKimiDir(
+    (dir) => {
+      mkdirSync(join(dir, "agents", "main"), { recursive: true });
+      writeFileSync(join(dir, "agents", "main", "wire.jsonl"), kimiLines().join("\n"), "utf8");
+      // 子代理的 wire 不许被并进来
+      mkdirSync(join(dir, "agents", "agent-0"), { recursive: true });
+      writeFileSync(join(dir, "agents", "agent-0", "wire.jsonl"), "not json", "utf8");
+    },
+    (dir) => {
+      const result = run([dir, "--format", "kimi", "--json"]);
+      assert.equal(result.status, 0, "目录形式要能解析主代理那一条");
+      assert.match(result.stdout, /"deliverable": "verified"/);
+    },
+  );
+});
+
+test("CLI：kimi 目录里没有 agents/main/wire.jsonl ⇒ 2", () => {
+  withKimiDir(
+    () => {},
+    (dir) => {
+      assert.equal(run([dir, "--format", "kimi"]).status, 2);
+    },
+  );
+});
+
+test("CLI：kimi 只有 append_message ⇒ 2 且点名原因", () => {
+  const lines = [
+    JSON.stringify({
+      type: "context.append_message",
+      message: { role: "assistant", content: [{ type: "text", text: "改了 `src/a.ts`。" }] },
+    }),
+  ];
+  withFixture(lines, (path) => {
+    const result = run([path, "--format", "kimi"]);
+    assert.equal(result.status, 2, "认不出事件不能装作判过");
+    assert.match(result.stdout + result.stderr, /append_message/, "文案要说清为什么不支持");
+  });
+});
+
+test("CLI：--json 走管道不被截断（128 KiB 之后还在）", () => {
+  const lines: string[] = [];
+  const tail = "x".repeat(200);
+  for (let i = 0; i < 800; i++) {
+    lines.push(
+      JSON.stringify({
+        type: "context.append_loop_event",
+        event: {
+          type: "tool.call",
+          toolCallId: `t${i}`,
+          name: "Bash",
+          args: { command: `pnpm run task-${i}-${tail}` },
+        },
+      }),
+    );
+    lines.push(
+      JSON.stringify({
+        type: "context.append_loop_event",
+        event: { type: "tool.result", toolCallId: `t${i}`, result: { output: "ok" } },
+      }),
+    );
+  }
+  // 给一句没人任何自述的正文：不然判词是 absent（退 1），测不到截断
+  lines.push(
+    JSON.stringify({
+      type: "context.append_loop_event",
+      event: {
+        type: "content.part",
+        turnId: 0,
+        step: 1,
+        part: { type: "text", text: "先看日志，再改代码。" },
+      },
+    }),
+  );
+  withFixture(lines, (path) => {
+    const result = run([path, "--format", "kimi", "--json"]);
+    assert.equal(result.status, 0);
+    assert.ok(result.stdout.length > 140_000, `管道里只有 ${result.stdout.length} 字节`);
+    const parsed = JSON.parse(result.stdout) as { receipts: { commands: unknown[] } };
+    assert.equal(parsed.receipts.commands.length, 800, "一条都不能丢");
+  });
 });

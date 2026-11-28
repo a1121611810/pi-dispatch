@@ -127,7 +127,7 @@ npx @goodali/pi-dispatch session-audit ./session.jsonl --format codex --json
 The plain-text render prints in Chinese (`判词 verified  自述 2 路径 / 1 命令`); `--json` is the
 language-neutral form.
 
-- `--format codex|claude|pi` — which log shape to read.
+- `--format codex|claude|pi|kimi` — which log shape to read. `kimi` takes either the `wire.jsonl` or the session directory (it resolves `agents/main/wire.jsonl`).
 - `--cwd DIR` — base for relative paths in claims.
 - `--max N` — keep only the last N command / first N path receipts (default: keep all).
 - `--json` — the full record; `--strict` — treat `unclaimed` as a failure.

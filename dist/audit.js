@@ -54,7 +54,7 @@ const REPORT_CONTRACT_BLOCK = [
 * 会改文件的工具（pi 内置只有这两个）。收据只认白名单——
 * 黑名单会把「任何带 path 参数的调用」都当改文件，`child_report` 多传个 path 就能伪造收据。
 */
-const WRITE_TOOLS$1 = ["edit", "write"];
+const WRITE_TOOLS$2 = ["edit", "write"];
 /** 路径清单上限：父面只看前几条，超出部分不记。 */
 const MAX_PATHS = 20;
 /** 命令清单上限：留最近 N 条——对质关心的是交付前跑没跑。 */
@@ -118,7 +118,7 @@ function declaredToolNames(sections) {
 * 只要把那 N 个文件读一遍就能对上（实测可洗白）。
 */
 function writablePath(toolName, args) {
-	if (!WRITE_TOOLS$1.includes(toolName)) return void 0;
+	if (!WRITE_TOOLS$2.includes(toolName)) return void 0;
 	const path = args?.path;
 	if (typeof path !== "string" || !path) return void 0;
 	return path;
@@ -1158,14 +1158,14 @@ function audit(events, report, opts = {}) {
 	};
 }
 // src/audit/normalize-codex.ts
-const str$1 = (value) => typeof value === "string" && value !== "" ? value : void 0;
+const str$2 = (value) => typeof value === "string" && value !== "" ? value : void 0;
 /** `["/bin/zsh","-lc",script]` → script；`/bin/zsh -lc "…"` → 内层；其余原样。 */
 function unwrapShell(command) {
 	if (Array.isArray(command)) {
 		const last = command[command.length - 1];
 		return typeof last === "string" ? last : void 0;
 	}
-	const text = str$1(command);
+	const text = str$2(command);
 	if (text === void 0) return void 0;
 	const m = /^(?:\/(?:usr\/)?bin\/)?(?:ba|z|da|k)?sh\s+-l?c\s+(["'])([\s\S]*)\1$/.exec(text.trim());
 	return m ? m[2] : text;
@@ -1175,12 +1175,12 @@ function cmdOfArguments(arguments_) {
 	if (typeof arguments_ !== "string") return void 0;
 	try {
 		const parsed = JSON.parse(arguments_);
-		return str$1(parsed.cmd);
+		return str$2(parsed.cmd);
 	} catch {
 		return;
 	}
 }
-const textOf$1 = (content) => {
+const textOf$2 = (content) => {
 	if (!Array.isArray(content)) return void 0;
 	const parts = [];
 	for (const block of content) if (block && typeof block === "object") {
@@ -1210,12 +1210,12 @@ function normalizeCodex(lines) {
 			continue;
 		}
 		const payload = record.payload ?? {};
-		const payloadType = str$1(payload.type);
-		const topType = str$1(record.type);
-		const metaCwd = str$1(payload.cwd)?.replace(/^file:\/\//, "");
+		const payloadType = str$2(payload.type);
+		const topType = str$2(record.type);
+		const metaCwd = str$2(payload.cwd)?.replace(/^file:\/\//, "");
 		if (cwd === void 0 && metaCwd !== void 0) cwd = metaCwd;
 		if (topType === "response_item" && payloadType === "function_call") {
-			const callId = str$1(payload.call_id);
+			const callId = str$2(payload.call_id);
 			const cmd = cmdOfArguments(payload.arguments);
 			if (callId !== void 0 && cmd !== void 0) originals.set(callId, cmd);
 			continue;
@@ -1231,7 +1231,7 @@ function normalizeCodex(lines) {
 					...item.id !== void 0 ? { id: item.id } : {},
 					command,
 					...typeof item.exit_code === "number" ? { exitCode: item.exit_code } : {},
-					...str$1(item.cwd) !== void 0 ? { cwd: str$1(item.cwd).replace(/^file:\/\//, "") } : {}
+					...str$2(item.cwd) !== void 0 ? { cwd: str$2(item.cwd).replace(/^file:\/\//, "") } : {}
 				});
 				continue;
 			}
@@ -1245,16 +1245,16 @@ function normalizeCodex(lines) {
 				continue;
 			}
 			if (type === "agentmessage") {
-				const text = str$1(item.text) ?? textOf$1(item.content);
+				const text = str$2(item.text) ?? textOf$2(item.content);
 				if (text !== void 0) messages.push({
 					role: "assistant",
 					text,
-					...str$1(item.phase) !== void 0 ? { phase: str$1(item.phase) } : {}
+					...str$2(item.phase) !== void 0 ? { phase: str$2(item.phase) } : {}
 				});
 				continue;
 			}
 			if (type === "usermessage") {
-				const text = textOf$1(item.content) ?? str$1(item.text);
+				const text = textOf$2(item.content) ?? str$2(item.text);
 				if (text !== void 0) messages.push({
 					role: "user",
 					text
@@ -1263,8 +1263,8 @@ function normalizeCodex(lines) {
 			}
 		}
 		if (topType === "response_item" && payloadType === "message") {
-			const role = str$1(payload.role);
-			const text = textOf$1(payload.content);
+			const role = str$2(payload.role);
+			const text = textOf$2(payload.content);
 			if ((role === "user" || role === "assistant") && text !== void 0) messages.push({
 				role,
 				text
@@ -1306,7 +1306,7 @@ function normalizeCodex(lines) {
 	};
 }
 // src/audit/normalize-claude.ts
-const WRITE_TOOLS = /* @__PURE__ */ new Set([
+const WRITE_TOOLS$1 = /* @__PURE__ */ new Set([
 	"Write",
 	"Edit",
 	"NotebookEdit"
@@ -1316,8 +1316,8 @@ const BACKGROUND_MARKERS = [
 	"did not complete within",
 	"moved to the background"
 ];
-const str = (value) => typeof value === "string" && value !== "" ? value : void 0;
-const textOf = (content) => {
+const str$1 = (value) => typeof value === "string" && value !== "" ? value : void 0;
+const textOf$1 = (content) => {
 	if (typeof content === "string") return content === "" ? void 0 : content;
 	if (!Array.isArray(content)) return void 0;
 	const parts = [];
@@ -1328,7 +1328,7 @@ const textOf = (content) => {
 	return parts.length > 0 ? parts.join("\n") : void 0;
 };
 /** 一条 tool_result 对应的退出码。`undefined` = 不是收据。 */
-function exitCodeOf(output, isError, background) {
+function exitCodeOf$1(output, isError, background) {
 	const marker = /^Exit code (\d+)/.exec(output.trim());
 	if (marker !== null) return Number(marker[1]);
 	if (isError) return void 0;
@@ -1352,8 +1352,8 @@ function normalizeClaude(lines) {
 			malformed++;
 			continue;
 		}
-		if (cwd === void 0) cwd = str(record.cwd);
-		const type = str(record.type);
+		if (cwd === void 0) cwd = str$1(record.cwd);
+		const type = str$1(record.type);
 		if (type !== "assistant" && type !== "user") continue;
 		const message = record.message ?? {};
 		const sidechain = record.isSidechain === true;
@@ -1361,9 +1361,9 @@ function normalizeClaude(lines) {
 		for (const raw of blocks) {
 			if (!raw || typeof raw !== "object") continue;
 			const block = raw;
-			const kind = str(block.type);
+			const kind = str$1(block.type);
 			if (kind === "text") {
-				const text = str(block.text);
+				const text = str$1(block.text);
 				if (text === void 0) continue;
 				if (type === "assistant") {
 					messages.push({
@@ -1387,15 +1387,15 @@ function normalizeClaude(lines) {
 				continue;
 			}
 			if (kind === "tool_use" && type === "assistant") {
-				const id = str(block.id);
-				const name = str(block.name);
+				const id = str$1(block.id);
+				const name = str$1(block.name);
 				if (id === void 0 || name === void 0) continue;
 				const input = block.input ?? {};
 				pending.set(id, {
 					name,
 					input: {
-						...str(input.file_path) !== void 0 ? { path: str(input.file_path) } : str(input.notebook_path) !== void 0 ? { path: str(input.notebook_path) } : {},
-						...str(input.command) !== void 0 ? { command: str(input.command) } : {},
+						...str$1(input.file_path) !== void 0 ? { path: str$1(input.file_path) } : str$1(input.notebook_path) !== void 0 ? { path: str$1(input.notebook_path) } : {},
+						...str$1(input.command) !== void 0 ? { command: str$1(input.command) } : {},
 						...input.run_in_background === true ? { runInBackground: true } : {}
 					},
 					sidechain
@@ -1403,17 +1403,17 @@ function normalizeClaude(lines) {
 				continue;
 			}
 			if (kind === "tool_result" && type === "user") {
-				const id = str(block.tool_use_id);
+				const id = str$1(block.tool_use_id);
 				if (id === void 0) continue;
 				const tool = pending.get(id);
 				pending.delete(id);
 				if (tool === void 0) continue;
-				const output = textOf(block.content) ?? "";
+				const output = textOf$1(block.content) ?? "";
 				const isError = block.is_error === true;
 				if (tool.sidechain) continue;
 				if (tool.name === "bash" || tool.name === "Bash") {
 					if (tool.input.command === void 0) continue;
-					const exitCode = exitCodeOf(output, isError, tool.input.runInBackground === true);
+					const exitCode = exitCodeOf$1(output, isError, tool.input.runInBackground === true);
 					if (exitCode === void 0) continue;
 					events.push({
 						kind: "tool",
@@ -1423,7 +1423,7 @@ function normalizeClaude(lines) {
 					});
 					continue;
 				}
-				if (WRITE_TOOLS.has(tool.name)) {
+				if (WRITE_TOOLS$1.has(tool.name)) {
 					const path = tool.input.path;
 					if (path === void 0) continue;
 					events.push({
@@ -1447,6 +1447,253 @@ function normalizeClaude(lines) {
 		kind: "meta",
 		cwd
 	});
+	return {
+		events,
+		report,
+		malformed
+	};
+}
+// src/audit/normalize-kimi.ts
+const WRITE_TOOLS = /* @__PURE__ */ new Set(["Write", "Edit"]);
+/** 失败码：尾部是主流，开头是少数；两个都认。 */
+const EXIT_TRAILING = /Command failed with exit code: (\d+)/;
+const EXIT_LEADING = /^\s*Process exited with code (\d+)/;
+/**
+* 「命令根本没跑」的签名。命中这些说明这次调用被插件路由或参数校验拦下了，
+* 记成「跑过但失败」会让一条诚实的负评被一个没执行的命令兑现。
+*/
+const NEVER_RAN = [
+	"Aborted before command started",
+	"Invalid args for tool",
+	"ptc-tools 插件"
+];
+/**
+* 后台启动回执。**不是每个后台命令都带 `run_in_background` 旗标**——实测 94 次自动转后台的
+* 调用旗标是缺省的，只回了这一段。把它当成功就是给还在跑的进程发一张 `exit 0` 收据；
+* 真退出码在 `task.terminated` 里。
+*/
+const LAUNCHED = /^\s*task_id: bash-/;
+/** 旧协议的正文段里裹着 `<think>`：推理不能当自述。 */
+const THINK_BLOCK = /<think>[\s\S]*?<\/think>/g;
+/** 人话打断的排除项：skill 加载也走 `msg_`，但它不是人说的。 */
+const SKILL_LOAD = ["Skill tool loaded", "[ponytail"];
+const str = (value) => typeof value === "string" && value !== "" ? value : void 0;
+/** 文本块既可能是字符串，也可能是 `[{type:"text",text}]`（后台任务的输出就是这样）。 */
+const textOf = (value) => {
+	if (typeof value === "string") return value;
+	if (!Array.isArray(value)) return "";
+	const parts = [];
+	for (const block of value) if (block && typeof block === "object") {
+		const b = block;
+		if (str(b.type) === "text" && typeof b.text === "string") parts.push(b.text);
+	}
+	return parts.join("\n");
+};
+/**
+* 一次 Bash 结果的退出码。
+*
+* - `isError` 缺省就是成功：本机六成结果没有这个键，写成 `=== false` 会让正常会话全废；
+* - 成功命令的输出里出现标记只说明它 **引用** 了别人的日志，不能读；
+* - 真失败但没标记（被 kill、超时）记 1：它确实跑挂了，只是没有数字码。
+*/
+function exitCodeOf(output, isError) {
+	if (!isError) return 0;
+	const marker = EXIT_TRAILING.exec(output) ?? EXIT_LEADING.exec(output);
+	return marker === null ? 1 : Number(marker[1]);
+}
+/**
+* 这一条是不是人发起的回合。
+*
+* `origin.kind === "user"` 是常态；但用户敲斜杠技能时走的是
+* `kind: "skill_activation"` + `trigger: "user-slash"`——那也是人发的话（本机 880 条），
+* 当成注入吞掉，报告之后的人话就再也标不出「早于最后一次转向」⇒ 假 verified。
+* 模型自己触发的技能加载是 `trigger: "model-tool"`（144 条），仍然不算。
+*/
+const isHumanTurn = (origin) => str(origin.kind) === "user" || str(origin.kind) === "skill_activation" && str(origin.trigger) === "user-slash";
+function normalizeKimi(lines) {
+	const events = [];
+	const pending = /* @__PURE__ */ new Map();
+	/** 见过启动的后台命令：`task.terminated.parentToolCallId` 要在这里才认。 */
+	const backgroundCalls = /* @__PURE__ */ new Set();
+	/**
+	* 后台终态收据先挂起：**落在最后一条报告之后的终态不能给那份报告作证**。
+	* 否则「构建还在跑 → 先写『跑通了』→ 两分钟后真跑通了」会被判 verified（假绿）。
+	*/
+	const terminated = [];
+	/**
+	* 上一条转向的原文：同一条人话会同时出现在 `turn.steer` 与 `prompt.steered` 里（相邻两行）。
+	* **只跟紧邻的那一条比**——按全文去重会吞掉「隔一会儿又说了一次『继续』」，
+	* 于是最后一条转向消失、旧报告被当成新鲜的（假 verified）。
+	*/
+	let lastSteerText = null;
+	let malformed = 0;
+	let seenUser = false;
+	let buffer = [];
+	let bufferStep = null;
+	const flush = () => {
+		if (buffer.length === 0) return;
+		const text = buffer.join("\n").replace(THINK_BLOCK, "").trim();
+		buffer = [];
+		bufferStep = null;
+		lastSteerText = null;
+		if (text !== "") events.push({
+			kind: "message",
+			role: "assistant",
+			text
+		});
+	};
+	const pushUser = (text) => {
+		if (seenUser) events.push({
+			kind: "message",
+			role: "user",
+			text,
+			steer: true
+		});
+		else events.push({
+			kind: "message",
+			role: "user",
+			text
+		});
+		seenUser = true;
+	};
+	const pushSteer = (text) => {
+		const key = text.trim();
+		if (key === "" || key === lastSteerText) return;
+		lastSteerText = key;
+		events.push({
+			kind: "message",
+			role: "user",
+			text,
+			steer: true
+		});
+	};
+	for (const line of lines) {
+		if (line.trim() === "") continue;
+		let record;
+		try {
+			record = JSON.parse(line);
+		} catch {
+			malformed++;
+			continue;
+		}
+		const type = str(record.type);
+		if (type === "context.append_loop_event") {
+			const event = record.event ?? {};
+			const kind = str(event.type);
+			if (kind === "content.part") {
+				const part = event.part ?? {};
+				if (str(part.type) !== "text") continue;
+				if (typeof part.text !== "string") continue;
+				const step = `${event.turnId ?? ""}/${event.step ?? ""}`;
+				if (bufferStep !== null && bufferStep !== step) flush();
+				bufferStep = step;
+				buffer.push(part.text);
+				continue;
+			}
+			flush();
+			if (kind === "tool.call") {
+				const id = str(event.toolCallId);
+				const name = str(event.name);
+				if (id === void 0 || name === void 0) continue;
+				const args = event.args ?? {};
+				const display = event.display ?? {};
+				const path = str(display.path) ?? str(args.path);
+				const background = name === "Bash" && args.run_in_background === true;
+				if (background) backgroundCalls.add(id);
+				pending.set(id, {
+					name,
+					...path !== void 0 ? { path } : {},
+					...str(args.command) !== void 0 ? { command: str(args.command) } : {},
+					background
+				});
+				continue;
+			}
+			if (kind === "tool.result") {
+				const id = str(event.toolCallId);
+				if (id === void 0) continue;
+				const call = pending.get(id);
+				pending.delete(id);
+				if (call === void 0) continue;
+				const result = event.result ?? {};
+				const isError = result.isError === true;
+				if (call.name === "Bash") {
+					if (call.command === void 0) continue;
+					const output = textOf(result.output);
+					if (call.background || LAUNCHED.test(output)) {
+						backgroundCalls.add(id);
+						continue;
+					}
+					if (NEVER_RAN.some((marker) => output.trimStart().startsWith(marker))) continue;
+					const exitCode = exitCodeOf(output, isError);
+					events.push({
+						kind: "tool",
+						name: "bash",
+						input: { command: call.command },
+						exitCode
+					});
+					continue;
+				}
+				if (WRITE_TOOLS.has(call.name)) {
+					if (isError) continue;
+					if (call.path === void 0) continue;
+					events.push({
+						kind: "tool",
+						name: "write",
+						input: { path: call.path }
+					});
+				}
+			}
+			continue;
+		}
+		flush();
+		if (type === "turn.prompt" || type === "turn.steer") {
+			const origin = record.origin ?? {};
+			if (!isHumanTurn(origin)) continue;
+			const text = textOf(record.input).trim();
+			if (text === "") continue;
+			if (type === "turn.steer") pushSteer(text);
+			else pushUser(text);
+			continue;
+		}
+		if (type === "prompt.steered") {
+			const steered = record;
+			const messageId = str(steered.messageId);
+			if (messageId === void 0 || !messageId.startsWith("msg_")) continue;
+			const text = textOf(steered.content).trim();
+			if (SKILL_LOAD.some((prefix) => text.startsWith(prefix))) continue;
+			pushSteer(text);
+			continue;
+		}
+		if (type === "task.terminated") {
+			const info = record.info ?? {};
+			const parent = str(info.parentToolCallId);
+			if (parent === void 0 || !backgroundCalls.has(parent)) continue;
+			const command = str(info.command);
+			if (command === void 0 || typeof info.exitCode !== "number") continue;
+			terminated.push({
+				at: events.length,
+				event: {
+					kind: "tool",
+					name: "bash",
+					input: { command },
+					exitCode: info.exitCode
+				}
+			});
+		}
+	}
+	flush();
+	let report = null;
+	let lastAssistant = -1;
+	for (let i = events.length - 1; i >= 0; i--) {
+		const event = events[i];
+		if (event.kind === "message" && event.role === "assistant") {
+			report = event.text;
+			lastAssistant = i;
+			break;
+		}
+	}
+	const kept = terminated.filter((entry) => lastAssistant === -1 || entry.at <= lastAssistant);
+	for (const [offset, entry] of kept.entries()) events.splice(entry.at + offset, 0, entry.event);
 	return {
 		events,
 		report,
@@ -1483,4 +1730,4 @@ function normalizePi(lines) {
 		commandsTruncated: parsed.delivery.commandsTruncated === true
 	};
 }
-export { audit, claimHit, collectReceipts, extractClaims, normalizeClaude, normalizeCodex, normalizePath, normalizePi, unwrapShell, verdictOf };
+export { audit, claimHit, collectReceipts, extractClaims, normalizeClaude, normalizeCodex, normalizeKimi, normalizePath, normalizePi, unwrapShell, verdictOf };
